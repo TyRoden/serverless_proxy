@@ -12,7 +12,8 @@ An OpenAI-compatible API proxy that bridges standard API requests to RunPod Serv
 - **OpenAI-compatible endpoints** — Works with any OpenAI client library (`openai`, `AI SDK`, etc.)
 - **Tool call parsing** — Automatically extracts tool calls from model output in multiple formats:
   - Fenced JSON: ` ```tool_call {"name": "...", "arguments": {...}} ``` `
-  - XML-style: `<tool_use code name="...">{...}</tool_use>`
+  - XML-style: `<tool_code>{"name":"...","arguments":{...}}</tool_code>` (OpenCode task format)
+  - `<tool_use code name="...">` format
   - Bare Python calls: `task(description="...", prompt="...")`
   - Multiple calls per fence: `{"name":"x"}{"name":"y"}`
 - **Chain-of-thought stripping** — Removes `analysis:`, `final:`, `assistantfinal` prefixes from responses

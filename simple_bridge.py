@@ -90,10 +90,12 @@ def extract_tool_calls(content):
     tool_use_pattern = re.compile(
         r"<tool_use\s+code\s+name=\"(\w+)\"\s*>(.*?)</tool_use>", re.DOTALL
     )
+    tool_code_pattern = re.compile(r"<tool_code>(.*?)</tool_code>", re.DOTALL)
 
     fence_matches = list(fence_pattern.finditer(content))
     inline_matches = list(inline_pattern.finditer(content))
     tool_use_matches = list(tool_use_pattern.finditer(content))
+    tool_code_matches = list(tool_code_pattern.finditer(content))
 
     all_ranges = []
     for m in fence_matches:
@@ -102,6 +104,8 @@ def extract_tool_calls(content):
         all_ranges.append(("inline", m.start(), m.end(), m))
     for m in tool_use_matches:
         all_ranges.append(("tool_use", m.start(), m.end(), m))
+    for m in tool_code_matches:
+        all_ranges.append(("tool_code", m.start(), m.end(), m))
     all_ranges.sort(key=lambda x: x[1])
 
     if not all_ranges:
@@ -180,6 +184,32 @@ def extract_tool_calls(content):
                     "function": {"name": tool_name, "arguments": args_str},
                 }
             )
+        elif match_type == "tool_code":
+            inner = match.group(1).strip()
+            json_objs = parse_json_objects(inner)
+            for obj in json_objs:
+                name = obj.get("name")
+                args = obj.get("arguments")
+                if name and args:
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(
+                                args.replace("\r\n", "\n").replace("\r", "\n")
+                            )
+                        except (json.JSONDecodeError, ValueError):
+                            args_fixed = args.replace("\n", "\\n").replace("\r", "\\r")
+                            try:
+                                args = json.loads(args_fixed)
+                            except (json.JSONDecodeError, ValueError):
+                                pass
+                    args_str = json.dumps(args, ensure_ascii=False)
+                    tool_calls.append(
+                        {
+                            "id": f"call_{int(time.time() * 1000)}_{len(tool_calls)}",
+                            "type": "function",
+                            "function": {"name": name, "arguments": args_str},
+                        }
+                    )
         else:
             tool_name = match.group(1)
             args_str = match.group(2)

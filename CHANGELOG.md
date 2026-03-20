@@ -17,6 +17,7 @@ All notable changes to the RunPod Serverless Proxy will be documented in this fi
 - Content-wide bare call extraction that scans remaining text after fence removal
 - `KNOWN_TOOL_NAMES` frozenset for efficient tool name lookup
 - `parse_json_objects()` for parsing concatenated JSON objects
+- `<tool_code>...</tool_code>` XML tag support for OpenCode task tool calls
 - `_fix_json_newlines()` for fixing malformed JSON with real newlines in string values
 - `.env` file for secrets management (`.env.example` template provided)
 
