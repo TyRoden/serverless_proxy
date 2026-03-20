@@ -587,11 +587,24 @@ async def chat_completions(request: Request):
 
     # Route through AI Queue Master if enabled
     if USE_AI_QUEUE:
+        import logging
+
+        logger = logging.getLogger("uvicorn")
+        logger.warning(
+            f"[AI_QUEUE] Received request: model={model}, stream={stream}, tools={len(tools)}"
+        )
+
         queue_result, error, status_code = await handle_ai_queue_request(
             messages, model, tools
         )
+
         if error:
+            logger.error(f"[AI_QUEUE] Error: {error}")
             return JSONResponse(status_code=status_code, content=error)
+
+        logger.warning(
+            f"[AI_QUEUE] Raw result keys: {list(queue_result.keys()) if queue_result else 'None'}"
+        )
 
         # Extract content from queue response (OpenAI format)
         content = ""
@@ -612,6 +625,116 @@ async def chat_completions(request: Request):
             text_content = text_content or content
 
         job_id = queue_result.get("id", f"chat-{int(time.time())}")
+
+        # Handle streaming response
+        if stream:
+
+            async def generate_sse():
+                created = int(time.time())
+                chunk_id = job_id
+
+                if tool_calls_data:
+                    for tc_index, tc in enumerate(tool_calls_data):
+                        chunk = {
+                            "id": chunk_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {
+                                        "tool_calls": [
+                                            {
+                                                "index": tc_index,
+                                                "id": tc["id"],
+                                                "type": "function",
+                                                "function": {
+                                                    "name": tc["function"]["name"],
+                                                    "arguments": "",
+                                                },
+                                            }
+                                        ]
+                                    },
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                        await asyncio.sleep(0.01)
+                        args = tc["function"]["arguments"]
+                        chunk = {
+                            "id": chunk_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {
+                                        "tool_calls": [
+                                            {
+                                                "index": tc_index,
+                                                "id": tc["id"],
+                                                "function": {"arguments": args},
+                                            }
+                                        ]
+                                    },
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                        await asyncio.sleep(0.01)
+
+                if text_content:
+                    words = text_content.split()
+                    for i, word in enumerate(words):
+                        chunk = {
+                            "id": chunk_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {
+                                        "content": word
+                                        + (" " if i < len(words) - 1 else "")
+                                    },
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                        await asyncio.sleep(0.02)
+
+                final_chunk = {
+                    "id": chunk_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": "tool_calls"
+                            if tool_calls_data
+                            else "stop",
+                        }
+                    ],
+                }
+                yield f"data: {json.dumps(final_chunk)}\n\n"
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(
+                generate_sse(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                },
+            )
 
         # Non-streaming response
         if tool_calls_data:
