@@ -42,6 +42,9 @@ config_vllm.json
 # Session transcripts
 session-*.md
 
+# Internal / development docs
+AGENTS.md
+
 # Build artifacts
 *.pyc
 .pytest_cache/
