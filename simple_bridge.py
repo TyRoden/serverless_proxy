@@ -688,26 +688,20 @@ async def chat_completions(request: Request):
                         await asyncio.sleep(0.01)
 
                 if text_content:
-                    words = text_content.split()
-                    for i, word in enumerate(words):
-                        chunk = {
-                            "id": chunk_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {
-                                        "content": word
-                                        + (" " if i < len(words) - 1 else "")
-                                    },
-                                    "finish_reason": None,
-                                }
-                            ],
-                        }
-                        yield f"data: {json.dumps(chunk)}\n\n"
-                        await asyncio.sleep(0.02)
+                    chunk = {
+                        "id": chunk_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": text_content},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    yield f"data: {json.dumps(chunk)}\n\n"
 
                 final_chunk = {
                     "id": chunk_id,
@@ -878,7 +872,6 @@ async def chat_completions(request: Request):
                         }
                         yield f"data: {json.dumps(chunk)}\n\n"
                         await asyncio.sleep(0.01)
-
                         args = tc["function"]["arguments"]
                         chunk = {
                             "id": chunk_id,
@@ -905,26 +898,20 @@ async def chat_completions(request: Request):
                         await asyncio.sleep(0.01)
 
                 if text_content:
-                    words = text_content.split()
-                    for i, word in enumerate(words):
-                        chunk = {
-                            "id": chunk_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {
-                                        "content": word
-                                        + (" " if i < len(words) - 1 else "")
-                                    },
-                                    "finish_reason": None,
-                                }
-                            ],
-                        }
-                        yield f"data: {json.dumps(chunk)}\n\n"
-                        await asyncio.sleep(0.02)
+                    chunk = {
+                        "id": chunk_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": text_content},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    yield f"data: {json.dumps(chunk)}\n\n"
 
                 final_chunk = {
                     "id": chunk_id,
