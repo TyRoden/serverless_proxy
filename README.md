@@ -1,83 +1,137 @@
-# Runpod Serverless Proxy
+# RunPod Serverless Proxy
 
-This is a FastAPI application providing an OpenAI-compatible API for sporadic text generation using models hosted on [Runpod](https://runpod.io?ref=rql9o4ou) serverless infrastructure. It is not recommended for batch jobs or tasks with large run times.
+An OpenAI-compatible API proxy that bridges standard API requests to RunPod Serverless endpoints, making queue-based serverless LLM inference work as a drop-in OpenAI API replacement.
 
-## Getting Started
+## Features
+
+- **OpenAI-compatible endpoints** — Works with any OpenAI client library (`openai`, `AI SDK`, etc.)
+- **Tool call parsing** — Automatically extracts tool calls from model output in multiple formats:
+  - Fenced JSON: ` ```tool_call {"name": "...", "arguments": {...}} ``` `
+  - XML-style: `<tool_use code name="...">{...}</tool_use>`
+  - Bare Python calls: `task(description="...", prompt="...")`
+  - Multiple calls per fence: `{"name":"x"}{"name":"y"}`
+- **Chain-of-thought stripping** — Removes `analysis:`, `final:`, `assistantfinal` prefixes from responses
+- **Streaming & non-streaming** — Full SSE streaming support with proper `chat.completion.chunk` format
+- **Job polling** — Automatically polls for queued job completion (configurable timeout)
+- **Dual endpoint support** — Works with both Ollama and vLLM endpoints via `ENDPOINT_TYPE`
+
+## Quick Start
 
 ### Prerequisites
 
-- Python 3.6 or higher
-- FastAPI
-- A Runpod serverless endpoint running `runpod/worker-vllm:0.2.3`. See the [Setup Guide](./docs/runpod_endpoint.md) for instructions on setting this up.
-- **New**: Optionally use `registry.gitlab.com/dannysemi/worker-vllm:eager_mode` worker for access to `enforce_eager` flag. This flag frees up vram occupied by CUDA graphs at the expense of execution speed. Overall quality remains the same.
-- **New**: Use `registry.gitlab.com/dannysemi/worker-embeddings:0.1.7` for generating embeddings. `MODEL_NAME` should be any SentenceTransformer-compatible model on HuggingFace.
+- Docker & Docker Compose
+- A RunPod serverless endpoint with an LLM worker
+- RunPod API key
 
-### New guides for SillyTavern and hf-pre-downloader
-
-- [hf-pre-downloader](./docs/hf_pre_downloader.md) - Reduce initial execution time on your endpoint by downloading the model files to the network volume using a pod in advance.
-- [LoneStriker/MiquMaid-v2-70B-DPO-GPTQ guide](./docs/miqumaid_guide.md) - Complete guide to setting up this endpoint and accessing it through SillyTavern UI.
-- [TheBloke/Goliath-longLORA-120b-rope8-32k-fp16-AWQ](./docs/goliath_guide.md) - Very similar to the MiquMaid guide, but uses 2x A40s in the configuration.
-
-### Installing
-
-1. Clone the repository
-2. Navigate to the project directory
-3. Install the package using pip:
+### Run with Docker
 
 ```bash
-pip install .
+git clone https://github.com/TyRoden/serverless_proxy.git
+cd serverless_proxy
+docker compose up -d --build
+curl http://localhost:8002/v1/models | jq .
 ```
 
-### Usage
+### Configuration
 
-The application provides the following API endpoints which mirror the OpenAI api:
+```yaml
+services:
+  runpod-proxy:
+    build: .
+    ports:
+      - "8002:8002"
+    environment:
+      - RUNPOD_API_KEY=your_runpod_api_key
+      - RUNPOD_ENDPOINT_ID=your_endpoint_id
+      - MODEL_NAME=qwen3.5:27b
+      - ENDPOINT_TYPE=ollama  # or "vllm"
+      - TIMEOUT=300
+    restart: unless-stopped
+```
 
-- `POST /chat/completions`: Generate a chat completion
-- `POST /completions`: Generate a completion (Note: streaming does not work for this endpoint.)
-- `POST /embeddings`: Generate embeddings **NEW!**
-- `GET /models`: List all models
-- `GET /models/{model_id}`: Get a specific model
+### Environment Variables
 
-To start the application, you can use the following command:
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `RUNPOD_API_KEY` | RunPod API key | (required) |
+| `RUNPOD_ENDPOINT_ID` | RunPod serverless endpoint ID | (required) |
+| `MODEL_NAME` | Model identifier exposed by the API | `qwen3.5:27b` |
+| `ENDPOINT_TYPE` | Endpoint format: `ollama` or `vllm` | `ollama` |
+| `TIMEOUT` | Request timeout in seconds | `300` |
 
-`python main.py --config "/path/to/config/file"`
+## API Endpoints
 
-You can also specify different parameters using command line arguments:
-
-- `-c` or `--config`: Path to the config file. If this is provided, the application will load configurations from the specified file.
-- `-e` or `--endpoint`: API endpoint ID. This is mandatory if not loading from a config file. An alphanumeric string that should be found on the endpoint details for your Runpod serverless endpoint.
-- `-k` or `--api_key`: API key. This is mandatory if not loading from a config file. This is your Runpod API key.
-- `-m` or `--model`: Model name. This is mandatory if not loading from a config file. Used for routing requests to a specific worker. You can choose to name your models whatever you want. This is how you will reference them in the api or in menus with connected apps. Note: you can have multiple models/runpod endpoints if using a config file.
-- `-t` or `--timeout`: Timeout. *Default: 150*. Time in seconds before this app sends a request to cancel the job through runpod's api.
-- `-o` or `--use_openai_format`: Use OpenAI format. *Default: 1*. Tells the api to attempt to send the job as an OpenAI chat completion. Will fail if the model is not configured to handle messages (should have a chat template in its config)
-- `-b` or `--batch_size`: Batch size. *Default: 30*.
-- `--host`: Host. *Default: 127.0.0.1*
-- `--port`: Port. *Default: 3000*
-
-If not loading from a config file, the `--endpoint`, `--api_key`, and `--model` arguments are mandatory. If any of these arguments are missing, the application will not start.
-
-An example config file can be copied from `config.example.json` found in the root directory of this repo.
-
-For example:
+### `GET /v1/models`
 
 ```bash
-python main.py --endpoint "my_endpoint" --api_key "my_api_key" --model "my_model" --timeout 30 --use_openai_format 1 --batch_size 10 --host "0.0.0.0" --port 8000
+curl http://localhost:8002/v1/models
 ```
 
-## Built With
+### `POST /v1/chat/completions`
 
-- [FastAPI](https://fastapi.tiangolo.com/): A modern, fast (high-performance), web framework for building APIs with Python 3.6+ based on standard Python type hints.
+```bash
+curl -X POST http://localhost:8002/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "qwen3.5:27b", "messages": [{"role": "user", "content": "Hello!"}]}'
+```
 
-# Disclaimer
+#### Streaming
 
-Please be aware that this application uses cloud resources which may incur costs. These costs are dependent on the usage and the pricing model of the cloud service provider. 
+```bash
+curl -X POST http://localhost:8002/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "qwen3.5:27b", "messages": [{"role": "user", "content": "Hi"}], "stream": true}'
+```
 
-By using this application, you acknowledge that you are fully responsible for any costs that may arise from its operation. As the developer of this application, I am not responsible for any charges you may incur while running this application.
+## Endpoint Types
+
+### Ollama (`ENDPOINT_TYPE=ollama`)
+
+Converts OpenAI message format to a prompt format suitable for RunPod Ollama endpoints.
+
+### vLLM (`ENDPOINT_TYPE=vllm`)
+
+Passes messages directly with `sampling_params`. Suitable for RunPod vLLM endpoints.
+
+## Troubleshooting
+
+```bash
+# View container logs
+docker logs runpod-serverless-proxy
+
+# Restart container
+docker restart runpod-serverless-proxy
+
+# Check endpoint health
+curl -s -H "Authorization: Bearer $RUNPOD_API_KEY" \
+  https://api.runpod.ai/v2/$RUNPOD_ENDPOINT_ID/health | jq .
+```
+
+## Development
+
+```bash
+pip install -r requirements.txt
+python simple_bridge.py
+```
+
+## Project Structure
+
+```
+.
+├── simple_bridge.py      # Main proxy application (FastAPI)
+├── docker-compose.yml    # Docker Compose configuration
+├── Dockerfile            # Container image definition
+├── requirements.txt      # Python dependencies
+├── README.md
+├── CHANGELOG.md
+└── LICENSE.md
+```
 
 ## License
 
-This project is licensed under the MIT License - see the `LICENSE.md` file for details
+MIT License — see [LICENSE.md](LICENSE.md)
 
 ## Acknowledgments
 
-- Credit to [Pooya Haratian](https://github.com/pooyahrtn). An early version of their [OllamaRunpod](https://github.com/pooyahrtn/RunpodOllama) repository served as a basis for this project.
+- Based on [runpod-serverless-proxy](https://github.com/dannysemi/runpod-serverless-proxy) by [Daniel Semanisin](https://github.com/dannysemi) — the original proxy implementation
+- Built with [FastAPI](https://fastapi.tiangolo.com/)

@@ -1,9 +1,48 @@
-__pycache__/main.cpython-311.pyc
-__pycache__/runpod_serverless.cpython-311.pyc
-runpod_serverless_proxy.egg-info/dependency_links.txt
-runpod_serverless_proxy.egg-info/PKG-INFO
-runpod_serverless_proxy.egg-info/requires.txt
-runpod_serverless_proxy.egg-info/SOURCES.txt
-runpod_serverless_proxy.egg-info/top_level.txt
-config.json
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+runpod_serverless_proxy.egg-info/
+
+# Environment
+venv/
+.venv/
+.env
+*.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+*.pid
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
 *.ipynb
+
+# Deploy key
+deploy_key
+deploy_key.pub
+
+# Config with secrets
+config.json
+config_gptoss.json
+config_vllm.json
+
+# Session transcripts
+session-*.md
+
+# Build artifacts
+*.pyc
+.pytest_cache/
+.ruff_cache/
