@@ -20,6 +20,7 @@ An OpenAI-compatible API proxy that bridges standard API requests to RunPod Serv
 - **Streaming & non-streaming** — Full SSE streaming support with proper `chat.completion.chunk` format
 - **Job polling** — Automatically polls for queued job completion (configurable timeout)
 - **Dual endpoint support** — Works with both Ollama and vLLM endpoints via `ENDPOINT_TYPE`
+- **AI Queue Master integration** — Optional routing through [AI Queue Master](https://github.com/TyRoden/ai-queue-master) for priority queuing and request tracking
 
 ## Quick Start
 
@@ -97,6 +98,48 @@ Converts OpenAI message format to a prompt format suitable for RunPod Ollama end
 ### vLLM (`ENDPOINT_TYPE=vllm`)
 
 Passes messages directly with `sampling_params`. Suitable for RunPod vLLM endpoints.
+
+## AI Queue Master Integration (Optional)
+
+Route requests through [AI Queue Master](https://github.com/TyRoden/ai-queue-master) for priority queuing, request tracking, and history.
+
+### Enable AI Queue
+
+```bash
+USE_AI_QUEUE=true
+AI_QUEUE_URL=http://host.docker.internal:8102
+AI_QUEUE_API_KEY=your_queue_api_key
+AI_QUEUE_PRIORITY=NORMAL  # HIGH, NORMAL, or LOW
+AI_QUEUE_SOURCE=runpod-proxy
+```
+
+### Environment Variables for AI Queue
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `USE_AI_QUEUE` | Enable AI Queue routing | `false` |
+| `AI_QUEUE_URL` | AI Queue Master URL | `http://host.docker.internal:8102` |
+| `AI_QUEUE_API_KEY` | API key for AI Queue | (required if enabled) |
+| `AI_QUEUE_PRIORITY` | Request priority: `HIGH`, `NORMAL`, `LOW` | `NORMAL` |
+| `AI_QUEUE_SOURCE` | Source identifier for tracking | `runpod-proxy` |
+
+### Docker Network
+
+Ensure both containers are on the same Docker network:
+
+```yaml
+services:
+  runpod-proxy:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - default
+      - ai-queue-master_default
+
+networks:
+  ai-queue-master_default:
+    external: true
+```
 
 ## Troubleshooting
 

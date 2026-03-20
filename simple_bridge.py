@@ -59,6 +59,13 @@ RUNPOD_API_KEY = os.getenv("RUNPOD_API_KEY", "")
 RUNPOD_ENDPOINT_ID = os.getenv("RUNPOD_ENDPOINT_ID", "")
 ENDPOINT_TYPE = os.getenv("ENDPOINT_TYPE", "ollama").lower()  # "ollama" or "vllm"
 
+# AI Queue Master integration (optional)
+USE_AI_QUEUE = os.getenv("USE_AI_QUEUE", "false").lower() == "true"
+AI_QUEUE_URL = os.getenv("AI_QUEUE_URL", "http://host.docker.internal:8102")
+AI_QUEUE_API_KEY = os.getenv("AI_QUEUE_API_KEY", "")
+AI_QUEUE_PRIORITY = os.getenv("AI_QUEUE_PRIORITY", "NORMAL")  # HIGH, NORMAL, LOW
+AI_QUEUE_SOURCE = os.getenv("AI_QUEUE_SOURCE", "runpod-proxy")
+
 
 async def wait_for_completion(client, job_id, max_wait=300):
     start = time.time()
@@ -526,6 +533,46 @@ def extract_content_ollama(result):
     return ""
 
 
+async def handle_ai_queue_request(messages, model, tools, timeout=1200):
+    """Route request through AI Queue Master instead of directly to RunPod."""
+    headers = {
+        "Authorization": f"Bearer {AI_QUEUE_API_KEY}",
+        "Content-Type": "application/json",
+        "X-Source": AI_QUEUE_SOURCE,
+        "X-Priority": AI_QUEUE_PRIORITY,
+    }
+
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+    }
+    if tools:
+        payload["tools"] = tools
+
+    async with httpx.AsyncClient(timeout=float(timeout)) as client:
+        response = await client.post(
+            f"{AI_QUEUE_URL}/v1/chat/completions",
+            headers=headers,
+            json=payload,
+        )
+
+        if response.status_code != 200:
+            return (
+                None,
+                {"error": f"AI Queue error: {response.text}"},
+                response.status_code,
+            )
+
+        result = response.json()
+
+        # Handle error responses from queue
+        if result.get("error"):
+            return None, {"error": result.get("error")}, 500
+
+        return result, None, 200
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     data = await request.json()
@@ -538,6 +585,78 @@ async def chat_completions(request: Request):
     stream = data.get("stream", False)
     tools = data.get("tools", [])
 
+    # Route through AI Queue Master if enabled
+    if USE_AI_QUEUE:
+        queue_result, error, status_code = await handle_ai_queue_request(
+            messages, model, tools
+        )
+        if error:
+            return JSONResponse(status_code=status_code, content=error)
+
+        # Extract content from queue response (OpenAI format)
+        content = ""
+        tool_calls_data = []
+        usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+        if "choices" in queue_result and queue_result["choices"]:
+            choice = queue_result["choices"][0]
+            content = choice.get("message", {}).get("content", "") or ""
+            tool_calls_data = choice.get("message", {}).get("tool_calls", []) or []
+            usage = queue_result.get("usage", usage)
+
+        # Process content to extract tool calls
+        extracted_tc, text_content = process_content(content)
+        if extracted_tc:
+            tool_calls_data = extracted_tc
+        elif not tool_calls_data:
+            text_content = text_content or content
+
+        job_id = queue_result.get("id", f"chat-{int(time.time())}")
+
+        # Non-streaming response
+        if tool_calls_data:
+            return JSONResponse(
+                content={
+                    "id": job_id,
+                    "object": "chat.completion",
+                    "created": int(time.time()),
+                    "model": model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": text_content,
+                            },
+                            "tool_calls": tool_calls_data,
+                            "finish_reason": "tool_calls",
+                        }
+                    ],
+                    "usage": usage,
+                }
+            )
+
+        return JSONResponse(
+            content={
+                "id": job_id,
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": text_content,
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": usage,
+            }
+        )
+
+    # Direct RunPod mode (existing logic)
     # Build payload based on endpoint type
     if ENDPOINT_TYPE == "ollama":
         input_data = build_input_payload_ollama(
@@ -590,8 +709,8 @@ async def chat_completions(request: Request):
             else:
                 content = ""
 
-        tool_calls, text_content = process_content(content)
-        if not tool_calls:
+        tool_calls_data, text_content = process_content(content)
+        if not tool_calls_data:
             text_content = text_content or content
 
         # Get usage if available
@@ -607,8 +726,8 @@ async def chat_completions(request: Request):
                 created = int(time.time())
                 chunk_id = f"chatcmpl-{job_id}"
 
-                if tool_calls:
-                    for tc_index, tc in enumerate(tool_calls):
+                if tool_calls_data:
+                    for tc_index, tc in enumerate(tool_calls_data):
                         chunk = {
                             "id": chunk_id,
                             "object": "chat.completion.chunk",
@@ -693,7 +812,9 @@ async def chat_completions(request: Request):
                         {
                             "index": 0,
                             "delta": {},
-                            "finish_reason": "tool_calls" if tool_calls else "stop",
+                            "finish_reason": "tool_calls"
+                            if tool_calls_data
+                            else "stop",
                         }
                     ],
                 }
@@ -710,7 +831,7 @@ async def chat_completions(request: Request):
             )
 
         # Non-streaming response
-        if tool_calls:
+        if tool_calls_data:
             return JSONResponse(
                 content={
                     "id": job_id,
@@ -724,7 +845,7 @@ async def chat_completions(request: Request):
                                 "role": "assistant",
                                 "content": text_content,
                             },
-                            "tool_calls": tool_calls,
+                            "tool_calls": tool_calls_data,
                             "finish_reason": "tool_calls",
                         }
                     ],

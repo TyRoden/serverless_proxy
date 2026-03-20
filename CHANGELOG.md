@@ -11,7 +11,8 @@ All notable changes to the RunPod Serverless Proxy will be documented in this fi
 
 - Comprehensive tool call parsing supporting multiple model output formats:
   - Fenced JSON: ` ```tool_call {"name": "...", "arguments": {...}} ``` `
-  - XML-style: `<tool_use code name="...">{...}</tool_use>`
+  - XML-style: `<tool_code>{"name":"...","arguments":{...}}</tool_code>` (OpenCode task format)
+  - `<tool_use code name="...">` format
   - Bare Python calls: `task(description="...", prompt="...")` with both `:` and `=` argument separators
   - Multiple calls per fence: `{"name":"x"}{"name":"y"}`
 - Content-wide bare call extraction that scans remaining text after fence removal
@@ -20,6 +21,12 @@ All notable changes to the RunPod Serverless Proxy will be documented in this fi
 - `<tool_code>...</tool_code>` XML tag support for OpenCode task tool calls
 - `_fix_json_newlines()` for fixing malformed JSON with real newlines in string values
 - `.env` file for secrets management (`.env.example` template provided)
+- **AI Queue Master integration** — Optional routing through AI Queue Master for priority queuing and request tracking:
+  - `USE_AI_QUEUE` — Enable/disable queue routing
+  - `AI_QUEUE_URL` — Queue Master URL
+  - `AI_QUEUE_PRIORITY` — Priority level (HIGH/NORMAL/LOW)
+  - `AI_QUEUE_SOURCE` — Source identifier for tracking
+  - `extra_hosts` configuration for Docker networking
 
 ### Fixed
 
