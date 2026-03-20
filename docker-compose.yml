@@ -4,12 +4,8 @@ services:
     container_name: runpod-serverless-proxy
     ports:
       - "8002:8002"
-    environment:
-      - RUNPOD_API_KEY=your_runpod_api_key
-      - RUNPOD_ENDPOINT_ID=your_endpoint_id
-      - MODEL_NAME=qwen3.5:27b
-      - ENDPOINT_TYPE=ollama
-      - TIMEOUT=300
+    env_file:
+      - .env
     restart: unless-stopped
     networks:
       - default

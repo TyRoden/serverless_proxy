@@ -2,6 +2,11 @@
 
 An OpenAI-compatible API proxy that bridges standard API requests to RunPod Serverless endpoints, making queue-based serverless LLM inference work as a drop-in OpenAI API replacement.
 
+## Tested With
+
+- **RunPod Worker Ollama** `ollama@0.18.2` on RunPod Serverless
+- **Model**: Qwen 3.5 27B (`qwen3.5:27b`)
+
 ## Features
 
 - **OpenAI-compatible endpoints** — Works with any OpenAI client library (`openai`, `AI SDK`, etc.)
@@ -20,7 +25,7 @@ An OpenAI-compatible API proxy that bridges standard API requests to RunPod Serv
 ### Prerequisites
 
 - Docker & Docker Compose
-- A RunPod serverless endpoint with an LLM worker
+- A RunPod serverless endpoint with an LLM worker (tested with [RunPod Worker Ollama](https://hub.docker.com/r/ollama/ollama))
 - RunPod API key
 
 ### Run with Docker
@@ -28,26 +33,25 @@ An OpenAI-compatible API proxy that bridges standard API requests to RunPod Serv
 ```bash
 git clone https://github.com/TyRoden/serverless_proxy.git
 cd serverless_proxy
+cp .env.example .env
+# Edit .env with your RUNPOD_API_KEY and RUNPOD_ENDPOINT_ID
 docker compose up -d --build
 curl http://localhost:8002/v1/models | jq .
 ```
 
 ### Configuration
 
-```yaml
-services:
-  runpod-proxy:
-    build: .
-    ports:
-      - "8002:8002"
-    environment:
-      - RUNPOD_API_KEY=your_runpod_api_key
-      - RUNPOD_ENDPOINT_ID=your_endpoint_id
-      - MODEL_NAME=qwen3.5:27b
-      - ENDPOINT_TYPE=ollama  # or "vllm"
-      - TIMEOUT=300
-    restart: unless-stopped
+Copy `.env.example` to `.env` and set your values:
+
+```bash
+RUNPOD_API_KEY=your_runpod_api_key
+RUNPOD_ENDPOINT_ID=your_endpoint_id
+MODEL_NAME=qwen3.5:27b
+ENDPOINT_TYPE=ollama
+TIMEOUT=300
 ```
+
+The `docker-compose.yml` uses `env_file: .env` to load these automatically.
 
 ### Environment Variables
 
@@ -111,6 +115,8 @@ curl -s -H "Authorization: Bearer $RUNPOD_API_KEY" \
 
 ```bash
 pip install -r requirements.txt
+cp .env.example .env
+# Edit .env with your values
 python simple_bridge.py
 ```
 
@@ -122,6 +128,8 @@ python simple_bridge.py
 ├── docker-compose.yml    # Docker Compose configuration
 ├── Dockerfile            # Container image definition
 ├── requirements.txt      # Python dependencies
+├── .env.example          # Environment variable template
+├── .env                  # Your secrets (not committed)
 ├── README.md
 ├── CHANGELOG.md
 └── LICENSE.md

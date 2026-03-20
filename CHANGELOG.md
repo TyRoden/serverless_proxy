@@ -5,6 +5,7 @@ All notable changes to the RunPod Serverless Proxy will be documented in this fi
 ## [1.4.0] - 2026-03-20
 
 > Forked from [runpod-serverless-proxy](https://github.com/dannysemi/runpod-serverless-proxy) by [Daniel Semanisin](https://github.com/dannysemi)
+> Tested with [RunPod Worker Ollama](https://hub.docker.com/r/ollama/ollama) `ollama@0.18.2` on RunPod Serverless
 
 ### Added
 
@@ -17,6 +18,7 @@ All notable changes to the RunPod Serverless Proxy will be documented in this fi
 - `KNOWN_TOOL_NAMES` frozenset for efficient tool name lookup
 - `parse_json_objects()` for parsing concatenated JSON objects
 - `_fix_json_newlines()` for fixing malformed JSON with real newlines in string values
+- `.env` file for secrets management (`.env.example` template provided)
 
 ### Fixed
 
