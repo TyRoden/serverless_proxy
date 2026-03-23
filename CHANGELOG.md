@@ -2,6 +2,12 @@
 
 All notable changes to the RunPod Serverless Proxy will be documented in this file.
 
+## [1.4.1] - 2026-03-22
+
+### Added
+
+- `X-Model` header in AI Queue requests for model identification
+
 ## [1.4.0] - 2026-03-20
 
 > Forked from [runpod-serverless-proxy](https://github.com/dannysemi/runpod-serverless-proxy) by [Daniel Semanisin](https://github.com/dannysemi)

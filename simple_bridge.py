@@ -540,6 +540,7 @@ async def handle_ai_queue_request(messages, model, tools, timeout=1200):
         "Content-Type": "application/json",
         "X-Source": AI_QUEUE_SOURCE,
         "X-Priority": AI_QUEUE_PRIORITY,
+        "X-Model": model,
     }
 
     payload = {
