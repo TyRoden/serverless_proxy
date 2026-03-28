@@ -79,31 +79,20 @@
 
 **Note**: See AQM-1 for ai-queue-master error format issue
 
-### OA-4: Response Field Completeness
+### OA-4: ~~Response Field Completeness~~ - RESOLVED
 **Priority: MEDIUM** - Some tools validate response fields
 
-**Missing/incorrect fields:**
-- `system_fingerprint` - Should pass through from queue
-- `finish_reason` - Should be "stop", "length", "tool_calls", or "content_filter"
-- `logprobs` - Log probabilities (optional)
-- `index` - Choice index (for multiple choices)
+**Now fixed:**
+- `system_fingerprint` ✅ - Passed through from queue to response
+- `finish_reason` ✅ - Fixed: now correctly checks both tool_calls AND text_content
+- `index` ✅ - Already included in choices
 
-### OA-5: Streaming Response Integrity
+### OA-5: ~~Streaming Response Integrity~~ - RESOLVED
 **Priority: HIGH** - Known bug in current code
 
-**Issues:**
-- Line 717: Always sets `finish_reason: "tool_calls"` for normal responses when `tool_calls_data` is truthy (bug)
-- Should only use `"stop"` when there are NO tool calls
-- `delta` field may be missing `role` on first chunk
-
-**Fix:**
-```python
-# Current (buggy):
-"finish_reason": "tool_calls" if tool_calls_data else "stop"
-
-# Should check actual choice content:
-"finish_reason": "tool_calls" if (tool_calls_data and not text_content) else "stop"
-```
+**Fixed:**
+- finish_reason now correctly determines: "tool_calls" only if tool calls present AND no text content
+- Otherwise returns "stop"
 
 ### OA-6: Rate Limit Headers
 **Priority: LOW** - Nice to have
@@ -118,14 +107,16 @@
 
 **Implementation**: Add headers when available from queue
 
-### OA-7: Content-Type Headers
-**Priority: MEDIUM** - Some clients are strict
+### OA-7: ~~CORS Headers~~ - RESOLVED
+**Priority: MEDIUM** - Needed for browser-based tools
 
-**Current**: Returns application/json
+**Added:**
+- `Access-Control-Allow-Origin: *`
+- `Access-Control-Allow-Credentials: true`
+- `Access-Control-Allow-Methods: *`
+- `Access-Control-Allow-Headers: *`
 
-**Should support:**
-- `application/json` (default)
-- `text/event-stream` for streaming (already set)
+Implemented via FastAPI CORSMiddleware
 
 ### OA-8: CORS Headers
 **Priority: MEDIUM** - Needed for browser-based tools

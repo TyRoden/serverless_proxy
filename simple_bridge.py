@@ -7,6 +7,7 @@ Supports multiple backends via backend abstraction layer
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import os
 import time
@@ -57,6 +58,15 @@ KNOWN_TOOL_NAMES = frozenset(
 )
 
 app = FastAPI()
+
+# Add CORS middleware for browser-based tools (OA-7)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # ============================================================================
@@ -848,6 +858,9 @@ async def chat_completions(request: Request):
         tool_calls_data = choice.get("message", {}).get("tool_calls", []) or []
         usage = result.get("usage", usage)
 
+    # Extract system_fingerprint if present (OA-4)
+    system_fingerprint = result.get("system_fingerprint")
+
     # Process content to extract tool calls
     extracted_tc, text_content = process_content(content)
     if extracted_tc:
@@ -865,6 +878,7 @@ async def chat_completions(request: Request):
                 model=model,
                 tool_calls_data=tool_calls_data,
                 text_content=text_content,
+                system_fingerprint=system_fingerprint,
             ),
             media_type="text/event-stream",
             headers={
@@ -883,6 +897,13 @@ async def chat_completions(request: Request):
         "usage": usage,
     }
 
+    # Add system_fingerprint if available (OA-4)
+    if system_fingerprint:
+        response_content["system_fingerprint"] = system_fingerprint
+
+    # Determine finish_reason: "tool_calls" only if tool calls present AND no text content
+    finish_reason = "tool_calls" if (tool_calls_data and not text_content) else "stop"
+
     if tool_calls_data:
         response_content["choices"].append(
             {
@@ -892,7 +913,7 @@ async def chat_completions(request: Request):
                     "content": text_content,
                 },
                 "tool_calls": tool_calls_data,
-                "finish_reason": "tool_calls",
+                "finish_reason": finish_reason,
             }
         )
     else:
@@ -903,17 +924,24 @@ async def chat_completions(request: Request):
                     "role": "assistant",
                     "content": text_content,
                 },
-                "finish_reason": "stop",
+                "finish_reason": finish_reason,
             }
         )
 
     return JSONResponse(content=response_content)
 
 
-async def _generate_sse(job_id, model, tool_calls_data, text_content):
+async def _generate_sse(
+    job_id, model, tool_calls_data, text_content, system_fingerprint=None
+):
     """Generate SSE stream for streaming responses."""
     created = int(time.time())
     chunk_id = job_id
+
+    # Include system_fingerprint in first chunk if available (OA-4)
+    first_chunk_meta = {}
+    if system_fingerprint:
+        first_chunk_meta["system_fingerprint"] = system_fingerprint
 
     if tool_calls_data:
         for tc_index, tc in enumerate(tool_calls_data):
@@ -986,6 +1014,9 @@ async def _generate_sse(job_id, model, tool_calls_data, text_content):
         }
         yield f"data: {json.dumps(chunk)}\n\n"
 
+    # Determine finish_reason: "tool_calls" only if tool calls present AND no text content
+    finish_reason = "tool_calls" if (tool_calls_data and not text_content) else "stop"
+
     final_chunk = {
         "id": chunk_id,
         "object": "chat.completion.chunk",
@@ -995,7 +1026,7 @@ async def _generate_sse(job_id, model, tool_calls_data, text_content):
             {
                 "index": 0,
                 "delta": {},
-                "finish_reason": "tool_calls" if tool_calls_data else "stop",
+                "finish_reason": finish_reason,
             }
         ],
     }
