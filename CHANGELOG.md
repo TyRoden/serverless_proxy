@@ -2,6 +2,37 @@
 
 All notable changes to the RunPod Serverless Proxy will be documented in this file.
 
+## [1.5.0] - 2026-03-28
+
+### Added
+
+- **Backend Abstraction Layer** - New plugin-based architecture for easy extension:
+  - `LLMBackend` abstract base class for defining new backends
+  - `AIQueueBackend` - Routes requests through AI Queue Master
+  - `RunPodBackend` - Routes directly to RunPod Serverless
+  - `get_backend()` factory function for dynamic backend selection
+  - Easy to add new backends (Together AI, Anyscale, etc.) by extending `LLMBackend`
+- **Health Endpoint** (`/health`) - Returns backend health status for container orchestration
+- **OpenAI Parameter Support** - Added support for all common OpenAI parameters:
+  - `stop` - Stop sequences
+  - `presence_penalty` - Presence penalty
+  - `frequency_penalty` - Frequency penalty
+  - `logit_bias` - Token probability modification
+  - `user` - End-user ID (passed as X-User-ID header to queue)
+  - `tool_choice` - Force specific tool or auto
+  - `response_format` - JSON/JSON schema mode
+  - `seed` - Reproducible outputs
+  - `parallel_tool_calls` - Enable/disable parallel tool execution
+- **OpenAI Error Format** - All error responses now return proper OpenAI format:
+  - `{"error": {"message": "...", "type": "...", "param": "...", "code": "..."}}`
+  - Proper HTTP status codes (400, 401, 403, 404, 408, 422, 429, 500, 503)
+
+### Changed
+
+- Default model changed to `project-system-ai`
+- AI Queue enabled by default (`USE_AI_QUEUE=true`)
+- Configuration now documented in UPGRADES.md for future planning
+
 ## [1.4.1] - 2026-03-22
 
 ### Added

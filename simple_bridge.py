@@ -2,6 +2,7 @@
 """
 Simple proxy to bridge OpenAI-compatible requests to RunPod Serverless
 Supports both vLLM and Ollama endpoints via ENDPOINT_TYPE env var
+Supports multiple backends via backend abstraction layer
 """
 
 from fastapi import FastAPI, Request
@@ -12,6 +13,8 @@ import time
 import json
 import asyncio
 import re
+from abc import ABC, abstractmethod
+from typing import Any, Optional
 
 KNOWN_TOOL_NAMES = frozenset(
     [
@@ -54,6 +57,373 @@ KNOWN_TOOL_NAMES = frozenset(
 )
 
 app = FastAPI()
+
+
+# ============================================================================
+# Backend Abstraction Layer
+# ============================================================================
+
+
+class LLMBackend(ABC):
+    """Abstract base class for LLM backends."""
+
+    @abstractmethod
+    async def chat_completion(
+        self,
+        messages: list,
+        model: str,
+        temperature: float = 0.7,
+        max_tokens: int = 256,
+        top_p: float = 1.0,
+        stream: bool = False,
+        tools: Optional[list] = None,
+        **kwargs,
+    ) -> tuple[Optional[dict], Optional[dict], int]:
+        """
+        Execute a chat completion request.
+        Returns: (result, error, status_code)
+        - result: Response dict on success
+        - error: Error dict on failure
+        - status_code: HTTP status code
+        """
+        pass
+
+    @abstractmethod
+    async def health_check(self) -> bool:
+        """Check if backend is healthy."""
+        pass
+
+
+class AIQueueBackend(LLMBackend):
+    """AI Queue Master backend."""
+
+    def __init__(self):
+        self.url = os.getenv("AI_QUEUE_URL", "http://host.docker.internal:8102")
+        self.api_key = os.getenv("AI_QUEUE_API_KEY", "")
+        self.priority = os.getenv("AI_QUEUE_PRIORITY", "NORMAL")
+        self.source = os.getenv("AI_QUEUE_SOURCE", "runpod-proxy")
+
+    async def chat_completion(
+        self,
+        messages: list,
+        model: str,
+        temperature: float = 0.7,
+        max_tokens: int = 256,
+        top_p: float = 1.0,
+        stream: bool = False,
+        tools: Optional[list] = None,
+        **kwargs,
+    ) -> tuple[Optional[dict], Optional[dict], int]:
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "X-Source": self.source,
+            "X-Priority": self.priority,
+            "X-Model": model,
+        }
+
+        # Add user ID if provided
+        user = kwargs.get("user")
+        if user:
+            headers["X-User-ID"] = user
+
+        payload = {
+            "model": model,
+            "messages": messages,
+            "stream": False,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "top_p": top_p,
+        }
+
+        # Add optional parameters
+        optional_params = [
+            "stop",
+            "presence_penalty",
+            "frequency_penalty",
+            "logit_bias",
+            "tool_choice",
+            "response_format",
+            "seed",
+            "parallel_tool_calls",
+        ]
+        for param in optional_params:
+            if kwargs.get(param) is not None:
+                payload[param] = kwargs[param]
+
+        if tools:
+            payload["tools"] = tools
+
+        async with httpx.AsyncClient(timeout=1200.0) as client:
+            response = await client.post(
+                f"{self.url}/v1/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+
+            if response.status_code != 200:
+                try:
+                    error_data = response.json()
+                    if "error" in error_data:
+                        return (
+                            None,
+                            {"error": error_data["error"]},
+                            response.status_code,
+                        )
+                except Exception:
+                    pass
+                return (
+                    None,
+                    {
+                        "error": {
+                            "message": f"AI Queue error: {response.text}",
+                            "type": "internal_server_error",
+                            "code": "queue_error",
+                        }
+                    },
+                    response.status_code,
+                )
+
+            result = response.json()
+
+            if result.get("error"):
+                error_info = result.get("error")
+                if isinstance(error_info, str):
+                    error_info = {
+                        "message": error_info,
+                        "type": "internal_server_error",
+                    }
+                return None, {"error": error_info}, 500
+
+            return result, None, 200
+
+    async def health_check(self) -> bool:
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.get(f"{self.url}/health")
+                return response.status_code == 200
+        except Exception:
+            return False
+
+
+class RunPodBackend(LLMBackend):
+    """RunPod Serverless backend."""
+
+    def __init__(self):
+        self.api_key = os.getenv("RUNPOD_API_KEY", "")
+        self.endpoint_id = os.getenv("RUNPOD_ENDPOINT_ID", "")
+        self.endpoint_type = os.getenv("ENDPOINT_TYPE", "ollama").lower()
+
+    def _build_payload(
+        self,
+        messages: list,
+        temperature: float,
+        max_tokens: int,
+        top_p: float,
+        tools: Optional[list] = None,
+        **kwargs,
+    ) -> dict:
+        """Build backend-specific payload."""
+        if self.endpoint_type == "ollama":
+            return self._build_ollama_payload(
+                messages, temperature, max_tokens, top_p, tools, **kwargs
+            )
+        else:
+            return self._build_vllm_payload(
+                messages, temperature, max_tokens, top_p, tools, **kwargs
+            )
+
+    def _build_ollama_payload(
+        self, messages, temperature, max_tokens, top_p, tools=None, **kwargs
+    ):
+        """Build Ollama format payload."""
+        system_parts = []
+
+        if tools:
+            tool_desc = "You have access to the following tools:\n\n"
+            for tool in tools:
+                func = tool.get("function", {})
+                name = func.get("name", "unknown")
+                desc = func.get("description", "")
+                params = func.get("parameters", {})
+                props = params.get("properties", {})
+                param_str = ", ".join(props.keys()) if props else "none"
+                tool_desc += f"- {name}({param_str}): {desc}\n"
+            tool_desc += "\nWhen you need to use a tool, respond with ONLY the tool call in this format:\n"
+            tool_desc += '```tool_call\n{"name": "tool_name", "arguments": {"arg1": "value1"}}\n```\n'
+            system_parts.append(tool_desc)
+
+        prompt_parts = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if role == "system":
+                prompt_parts.append(f"System: {content}")
+            elif role == "user":
+                prompt_parts.append(f"User: {content}")
+            elif role == "assistant":
+                prompt_parts.append(f"Assistant: {content}")
+
+        if system_parts:
+            prompt_parts = system_parts + prompt_parts
+
+        prompt = "\n\n".join(prompt_parts) + "\n\nAssistant:"
+
+        return {
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "temperature": temperature,
+                "num_predict": max_tokens,
+                "top_p": top_p,
+            },
+        }
+
+    def _build_vllm_payload(
+        self, messages, temperature, max_tokens, top_p, tools=None, **kwargs
+    ):
+        """Build vLLM format payload."""
+        payload = {
+            "messages": messages,
+            "sampling_params": {
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "top_p": top_p,
+            },
+            "use_openai_format": 1,
+        }
+
+        stop = kwargs.get("stop")
+        presence_penalty = kwargs.get("presence_penalty")
+        frequency_penalty = kwargs.get("frequency_penalty")
+
+        if stop is not None:
+            payload["sampling_params"]["stop"] = stop
+        if presence_penalty is not None:
+            payload["sampling_params"]["presence_penalty"] = presence_penalty
+        if frequency_penalty is not None:
+            payload["sampling_params"]["frequency_penalty"] = frequency_penalty
+
+        if tools:
+            payload["tools"] = tools
+
+        return payload
+
+    async def chat_completion(
+        self,
+        messages: list,
+        model: str,
+        temperature: float = 0.7,
+        max_tokens: int = 256,
+        top_p: float = 1.0,
+        stream: bool = False,
+        tools: Optional[list] = None,
+        **kwargs,
+    ) -> tuple[Optional[dict], Optional[dict], int]:
+        input_data = self._build_payload(
+            messages, temperature, max_tokens, top_p, tools, **kwargs
+        )
+
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            response = await client.post(
+                f"https://api.runpod.ai/v2/{self.endpoint_id}/runsync",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={"input": input_data},
+            )
+
+            if response.status_code != 200:
+                return (
+                    None,
+                    {
+                        "error": {
+                            "message": f"RunPod error: {response.text}",
+                            "type": "internal_server_error",
+                            "code": "runpod_error",
+                        }
+                    },
+                    500,
+                )
+
+            result = response.json()
+            job_id = result.get("id", f"chat-{int(time.time())}")
+
+            if result.get("status") != "COMPLETED":
+                result = await self._wait_for_completion(client, job_id)
+                if result.get("status") == "TIMEOUT":
+                    return (
+                        None,
+                        {
+                            "error": {
+                                "message": "Request timed out",
+                                "type": "timeout_error",
+                                "code": "request_timeout",
+                            }
+                        },
+                        408,
+                    )
+                if result.get("status") in ["FAILED", "CANCELLED"]:
+                    return (
+                        None,
+                        {
+                            "error": {
+                                "message": f"Job {result.get('status', 'unknown').lower()}",
+                                "type": "internal_server_error",
+                                "code": "job_failed",
+                            }
+                        },
+                        500,
+                    )
+
+            return {"job_id": job_id, "result": result}, None, 200
+
+    async def _wait_for_completion(self, client, job_id, max_wait=300):
+        start = time.time()
+        while time.time() - start < max_wait:
+            await asyncio.sleep(2)
+            status_resp = await client.get(
+                f"https://api.runpod.ai/v2/{self.endpoint_id}/status/{job_id}",
+                headers={"Authorization": f"Bearer {self.api_key}"},
+            )
+            if status_resp.status_code == 200:
+                data = status_resp.json()
+                if data.get("status") == "COMPLETED":
+                    return data
+                elif data.get("status") in ["FAILED", "CANCELLED"]:
+                    return data
+        return {"status": "TIMEOUT"}
+
+    async def health_check(self) -> bool:
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.get(
+                    f"https://api.runpod.ai/v2/{self.endpoint_id}/health",
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                )
+                return response.status_code == 200
+        except Exception:
+            return False
+
+
+# ============================================================================
+# Backend Factory
+# ============================================================================
+
+
+def get_backend() -> LLMBackend:
+    """Get the configured backend based on environment variables."""
+    use_queue = os.getenv("USE_AI_QUEUE", "false").lower() == "true"
+
+    if use_queue:
+        return AIQueueBackend()
+    else:
+        return RunPodBackend()
+
+
+# Initialize backend
+BACKEND = get_backend()
 
 RUNPOD_API_KEY = os.getenv("RUNPOD_API_KEY", "")
 RUNPOD_ENDPOINT_ID = os.getenv("RUNPOD_ENDPOINT_ID", "")
@@ -445,7 +815,16 @@ def process_content(content):
     return None, content
 
 
-def build_input_payload_vllm(messages, temperature, max_tokens, top_p, tools=None):
+def build_input_payload_vllm(
+    messages,
+    temperature,
+    max_tokens,
+    top_p,
+    tools=None,
+    stop=None,
+    presence_penalty=None,
+    frequency_penalty=None,
+):
     """Build vLLM format payload."""
     payload = {
         "messages": messages,
@@ -456,12 +835,21 @@ def build_input_payload_vllm(messages, temperature, max_tokens, top_p, tools=Non
         },
         "use_openai_format": 1,
     }
+    # Add additional sampling params (OA-1)
+    if stop is not None:
+        payload["sampling_params"]["stop"] = stop
+    if presence_penalty is not None:
+        payload["sampling_params"]["presence_penalty"] = presence_penalty
+    if frequency_penalty is not None:
+        payload["sampling_params"]["frequency_penalty"] = frequency_penalty
     if tools:
         payload["tools"] = tools
     return payload
 
 
-def build_input_payload_ollama(messages, temperature, max_tokens, top_p, tools=None):
+def build_input_payload_ollama(
+    messages, temperature, max_tokens, top_p, tools=None, stop=None
+):
     """Build Ollama format payload - convert messages to prompt with tool definitions."""
     # Include tool definitions in system prompt if tools are provided
     system_parts = []
@@ -533,7 +921,24 @@ def extract_content_ollama(result):
     return ""
 
 
-async def handle_ai_queue_request(messages, model, tools, timeout=1200):
+async def handle_ai_queue_request(
+    messages,
+    model,
+    tools,
+    timeout=1200,
+    temperature=None,
+    max_tokens=None,
+    top_p=None,
+    stop=None,
+    presence_penalty=None,
+    frequency_penalty=None,
+    logit_bias=None,
+    user=None,
+    tool_choice=None,
+    response_format=None,
+    seed=None,
+    parallel_tool_calls=None,
+):
     """Route request through AI Queue Master instead of directly to RunPod."""
     headers = {
         "Authorization": f"Bearer {AI_QUEUE_API_KEY}",
@@ -543,11 +948,40 @@ async def handle_ai_queue_request(messages, model, tools, timeout=1200):
         "X-Model": model,
     }
 
+    # Add user ID if provided (OA-1)
+    if user:
+        headers["X-User-ID"] = user
+
     payload = {
         "model": model,
         "messages": messages,
         "stream": False,
     }
+
+    # Add optional parameters (OA-1)
+    if temperature is not None:
+        payload["temperature"] = temperature
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
+    if top_p is not None:
+        payload["top_p"] = top_p
+    if stop is not None:
+        payload["stop"] = stop
+    if presence_penalty is not None:
+        payload["presence_penalty"] = presence_penalty
+    if frequency_penalty is not None:
+        payload["frequency_penalty"] = frequency_penalty
+    if logit_bias is not None:
+        payload["logit_bias"] = logit_bias
+    if tool_choice is not None:
+        payload["tool_choice"] = tool_choice
+    if response_format is not None:
+        payload["response_format"] = response_format
+    if seed is not None:
+        payload["seed"] = seed
+    if parallel_tool_calls is not None:
+        payload["parallel_tool_calls"] = parallel_tool_calls
+
     if tools:
         payload["tools"] = tools
 
@@ -559,9 +993,25 @@ async def handle_ai_queue_request(messages, model, tools, timeout=1200):
         )
 
         if response.status_code != 200:
+            try:
+                error_data = response.json()
+                if "error" in error_data:
+                    return (
+                        None,
+                        {"error": error_data["error"]},
+                        response.status_code,
+                    )
+            except Exception:
+                pass
             return (
                 None,
-                {"error": f"AI Queue error: {response.text}"},
+                {
+                    "error": {
+                        "message": f"AI Queue error: {response.text}",
+                        "type": "internal_server_error",
+                        "code": "queue_error",
+                    }
+                },
                 response.status_code,
             )
 
@@ -569,7 +1019,10 @@ async def handle_ai_queue_request(messages, model, tools, timeout=1200):
 
         # Handle error responses from queue
         if result.get("error"):
-            return None, {"error": result.get("error")}, 500
+            error_info = result.get("error")
+            if isinstance(error_info, str):
+                error_info = {"message": error_info, "type": "internal_server_error"}
+            return None, {"error": error_info}, 500
 
         return result, None, 200
 
@@ -586,6 +1039,17 @@ async def chat_completions(request: Request):
     stream = data.get("stream", False)
     tools = data.get("tools", [])
 
+    # Additional OpenAI parameters (OA-1)
+    stop = data.get("stop")
+    presence_penalty = data.get("presence_penalty")
+    frequency_penalty = data.get("frequency_penalty")
+    logit_bias = data.get("logit_bias")
+    user = data.get("user")
+    tool_choice = data.get("tool_choice")
+    response_format = data.get("response_format")
+    seed = data.get("seed")
+    parallel_tool_calls = data.get("parallel_tool_calls", True)
+
     # Route through AI Queue Master if enabled
     if USE_AI_QUEUE:
         import logging
@@ -596,7 +1060,21 @@ async def chat_completions(request: Request):
         )
 
         queue_result, error, status_code = await handle_ai_queue_request(
-            messages, model, tools
+            messages,
+            model,
+            tools,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            stop=stop,
+            presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty,
+            logit_bias=logit_bias,
+            user=user,
+            tool_choice=tool_choice,
+            response_format=response_format,
+            seed=seed,
+            parallel_tool_calls=parallel_tool_calls,
         )
 
         if error:
@@ -778,11 +1256,18 @@ async def chat_completions(request: Request):
     # Build payload based on endpoint type
     if ENDPOINT_TYPE == "ollama":
         input_data = build_input_payload_ollama(
-            messages, temperature, max_tokens, top_p, tools
+            messages, temperature, max_tokens, top_p, tools, stop=stop
         )
     else:
         input_data = build_input_payload_vllm(
-            messages, temperature, max_tokens, top_p, tools
+            messages,
+            temperature,
+            max_tokens,
+            top_p,
+            tools,
+            stop=stop,
+            presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty,
         )
 
     async with httpx.AsyncClient(timeout=300.0) as client:
@@ -797,7 +1282,14 @@ async def chat_completions(request: Request):
 
         if response.status_code != 200:
             return JSONResponse(
-                status_code=500, content={"error": f"RunPod error: {response.text}"}
+                status_code=500,
+                content={
+                    "error": {
+                        "message": f"RunPod error: {response.text}",
+                        "type": "internal_server_error",
+                        "code": "runpod_error",
+                    }
+                },
             )
 
         result = response.json()
@@ -807,12 +1299,25 @@ async def chat_completions(request: Request):
             result = await wait_for_completion(client, job_id)
             if result.get("status") == "TIMEOUT":
                 return JSONResponse(
-                    status_code=408, content={"error": "Request timed out"}
+                    status_code=408,
+                    content={
+                        "error": {
+                            "message": "Request timed out",
+                            "type": "timeout_error",
+                            "code": "request_timeout",
+                        }
+                    },
                 )
             if result.get("status") in ["FAILED", "CANCELLED"]:
                 return JSONResponse(
                     status_code=500,
-                    content={"error": f"Job {result.get('status', 'unknown').lower()}"},
+                    content={
+                        "error": {
+                            "message": f"Job {result.get('status', 'unknown').lower()}",
+                            "type": "internal_server_error",
+                            "code": "job_failed",
+                        }
+                    },
                 )
 
         # Extract content based on endpoint type
@@ -983,6 +1488,17 @@ async def chat_completions(request: Request):
                 "usage": usage,
             }
         )
+
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint."""
+    backend_healthy = await BACKEND.health_check()
+    return {
+        "status": "healthy" if backend_healthy else "unhealthy",
+        "backend": type(BACKEND).__name__,
+        "timestamp": int(time.time()),
+    }
 
 
 @app.get("/v1/models")
