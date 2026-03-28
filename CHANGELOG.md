@@ -2,7 +2,19 @@
 
 All notable changes to the RunPod Serverless Proxy will be documented in this file.
 
-## [1.5.0] - 2026-03-28
+## [1.5.1] - 2026-03-28
+
+### Changed
+
+- **Major refactor**: Unified code with backend abstraction layer
+  - Removed duplicate code paths (~460 lines removed)
+  - Chat completions now use `BACKEND.chat_completion()` uniformly
+  - Easier to add new backends
+- Default model: `project-system-ai`
+
+### Files Changed
+
+- simple_bridge.py: 1500+ → 1036 lines (net -660 lines including additions)
 
 ### Added
 
