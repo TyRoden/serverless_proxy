@@ -238,8 +238,8 @@ def log_chat_usage(virtual_model, endpoint_name, endpoint_id, usage, response_ti
         )
 
         cost_in, cost_out = get_virtual_model_cost(virtual_model)
-        cost_estimate = (prompt_tokens / 1000 * cost_in) + (
-            completion_tokens / 1000 * cost_out
+        cost_estimate = (prompt_tokens / 1000000 * cost_in) + (
+            completion_tokens / 1000000 * cost_out
         )
 
         with get_db() as conn:
@@ -260,8 +260,8 @@ def log_chat_usage(virtual_model, endpoint_name, endpoint_id, usage, response_ti
                     completion_tokens,
                     total_tokens,
                     cost_estimate,
-                    prompt_tokens / 1000 * cost_in,
-                    completion_tokens / 1000 * cost_out,
+                    prompt_tokens / 1000000 * cost_in,
+                    completion_tokens / 1000000 * cost_out,
                     response_time_ms,
                 ),
             )
@@ -283,8 +283,8 @@ def log_completion_usage(
         )
 
         cost_in, cost_out = get_virtual_model_cost(virtual_model)
-        cost_estimate = (prompt_tokens / 1000 * cost_in) + (
-            completion_tokens / 1000 * cost_out
+        cost_estimate = (prompt_tokens / 1000000 * cost_in) + (
+            completion_tokens / 1000000 * cost_out
         )
 
         with get_db() as conn:
@@ -305,8 +305,8 @@ def log_completion_usage(
                     completion_tokens,
                     total_tokens,
                     cost_estimate,
-                    prompt_tokens / 1000 * cost_in,
-                    completion_tokens / 1000 * cost_out,
+                    prompt_tokens / 1000000 * cost_in,
+                    completion_tokens / 1000000 * cost_out,
                     response_time_ms,
                 ),
             )
@@ -328,8 +328,8 @@ def log_embedding_usage(
         total_tokens = input_tokens + output_tokens
 
         cost_in, cost_out = get_virtual_model_cost(virtual_model)
-        cost_estimate = (input_tokens / 1000 * cost_in) + (
-            output_tokens / 1000 * cost_out
+        cost_estimate = (input_tokens / 1000000 * cost_in) + (
+            output_tokens / 1000000 * cost_out
         )
 
         with get_db() as conn:
@@ -350,8 +350,8 @@ def log_embedding_usage(
                     output_tokens,
                     total_tokens,
                     cost_estimate,
-                    input_tokens / 1000 * cost_in,
-                    output_tokens / 1000 * cost_out,
+                    input_tokens / 1000000 * cost_in,
+                    output_tokens / 1000000 * cost_out,
                     response_time_ms,
                 ),
             )
@@ -1653,7 +1653,7 @@ async def health_check():
 @app.get("/api/admin/usage")
 async def get_usage_summary(request: Request):
     """Get usage summary with date filtering."""
-    auth = validate_session()
+    auth = validate_session_fastapi(request)
     if not auth.get("valid"):
         return JSONResponse(status_code=401, content={"error": "Unauthorized"})
 
@@ -1712,7 +1712,16 @@ async def get_usage_summary(request: Request):
 
             daily_query += " GROUP BY date ORDER BY date DESC"
             cursor.execute(daily_query, daily_params)
-            daily_breakdown = [dict(row) for row in cursor.fetchall()]
+            daily_breakdown = []
+            for row in cursor.fetchall():
+                daily_breakdown.append(
+                    {
+                        "date": row[0],
+                        "prompt_tokens": row[1] or 0,
+                        "completion_tokens": row[2] or 0,
+                        "requests": row[3] or 0,
+                    }
+                )
 
             return JSONResponse(
                 content={
@@ -1734,7 +1743,7 @@ async def get_usage_summary(request: Request):
 @app.get("/api/admin/usage/by_model")
 async def get_usage_by_model(request: Request):
     """Get usage breakdown by virtual model."""
-    auth = validate_session()
+    auth = validate_session_fastapi(request)
     if not auth.get("valid"):
         return JSONResponse(status_code=401, content={"error": "Unauthorized"})
 
@@ -1776,7 +1785,7 @@ async def get_usage_by_model(request: Request):
 @app.get("/api/admin/usage/by_endpoint")
 async def get_usage_by_endpoint(request: Request):
     """Get usage breakdown by endpoint."""
-    auth = validate_session()
+    auth = validate_session_fastapi(request)
     if not auth.get("valid"):
         return JSONResponse(status_code=401, content={"error": "Unauthorized"})
 
@@ -1817,7 +1826,7 @@ async def get_usage_by_endpoint(request: Request):
 @app.post("/api/admin/usage/export")
 async def export_usage_csv(request: Request):
     """Export usage data as CSV."""
-    auth = validate_session()
+    auth = validate_session_fastapi(request)
     if not auth.get("valid"):
         return JSONResponse(status_code=401, content={"error": "Unauthorized"})
 
@@ -1884,7 +1893,7 @@ async def export_usage_csv(request: Request):
 @app.put("/virtual-models/<int:vm_id>/update_cost")
 async def update_virtual_model_cost(vm_id: int, request: Request):
     """Update cost per 1K tokens for a virtual model."""
-    auth = validate_session()
+    auth = validate_session_fastapi(request)
     if not auth.get("valid"):
         return JSONResponse(status_code=401, content={"error": "Unauthorized"})
 
@@ -1920,7 +1929,7 @@ async def update_virtual_model_cost(vm_id: int, request: Request):
 @app.get("/api/admin/usage/embeddings")
 async def get_embedding_usage(request: Request):
     """Get embedding usage summary."""
-    auth = validate_session()
+    auth = validate_session_fastapi(request)
     if not auth.get("valid"):
         return JSONResponse(status_code=401, content={"error": "Unauthorized"})
 
@@ -2163,18 +2172,38 @@ async def embeddings(request: Request):
 # ============================================================================
 
 
-def validate_session():
-    """Proxy session validation to ai-menu-system."""
+def validate_session(flask_cookies=None):
+    """Proxy session validation to ai-menu-system. Accepts cookies dict for FastAPI compatibility."""
     try:
-        cookies = flask_request.cookies
+        if flask_cookies is not None:
+            cookies = flask_cookies
+        else:
+            cookies = flask_request.cookies
         # Forward all cookies to validate endpoint
         resp = httpx.get(f"{AIMENU_URL}/session/validate", cookies=cookies, timeout=5)
         result = resp.json()
         # Debug log
-        print(f"Session validate: cookies={list(cookies.keys())}, result={result}")
+        print(
+            f"Session validate: cookies={list(cookies.keys()) if cookies else []}, result={result}"
+        )
         return result
     except Exception as e:
         print(f"Session validate error: {e}")
+        return {"valid": False}
+
+
+def validate_session_fastapi(request: Request):
+    """FastAPI version of session validation."""
+    try:
+        cookies = dict(request.cookies)
+        resp = httpx.get(f"{AIMENU_URL}/session/validate", cookies=cookies, timeout=5)
+        result = resp.json()
+        print(
+            f"FastAPI Session validate: cookies={list(cookies.keys())}, result={result}"
+        )
+        return result
+    except Exception as e:
+        print(f"FastAPI Session validate error: {e}")
         return {"valid": False}
 
 

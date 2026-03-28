@@ -10,6 +10,7 @@ All notable changes to the Serverless Proxy will be documented in this file.
   - Logs prompt tokens (input), completion tokens (output) separately
   - Tracks response time per request
   - Per-virtual-model cost configuration (different rates for input/output tokens)
+  - Cost calculated per 1M tokens (industry standard)
   - Usage API endpoints:
     - `GET /api/admin/usage` - Summary with daily breakdown
     - `GET /api/admin/usage/by_model` - Per-model breakdown
@@ -17,11 +18,28 @@ All notable changes to the Serverless Proxy will be documented in this file.
     - `POST /api/admin/usage/export` - CSV export
     - `GET /api/admin/usage/embeddings` - Embedding usage
   - Admin UI "Usage & Cost" tab with:
+    - Tab-based navigation (Dashboard / Usage & Cost)
     - Summary cards (requests, tokens, cost, avg response time)
     - Date range filtering (24h, 7d, 30d, custom)
     - Virtual model filter
     - Daily breakdown table
     - CSV export button
+
+- **Serverless Proxy Dashboard** - Web admin UI at `/proxy-dashboard`:
+  - Client-side session validation with cookie forwarding
+  - Endpoints management (add, edit, delete, test, fetch models)
+  - Virtual models management with cost configuration
+  - Proper tab navigation
+
+### Fixed
+
+- Session validation for FastAPI endpoints (was failing outside request context)
+- Caddyfile routing for `/session*` and `/api/admin/usage*`
+- Credentials forwarding for fetch calls (`credentials: 'same-origin'`)
+- JavaScript syntax error breaking function definitions
+- Tab layout - Usage section now properly toggles as tab
+- Navigation styling - now looks like proper tabs
+- Cost calculation changed from per-1K to per-1M tokens (industry standard)
 
 ### Database Changes
 

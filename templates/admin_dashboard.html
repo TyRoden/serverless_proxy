@@ -73,9 +73,27 @@
         .badge-enabled { background: rgba(16, 185, 129, 0.2); color: var(--accent-green); }
         .badge-disabled { background: rgba(239, 68, 68, 0.2); color: var(--accent-red); }
         .actions { display: flex; gap: 6px; }
-        .nav { display: flex; gap: 16px; margin-bottom: 24px; }
-        .nav a { color: var(--accent); text-decoration: none; font-size: 14px; }
-        .nav a:hover { text-decoration: underline; }
+        .nav { display: flex; gap: 4px; margin-bottom: 24px; border-bottom: 1px solid var(--border); padding-bottom: 0; }
+        .nav a { 
+            color: var(--text-secondary); 
+            text-decoration: none; 
+            font-size: 14px; 
+            padding: 10px 20px;
+            border: 1px solid transparent;
+            border-bottom: none;
+            border-radius: 6px 6px 0 0;
+            background: var(--bg-secondary);
+            margin-bottom: -1px;
+        }
+        .nav a:hover { 
+            color: var(--text-primary);
+            background: var(--bg-card);
+        }
+        .nav a.active {
+            color: var(--accent);
+            background: var(--bg-card);
+            border-color: var(--border);
+        }
         .empty { color: var(--text-secondary); text-align: center; padding: 40px; }
         .loading { text-align: center; padding: 40px; color: var(--text-secondary); }
         .form-group { margin-bottom: 16px; }
@@ -184,31 +202,46 @@
         </header>
         
         <nav class="nav">
-            <a href="/" onclick="showTab('dashboard')">Dashboard</a>
-            <a href="/" onclick="showTab('usage')">Usage & Cost</a>
+            <a href="#" onclick="console.log('Dashboard clicked'); event.preventDefault(); showTab('dashboard');">Dashboard</a>
+            <a href="#" onclick="console.log('Usage clicked'); event.preventDefault(); showTab('usage');">Usage & Cost</a>
             <a href="/menu">Menu</a>
             <a href="/queue-dashboard">AI Queue</a>
         </nav>
         
-        <!-- Endpoints Card -->
-        <div class="card">
-            <h2>Endpoints</h2>
-            <p style="color:var(--text-secondary);margin-bottom:16px;font-size:14px;">
-                Configure backend endpoints (RunPod, Ollama, OpenAI-compatible, etc.)
-            </p>
-            <div id="endpoints-list" class="loading">Loading...</div>
-            <div style="margin-top: 16px;">
-                <button class="btn btn-primary" onclick="openEndpointModal()">+ Add Endpoint</button>
+        <!-- Dashboard Tab Content -->
+        <div id="dashboard-section">
+            <!-- Endpoints Card -->
+            <div class="card">
+                <h2>Endpoints</h2>
+                <p style="color:var(--text-secondary);margin-bottom:16px;font-size:14px;">
+                    Configure backend endpoints (RunPod, Ollama, OpenAI-compatible, etc.)
+                </p>
+                <div id="endpoints-list" class="loading">Loading...</div>
+                <div style="margin-top: 16px;">
+                    <button class="btn btn-primary" onclick="openEndpointModal()">+ Add Endpoint</button>
+                </div>
+            </div>
+            
+            <!-- Virtual Models Card -->
+            <div class="card">
+                <h2>Virtual Models</h2>
+                <p style="color:var(--text-secondary);margin-bottom:16px;font-size:14px;">
+                    Map virtual model names to actual models on endpoints. Tools will see the virtual name, and requests route to the configured endpoint.
+                </p>
+                <div id="virtual-models-list" class="loading">Loading...</div>
+                <div style="margin-top: 16px;">
+                    <button class="btn btn-primary" onclick="openVMModal()">+ Add Virtual Model</button>
+                </div>
             </div>
         </div>
         
-    <!-- Usage and Cost Card -->
-    <div id="usage-section" class="hidden">
-        <div class="card">
-            <h2>Usage & Cost</h2>
-            <p style="color:var(--text-secondary);margin-bottom:16px;font-size:14px;">
-                Track token usage and costs for your virtual models. Set cost per 1K tokens on virtual models to compare against paid services.
-            </p>
+        <!-- Usage Tab Content -->
+        <div id="usage-section" class="hidden">
+            <div class="card">
+                <h2>Usage & Cost</h2>
+                <p style="color:var(--text-secondary);margin-bottom:16px;font-size:14px;">
+                    Track token usage and costs for your virtual models. Set cost per 1M tokens on virtual models to compare against paid services.
+                </p>
             <div style="display:flex;gap:16px;align-items:center;margin-bottom:16px;">
                 <div class="form-group">
                     <label>Date Range</label>
@@ -250,18 +283,7 @@
         </div>
     </div>
 
-    <!-- Virtual Models Card -->
-    <div id="dashboard-section">
-    <div class="card">
-        <h2>Virtual Models</h2>
-        <p style="color:var(--text-secondary);margin-bottom:16px;font-size:14px;">
-            Map virtual model names to actual models on endpoints. Tools will see the virtual name, and requests route to the configured endpoint.
-        </p>
-        <div id="virtual-models-list" class="loading">Loading...</div>
-        <div style="margin-top: 16px;">
-            <button class="btn btn-primary" onclick="openVMModal()">+ Add Virtual Model</button>
-        </div>
-    </div>
+    <!-- Endpoint Modal -->
     <!-- Endpoint Modal -->
         <div id="endpoint-modal" class="hidden">
             <div class="modal-overlay" onclick="if(event.target===this)closeEndpointModal()">
@@ -349,14 +371,12 @@
                         </div>
                         <div class="form-row">
                             <div class="form-group">
-                                <label for="vm-cost-in">Cost per 1K Input Tokens ($)</label>
-                                <input type="number" id="vm-cost-in" name="cost_per_1k_tokens_in" value="0" step="0.0001" min="0">
-                                <small>Price per 1K tokens you send (prompt)</small>
+                                <label for="vm-cost-in">Cost per 1M Input Tokens ($)</label>
+                                <small>Price per 1M tokens you send (prompt)</small>
                             </div>
                             <div class="form-group">
-                                <label for="vm-cost-out">Cost per 1K Output Tokens ($)</label>
-                                <input type="number" id="vm-cost-out" name="cost_per_1k_tokens_out" value="0" step="0.0001" min="0">
-                                <small>Price per 1K tokens you receive (completion)</small>
+                                <label for="vm-cost-out">Cost per 1M Output Tokens ($)</label>
+                                <small>Price per 1M tokens you receive (completion)</small>
                             </div>
                         </div>
                         <div class="checkbox-row">
@@ -382,6 +402,14 @@
     
     function showTab(tabName) {
         currentTab = tabName;
+        
+        // Update nav links
+        document.querySelectorAll('.nav a').forEach(a => a.classList.remove('active'));
+        if (tabName === 'usage') {
+            document.querySelectorAll('.nav a')[1].classList.add('active');
+        } else {
+            document.querySelectorAll('.nav a')[0].classList.add('active');
+        }
         
         if (tabName === 'usage') {
             document.getElementById('dashboard-section').classList.add('hidden');
@@ -443,14 +471,23 @@
             ...(virtualModel ? {virtual_model: virtualModel} : {})
         });
         
-        fetch('/api/admin/usage?' + params.toString())
-            .then(r => r.json())
+        fetch('/api/admin/usage?' + params.toString(), { credentials: 'same-origin' })
+            .then(r => {
+                console.log('Usage API status:', r.status);
+                return r.json();
+            })
             .then(data => {
-                renderSummaryCards(data.summary);
-                renderDailyBreakdown(data.daily_breakdown);
+                console.log('Usage API data:', data);
+                if (data.error) {
+                    showUsageError(data.error);
+                } else {
+                    renderSummaryCards(data.summary);
+                    renderDailyBreakdown(data.daily_breakdown);
+                }
                 document.getElementById('usage-loading').style.display = 'none';
             })
             .catch(err => {
+                console.error('Usage API error:', err);
                 showUsageError(err.message);
                 document.getElementById('usage-loading').style.display = 'none';
             });
@@ -538,6 +575,7 @@
         
         fetch('/api/admin/usage/export', {
             method: 'POST',
+            credentials: 'same-origin',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({start_date: startDate, end_date: endDate, virtual_model: virtualModel})
         })
@@ -669,7 +707,7 @@
     }
     
     function editEndpoint(id) {
-        fetch('/api/admin/endpoints')
+        fetch('/api/admin/endpoints', { credentials: 'same-origin' })
             .then(r => r.json())
             .then(data => {
                 const ep = data.find(e => e.id === id);
@@ -709,7 +747,7 @@
     }
     
     function loadEndpoints() {
-        fetch('/api/admin/endpoints')
+        fetch('/api/admin/endpoints', { credentials: 'same-origin' })
             .then(r => r.json())
             .then(data => {
                 const html = data.length ? `
@@ -773,7 +811,7 @@
     }
     
     function loadEndpointDropdown(selectedId) {
-        fetch('/api/admin/endpoints')
+        fetch('/api/admin/endpoints', { credentials: 'same-origin' })
             .then(r => r.json())
             .then(data => {
                 const select = document.getElementById('vm-endpoint-select');
@@ -824,7 +862,7 @@
     }
     
     function editVM(id) {
-        fetch('/api/admin/virtual-models')
+        fetch('/api/admin/virtual-models', { credentials: 'same-origin' })
             .then(r => r.json())
             .then(data => {
                 const vm = data.find(v => v.id === id);
@@ -867,7 +905,7 @@
     }
     
     function loadVirtualModels() {
-        fetch('/api/admin/virtual-models')
+        fetch('/api/admin/virtual-models', { credentials: 'same-origin' })
             .then(r => r.json())
             .then(data => {
                 const html = data.length ? `
