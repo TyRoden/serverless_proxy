@@ -1043,11 +1043,13 @@ def extract_tool_calls(content):
         r"<tool_use\s+code\s+name=\"(\w+)\"\s*>(.*?)</tool_use>", re.DOTALL
     )
     tool_code_pattern = re.compile(r"<tool_code>(.*?)</tool_code>", re.DOTALL)
+    tool_call_pattern = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
 
     fence_matches = list(fence_pattern.finditer(content))
     inline_matches = list(inline_pattern.finditer(content))
     tool_use_matches = list(tool_use_pattern.finditer(content))
     tool_code_matches = list(tool_code_pattern.finditer(content))
+    tool_call_matches = list(tool_call_pattern.finditer(content))
 
     all_ranges = []
     for m in fence_matches:
@@ -1058,6 +1060,8 @@ def extract_tool_calls(content):
         all_ranges.append(("tool_use", m.start(), m.end(), m))
     for m in tool_code_matches:
         all_ranges.append(("tool_code", m.start(), m.end(), m))
+    for m in tool_call_matches:
+        all_ranges.append(("tool_call", m.start(), m.end(), m))
     all_ranges.sort(key=lambda x: x[1])
 
     if not all_ranges:
@@ -1120,6 +1124,39 @@ def extract_tool_calls(content):
                             "function": {"name": bare[0], "arguments": bare[1]},
                         }
                     )
+                else:
+                    # Try to parse "lang tool_name argument" format (e.g., "bash read /etc/hostname")
+                    # The model outputs code fences like ```bash\nread /etc/hostname\n```
+                    # which becomes "bash read /etc/hostname" after stripping
+                    call_parts = full_call.strip().split(None, 1)
+                    if len(call_parts) == 2:
+                        # call_parts[0] = "bash read", call_parts[1] = rest
+                        # Actually split only once, so if full_call = "bash read /etc/hostname"
+                        # call_parts = ["bash", "read /etc/hostname"]
+                        second_parts = call_parts[1].strip().split(None, 1)
+                        if len(second_parts) >= 1:
+                            tool_name = second_parts[0]
+                            args_str = second_parts[1] if len(second_parts) == 2 else ""
+                            if tool_name in KNOWN_TOOL_NAMES:
+                                # Wrap in a JSON object
+                                try:
+                                    args_json = (
+                                        json.dumps({"command": args_str})
+                                        if tool_name == "bash"
+                                        else json.dumps({"filePath": args_str})
+                                    )
+                                except:
+                                    args_json = json.dumps({"value": args_str})
+                                tool_calls.append(
+                                    {
+                                        "id": f"call_{int(time.time() * 1000)}_{len(tool_calls)}",
+                                        "type": "function",
+                                        "function": {
+                                            "name": tool_name,
+                                            "arguments": args_json,
+                                        },
+                                    }
+                                )
         elif match_type == "tool_use":
             tool_name = match.group(1)
             args_inner = match.group(2).strip()
@@ -1137,6 +1174,32 @@ def extract_tool_calls(content):
                 }
             )
         elif match_type == "tool_code":
+            inner = match.group(1).strip()
+            json_objs = parse_json_objects(inner)
+            for obj in json_objs:
+                name = obj.get("name")
+                args = obj.get("arguments")
+                if name and args:
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(
+                                args.replace("\r\n", "\n").replace("\r", "\n")
+                            )
+                        except (json.JSONDecodeError, ValueError):
+                            args_fixed = args.replace("\n", "\\n").replace("\r", "\\r")
+                            try:
+                                args = json.loads(args_fixed)
+                            except (json.JSONDecodeError, ValueError):
+                                pass
+                    args_str = json.dumps(args, ensure_ascii=False)
+                    tool_calls.append(
+                        {
+                            "id": f"call_{int(time.time() * 1000)}_{len(tool_calls)}",
+                            "type": "function",
+                            "function": {"name": name, "arguments": args_str},
+                        }
+                    )
+        elif match_type == "tool_call":
             inner = match.group(1).strip()
             json_objs = parse_json_objects(inner)
             for obj in json_objs:
@@ -1450,8 +1513,8 @@ async def chat_completions(request: Request):
 
     # Check if this is a streaming response from a virtual model backend
     if "_stream_data" in result:
-        # Forward the streaming SSE response directly
-        async def stream_forwarder():
+        # Accumulate streaming response, extract tool calls, then stream properly
+        async def stream_processor():
             backend = get_backend(model)
             endpoint = backend.url
             if hasattr(backend, "endpoint_type"):
@@ -1475,16 +1538,45 @@ async def chat_completions(request: Request):
                 "stream": True,
             }
 
+            full_content = ""
+            usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
             async with httpx.AsyncClient(timeout=1200.0) as client:
                 async with client.stream(
                     "POST", endpoint, headers=headers, json=payload
                 ) as response:
                     async for line in response.aiter_lines():
-                        if line.strip():
-                            yield line + "\n\n"
+                        if line.strip() and line.startswith("data: "):
+                            try:
+                                chunk = json.loads(line[6:])
+                                if "choices" in chunk and chunk["choices"]:
+                                    delta = chunk["choices"][0].get("delta", {})
+                                    if delta.get("content"):
+                                        full_content += delta["content"]
+                                    # Check for tool_calls in delta
+                                    tc = delta.get("tool_calls")
+                                    if tc:
+                                        pass  # Already formatted tool_calls
+                                if "usage" in chunk and chunk["usage"]:
+                                    usage = chunk["usage"]
+                            except:
+                                pass
+
+            # Process accumulated content to extract tool calls
+            extracted_tc, text_content = process_content(full_content)
+
+            # Generate proper SSE with extracted tool calls
+            job_id = f"chat-{int(time_module.time())}"
+            async for chunk_data in _generate_sse(
+                job_id=job_id,
+                model=model,
+                tool_calls_data=extracted_tc,
+                text_content=text_content,
+            ):
+                yield chunk_data
 
         return StreamingResponse(
-            stream_forwarder(),
+            stream_processor(),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",

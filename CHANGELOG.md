@@ -2,6 +2,21 @@
 
 All notable changes to the Serverless Proxy will be documented in this file.
 
+## [2.2.0] - 2026-03-28
+
+### Added
+
+- **Tool Call Extraction for Streaming** - Extract and process tool calls from streaming responses:
+  - Accumulates streaming chunks to extract tool call content
+  - Parses `<tool_call>`, `<tool_code>`, `<tool_use>` formats
+  - Handles code fence formats (```bash\nread /path```)
+  - Converts extracted tool calls to proper OpenAI format
+  - Fixed streaming finish_reason to show "tool_calls" when applicable
+
+- **Extended Tool Call Format Support** - Added support for additional model output formats:
+  - `<tool_call>{"name": "...", "arguments": {...}}</tool_call>` - Qwen3 Next format
+  - `lang tool_name argument` format (e.g., "bash read /etc/hostname")
+
 ## [2.1.0] - 2026-03-28
 
 ### Added
