@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Serverless Proxy - Admin</title>
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%231a1a2e'/><text x='16' y='22' font-family='Arial,sans-serif' font-size='16' font-weight='bold' fill='%234f8cff'>P</text></svg>">
+    <style>
+        :root {
+            --bg-primary: #1a1a2e;
+            --bg-secondary: #16213e;
+            --bg-card: #1f2940;
+            --accent: #4f8cff;
+            --accent-green: #10b981;
+            --accent-red: #ef4444;
+            --accent-yellow: #f59e0b;
+            --text-primary: #e2e8f0;
+            --text-secondary: #94a3b8;
+            --border: #334155;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container { max-width: 1200px; margin: 0 auto; }
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 30px;
+            padding-bottom: 20px;
+            border-bottom: 1px solid var(--border);
+        }
+        h1 { font-size: 1.75rem; }
+        h2 { font-size: 1.25rem; margin-bottom: 16px; color: var(--text-secondary); }
+        .card {
+            background: var(--bg-card);
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        .btn {
+            padding: 8px 16px;
+            border-radius: 6px;
+            text-decoration: none;
+            font-weight: 500;
+            display: inline-block;
+            border: none;
+            cursor: pointer;
+            font-size: 14px;
+            transition: opacity 0.2s;
+        }
+        .btn:hover { opacity: 0.9; }
+        .btn-primary { background: var(--accent); color: white; }
+        .btn-danger { background: var(--accent-red); color: white; }
+        .btn-secondary { background: var(--bg-secondary); color: var(--text-primary); border: 1px solid var(--border); }
+        .btn-warning { background: var(--accent-yellow); color: #1a1a2e; }
+        .btn-success { background: var(--accent-green); color: white; }
+        .btn-sm { padding: 5px 10px; font-size: 13px; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 12px 16px; text-align: left; border-bottom: 1px solid var(--border); }
+        th { color: var(--text-secondary); font-weight: 500; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px; }
+        tr:hover { background: rgba(255,255,255,0.02); }
+        .badge {
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+        }
+        .badge-enabled { background: rgba(16, 185, 129, 0.2); color: var(--accent-green); }
+        .badge-disabled { background: rgba(239, 68, 68, 0.2); color: var(--accent-red); }
+        .actions { display: flex; gap: 6px; }
+        .nav { display: flex; gap: 16px; margin-bottom: 24px; }
+        .nav a { color: var(--accent); text-decoration: none; font-size: 14px; }
+        .nav a:hover { text-decoration: underline; }
+        .empty { color: var(--text-secondary); text-align: center; padding: 40px; }
+        .loading { text-align: center; padding: 40px; color: var(--text-secondary); }
+        .form-group { margin-bottom: 16px; }
+        label { display: block; margin-bottom: 6px; color: var(--text-secondary); font-size: 14px; }
+        input, select {
+            width: 100%;
+            padding: 10px 12px;
+            border-radius: 6px;
+            border: 1px solid var(--border);
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            font-size: 14px;
+        }
+        input:focus, select:focus { outline: none; border-color: var(--accent); }
+        small { color: var(--text-secondary); font-size: 12px; display: block; margin-top: 4px; }
+        .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+        .hidden { display: none !important; }
+        .modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.7);
+            z-index: 10000;
+            display: flex;
+            justify-content: center;
+            align-items: flex-start;
+            padding-top: 40px;
+            overflow-y: auto;
+        }
+        .modal-card {
+            max-width: 520px;
+            width: 100%;
+            margin: 20px;
+            max-height: 90vh;
+            overflow-y: auto;
+        }
+        .fetch-row {
+            display: flex;
+            gap: 8px;
+        }
+        .fetch-row input { flex: 1; }
+        .checkbox-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-top: 8px;
+        }
+        .checkbox-row input { width: auto; }
+        .checkbox-row label { margin: 0; cursor: pointer; }
+        .model-list { margin-top: 8px; max-height: 150px; overflow-y: auto; background: var(--bg-secondary); border-radius: 6px; }
+        .model-list-item {
+            padding: 8px 12px;
+            cursor: pointer;
+            border-bottom: 1px solid var(--border);
+            font-size: 13px;
+        }
+        .model-list-item:hover { background: var(--accent); color: white; }
+        .model-list-item.selected { background: var(--accent); color: white; }
+        .status-msg { padding: 10px; border-radius: 6px; margin-top: 8px; font-size: 13px; }
+        .status-error { background: rgba(239, 68, 68, 0.2); color: var(--accent-red); }
+        .status-success { background: rgba(16, 185, 129, 0.2); color: var(--accent-green); }
+    </style>
+</head>
+<body>
+    <div id="auth-overlay" style="position:fixed;top:0;left:0;width:100%;height:100%;background:var(--bg-primary);z-index:9999;display:flex;justify-content:center;align-items:center;">
+        <div style="text-align:center;">
+            <div style="font-size:24px;margin-bottom:12px;">Serverless Proxy Admin</div>
+            <div>Checking authentication...</div>
+        </div>
+    </div>
+    
+    <script>
+        fetch('/session/validate').then(r => r.json()).then(d => {
+            document.getElementById('auth-overlay').style.display = 'none';
+            if (!d.valid) {
+                window.location.href = '/login?redirect=' + encodeURIComponent(window.location.pathname);
+            } else {
+                document.getElementById('username').textContent = d.username;
+                loadEndpoints();
+                loadVirtualModels();
+            }
+        }).catch(() => {
+            window.location.href = '/login?redirect=' + encodeURIComponent(window.location.pathname);
+        });
+    </script>
+    
+    <div class="container">
+        <header>
+            <h1>Serverless Proxy Admin</h1>
+            <div>User: <strong id="username">-</strong></div>
+        </header>
+        
+        <nav class="nav">
+            <a href="/">Dashboard</a>
+            <a href="/menu">Menu</a>
+            <a href="/queue-dashboard">AI Queue</a>
+        </nav>
+        
+        <!-- Endpoints Card -->
+        <div class="card">
+            <h2>Endpoints</h2>
+            <p style="color:var(--text-secondary);margin-bottom:16px;font-size:14px;">
+                Configure backend endpoints (RunPod, Ollama, OpenAI-compatible, etc.)
+            </p>
+            <div id="endpoints-list" class="loading">Loading...</div>
+            <div style="margin-top: 16px;">
+                <button class="btn btn-primary" onclick="openEndpointModal()">+ Add Endpoint</button>
+            </div>
+        </div>
+        
+        <!-- Virtual Models Card -->
+        <div class="card">
+            <h2>Virtual Models</h2>
+            <p style="color:var(--text-secondary);margin-bottom:16px;font-size:14px;">
+                Map virtual model names to actual models on endpoints. Tools will see the virtual name, and requests route to the configured endpoint.
+            </p>
+            <div id="virtual-models-list" class="loading">Loading...</div>
+            <div style="margin-top: 16px;">
+                <button class="btn btn-primary" onclick="openVMModal()">+ Add Virtual Model</button>
+            </div>
+        </div>
+        
+        <!-- Endpoint Modal -->
+        <div id="endpoint-modal" class="hidden">
+            <div class="modal-overlay" onclick="if(event.target===this)closeEndpointModal()">
+                <div class="modal-card card">
+                    <h2 id="endpoint-modal-title">Add Endpoint</h2>
+                    <form id="endpoint-form" onsubmit="saveEndpoint(event)">
+                        <input type="hidden" name="id" id="ep-id">
+                        <div class="form-group">
+                            <label for="ep-name">Name</label>
+                            <input type="text" id="ep-name" name="name" placeholder="My RunPod Server" required>
+                            <small>A friendly name to identify this endpoint</small>
+                        </div>
+                        <div class="form-group">
+                            <label for="ep-url">URL</label>
+                            <input type="text" id="ep-url" name="url" placeholder="https://api.example.com/v1" required>
+                            <small>Base URL (e.g., http://localhost:11434 for Ollama, https://api.runpod.ai/v2/xxxx for RunPod)</small>
+                        </div>
+                        <div class="form-group">
+                            <label for="ep-key">API Key</label>
+                            <input type="password" id="ep-key" name="api_key" placeholder="(leave blank if not needed)">
+                            <small>Authorization token, if required by the endpoint</small>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="ep-type">Endpoint Type</label>
+                                <select id="ep-type" name="endpoint_type">
+                                    <option value="openai">OpenAI Compatible</option>
+                                    <option value="ollama">Ollama</option>
+                                    <option value="vllm">vLLM</option>
+                                    <option value="together">Together AI</option>
+                                    <option value="runpod">RunPod Serverless</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label for="ep-priority">Priority</label>
+                                <input type="number" id="ep-priority" name="priority" value="0" min="0">
+                                <small>Higher = preferred</small>
+                            </div>
+                        </div>
+                        <div class="checkbox-row">
+                            <input type="checkbox" id="ep-enabled" name="enabled" checked>
+                            <label for="ep-enabled">Enabled</label>
+                        </div>
+                        <div class="actions" style="margin-top:20px;">
+                            <button type="submit" class="btn btn-primary">Save Endpoint</button>
+                            <button type="button" class="btn btn-secondary" onclick="closeEndpointModal()">Cancel</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Virtual Model Modal -->
+        <div id="vm-modal" class="hidden">
+            <div class="modal-overlay" onclick="if(event.target===this)closeVMModal()">
+                <div class="modal-card card">
+                    <h2 id="vm-modal-title">Add Virtual Model</h2>
+                    <form id="vm-form" onsubmit="saveVM(event)">
+                        <input type="hidden" name="id" id="vm-id">
+                        <div class="form-group">
+                            <label for="vm-name">Virtual Model Name</label>
+                            <input type="text" id="vm-name" name="name" placeholder="prod-gpt4" required>
+                            <small>This is what tools will see when they query <code>/v1/models</code></small>
+                        </div>
+                        <div class="form-group">
+                            <label for="vm-endpoint-select">Endpoint</label>
+                            <select id="vm-endpoint-select" name="endpoint_id" required>
+                                <option value="">Select an endpoint...</option>
+                            </select>
+                            <small>Which backend endpoint to route requests to</small>
+                        </div>
+                        <div class="form-group">
+                            <label for="vm-model">Actual Model Name</label>
+                            <div class="fetch-row">
+                                <input type="text" id="vm-model" name="actual_model" placeholder="gpt-4o" required>
+                                <button type="button" class="btn btn-warning btn-sm" onclick="fetchModelsForVM()">Fetch Models</button>
+                            </div>
+                            <small>Select the endpoint above, then click "Fetch Models" to see available models</small>
+                            <div id="vm-model-list" class="model-list hidden"></div>
+                            <div id="vm-fetch-status"></div>
+                        </div>
+                        <div class="form-group">
+                            <label for="vm-desc">Description</label>
+                            <input type="text" id="vm-desc" name="description" placeholder="Production GPT-4 model">
+                        </div>
+                        <div class="checkbox-row">
+                            <input type="checkbox" id="vm-enabled" name="enabled" checked>
+                            <label for="vm-enabled">Enabled</label>
+                        </div>
+                        <div class="actions" style="margin-top:20px;">
+                            <button type="submit" class="btn btn-primary">Save Virtual Model</button>
+                            <button type="button" class="btn btn-secondary" onclick="closeVMModal()">Cancel</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+    // ==========================================
+    // Endpoint CRUD
+    // ==========================================
+    
+    function openEndpointModal(data) {
+        document.getElementById('endpoint-modal-title').textContent = data ? 'Edit Endpoint' : 'Add Endpoint';
+        document.getElementById('ep-id').value = data ? data.id : '';
+        document.getElementById('ep-name').value = data ? data.name : '';
+        document.getElementById('ep-url').value = data ? data.url : '';
+        document.getElementById('ep-key').value = data ? (data.api_key || '') : '';
+        document.getElementById('ep-type').value = data ? data.endpoint_type : 'openai';
+        document.getElementById('ep-priority').value = data ? data.priority : 0;
+        document.getElementById('ep-enabled').checked = data ? data.enabled : true;
+        document.getElementById('endpoint-modal').classList.remove('hidden');
+    }
+    
+    function closeEndpointModal() {
+        document.getElementById('endpoint-modal').classList.add('hidden');
+        document.getElementById('endpoint-form').reset();
+    }
+    
+    function saveEndpoint(e) {
+        e.preventDefault();
+        const form = e.target;
+        const id = form.id.value;
+        const data = {
+            name: form.name.value,
+            url: form.url.value,
+            api_key: form.api_key.value,
+            endpoint_type: form.endpoint_type.value,
+            priority: parseInt(form.priority.value) || 0,
+            enabled: form.enabled.checked
+        };
+        
+        const method = id ? 'PUT' : 'POST';
+        const url = id ? '/endpoints/' + id : '/endpoints';
+        
+        fetch(url, {
+            method: method,
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(data)
+        }).then(() => {
+            closeEndpointModal();
+            loadEndpoints();
+        });
+    }
+    
+    function editEndpoint(id) {
+        fetch('/api/admin/endpoints')
+            .then(r => r.json())
+            .then(data => {
+                const ep = data.find(e => e.id === id);
+                if (ep) openEndpointModal(ep);
+            });
+    }
+    
+    function testEndpoint(id) {
+        fetch('/endpoints/' + id + '/test', { method: 'POST' })
+            .then(r => r.json())
+            .then(d => {
+                alert(d.error ? 'Error: ' + d.error : 'Connected! Status: ' + d.endpoint_status);
+            })
+            .catch(e => alert('Error: ' + e.message));
+    }
+    
+    function fetchModels(id) {
+        fetch('/endpoints/' + id + '/models')
+            .then(r => r.json())
+            .then(d => {
+                if (d.error) {
+                    alert('Error: ' + d.error);
+                } else if (d.models && d.models.length) {
+                    alert('Available models:\n\n' + d.models.join('\n'));
+                } else {
+                    alert('No models found');
+                }
+            })
+            .catch(e => alert('Error: ' + e.message));
+    }
+    
+    function deleteEndpoint(id) {
+        if (confirm('Delete this endpoint and all its virtual models?')) {
+            fetch('/endpoints/' + id + '/delete')
+                .then(() => loadEndpoints());
+        }
+    }
+    
+    function loadEndpoints() {
+        fetch('/api/admin/endpoints')
+            .then(r => r.json())
+            .then(data => {
+                const html = data.length ? `
+                    <table>
+                        <thead><tr><th>Name</th><th>URL</th><th>Type</th><th>Status</th><th>Actions</th></tr></thead>
+                        <tbody>
+                            ${data.map(ep => `
+                                <tr>
+                                    <td><strong>${ep.name}</strong></td>
+                                    <td><code style="word-break:break-all;font-size:12px;">${ep.url}</code></td>
+                                    <td>${ep.endpoint_type}</td>
+                                    <td>
+                                        <span class="badge ${ep.enabled ? 'badge-enabled' : 'badge-disabled'}">
+                                            ${ep.enabled ? 'Enabled' : 'Disabled'}
+                                        </span>
+                                    </td>
+                                    <td class="actions">
+                                        <button class="btn btn-secondary btn-sm" onclick="editEndpoint(${ep.id})">Edit</button>
+                                        <button class="btn btn-warning btn-sm" onclick="fetchModels(${ep.id})">Models</button>
+                                        <button class="btn btn-danger btn-sm" onclick="deleteEndpoint(${ep.id})">Delete</button>
+                                    </td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                ` : '<p class="empty">No endpoints configured. Click "Add Endpoint" to get started.</p>';
+                document.getElementById('endpoints-list').innerHTML = html;
+            })
+            .catch(err => {
+                document.getElementById('endpoints-list').innerHTML = '<p style="color:var(--accent-red);">Error loading endpoints: ' + err.message + '</p>';
+            });
+    }
+    
+    // ==========================================
+    // Virtual Model CRUD
+    // ==========================================
+    
+    function openVMModal(data) {
+        document.getElementById('vm-modal-title').textContent = data ? 'Edit Virtual Model' : 'Add Virtual Model';
+        document.getElementById('vm-id').value = data ? data.id : '';
+        document.getElementById('vm-name').value = data ? data.name : '';
+        document.getElementById('vm-model').value = data ? data.actual_model : '';
+        document.getElementById('vm-desc').value = data ? (data.description || '') : '';
+        document.getElementById('vm-enabled').checked = data ? data.enabled : true;
+        document.getElementById('vm-model-list').classList.add('hidden');
+        document.getElementById('vm-fetch-status').innerHTML = '';
+        
+        // Load endpoints dropdown
+        loadEndpointDropdown(data ? data.endpoint_id : null);
+        
+        document.getElementById('vm-modal').classList.remove('hidden');
+    }
+    
+    function closeVMModal() {
+        document.getElementById('vm-modal').classList.add('hidden');
+        document.getElementById('vm-form').reset();
+        document.getElementById('vm-model-list').classList.add('hidden');
+        document.getElementById('vm-fetch-status').innerHTML = '';
+    }
+    
+    function loadEndpointDropdown(selectedId) {
+        fetch('/api/admin/endpoints')
+            .then(r => r.json())
+            .then(data => {
+                const select = document.getElementById('vm-endpoint-select');
+                select.innerHTML = '<option value="">Select an endpoint...</option>' +
+                    data.filter(ep => ep.enabled).map(ep => 
+                        `<option value="${ep.id}" ${ep.id === selectedId ? 'selected' : ''}>${ep.name} (${ep.endpoint_type})</option>`
+                    ).join('');
+            });
+    }
+    
+    function fetchModelsForVM() {
+        const endpointId = document.getElementById('vm-endpoint-select').value;
+        if (!endpointId) {
+            alert('Please select an endpoint first');
+            return;
+        }
+        
+        const statusEl = document.getElementById('vm-fetch-status');
+        statusEl.innerHTML = '<div class="status-msg">Fetching models...</div>';
+        
+        fetch('/endpoints/' + endpointId + '/models')
+            .then(r => r.json())
+            .then(d => {
+                if (d.error) {
+                    statusEl.innerHTML = '<div class="status-msg status-error">Error: ' + d.error + '</div>';
+                } else if (d.models && d.models.length) {
+                    const listEl = document.getElementById('vm-model-list');
+                    listEl.innerHTML = d.models.map(m => 
+                        `<div class="model-list-item" onclick="selectVMModel('${m}')">${m}</div>`
+                    ).join('');
+                    listEl.classList.remove('hidden');
+                    statusEl.innerHTML = '<div class="status-msg status-success">Found ' + d.models.length + ' models. Click to select.</div>';
+                } else {
+                    statusEl.innerHTML = '<div class="status-msg status-error">No models found</div>';
+                }
+            })
+            .catch(e => {
+                statusEl.innerHTML = '<div class="status-msg status-error">Error: ' + e.message + '</div>';
+            });
+    }
+    
+    function selectVMModel(modelName) {
+        document.getElementById('vm-model').value = modelName;
+        // Highlight selected
+        document.querySelectorAll('#vm-model-list .model-list-item').forEach(el => {
+            el.classList.toggle('selected', el.textContent === modelName);
+        });
+    }
+    
+    function editVM(id) {
+        fetch('/api/admin/virtual-models')
+            .then(r => r.json())
+            .then(data => {
+                const vm = data.find(v => v.id === id);
+                if (vm) openVMModal(vm);
+            });
+    }
+    
+    function saveVM(e) {
+        e.preventDefault();
+        const form = e.target;
+        const id = form.id.value;
+        const data = {
+            name: form.name.value,
+            endpoint_id: parseInt(form.endpoint_id.value),
+            actual_model: form.actual_model.value,
+            description: form.description.value,
+            enabled: form.enabled.checked
+        };
+        
+        const method = id ? 'PUT' : 'POST';
+        const url = id ? '/virtual-models/' + id : '/virtual-models';
+        
+        fetch(url, {
+            method: method,
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(data)
+        }).then(() => {
+            closeVMModal();
+            loadVirtualModels();
+        });
+    }
+    
+    function deleteVirtualModel(id) {
+        if (confirm('Delete this virtual model?')) {
+            fetch('/virtual-models/' + id + '/delete')
+                .then(() => loadVirtualModels());
+        }
+    }
+    
+    function loadVirtualModels() {
+        fetch('/api/admin/virtual-models')
+            .then(r => r.json())
+            .then(data => {
+                const html = data.length ? `
+                    <table>
+                        <thead><tr><th>Virtual Name</th><th>Endpoint</th><th>Actual Model</th><th>Description</th><th>Actions</th></tr></thead>
+                        <tbody>
+                            ${data.map(vm => `
+                                <tr>
+                                    <td><strong>${vm.name}</strong></td>
+                                    <td>${vm.endpoint_name || 'N/A'}</td>
+                                    <td><code>${vm.actual_model}</code></td>
+                                    <td>${vm.description || '-'}</td>
+                                    <td class="actions">
+                                        <button class="btn btn-secondary btn-sm" onclick="editVM(${vm.id})">Edit</button>
+                                        <button class="btn btn-danger btn-sm" onclick="deleteVirtualModel(${vm.id})">Delete</button>
+                                    </td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                ` : '<p class="empty">No virtual models configured. Click "Add Virtual Model" to get started.</p>';
+                document.getElementById('virtual-models-list').innerHTML = html;
+            })
+            .catch(err => {
+                document.getElementById('virtual-models-list').innerHTML = '<p style="color:var(--accent-red);">Error loading: ' + err.message + '</p>';
+            });
+    }
+    </script>
+</body>
+</html>

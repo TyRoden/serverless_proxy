@@ -1,6 +1,50 @@
 # Changelog
 
-All notable changes to the RunPod Serverless Proxy will be documented in this file.
+All notable changes to the Serverless Proxy will be documented in this file.
+
+## [2.0.0] - 2026-03-28
+
+### Added
+
+- **Multi-Backend Support** - Connect to any LLM backend:
+  - RunPod Serverless
+  - Ollama
+  - OpenAI-compatible APIs
+  - Together AI
+  - vLLM
+  - Extensible backend architecture for easy addition of new providers
+
+- **Web Admin UI** - Configure endpoints and virtual models via browser:
+  - Access at `/proxy-dashboard`
+  - Endpoint management (add, edit, delete, test)
+  - Virtual model mapping
+  - Model discovery from endpoints
+  - Enable/disable toggles
+  - Integrated with AI Menu System authentication
+
+- **Virtual Model Mapping** - Map user-facing model names to actual backend models:
+  - Virtual names exposed via `/v1/models`
+  - Requests routed to correct backend based on virtual model
+  - Supports any backend type
+
+- **Admin API** - RESTful API for endpoint and virtual model management:
+  - CRUD operations for endpoints
+  - CRUD operations for virtual models
+  - Endpoint testing and model discovery endpoints
+  - Session-based authentication via AI Menu System
+
+### Changed
+
+- Renamed from "RunPod Serverless Proxy" to "Serverless Proxy" (universal)
+- Default port: 8002 (API), 5001 (Admin API)
+- SQLite database at `/data/proxy.db`
+- Admin UI served as static HTML with JavaScript
+
+### Files Changed
+
+- simple_bridge.py: Added Flask admin routes, backend abstraction, virtual model routing
+- templates/admin_dashboard.html: New admin UI
+- requirements.txt: Added flask, flask-cors, jinja2
 
 ## [1.5.1] - 2026-03-28
 

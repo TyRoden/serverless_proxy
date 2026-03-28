@@ -1,145 +1,144 @@
-# RunPod Serverless Proxy
+# Serverless Proxy - Universal LLM Gateway
 
-An OpenAI-compatible API proxy that bridges standard API requests to RunPod Serverless endpoints, making queue-based serverless LLM inference work as a drop-in OpenAI API replacement.
+A universal OpenAI-compatible API proxy that bridges standard API requests to multiple backend providers (RunPod, Ollama, OpenAI-compatible APIs, Together AI, etc.). Configure endpoints through a web admin UI and map virtual model names to actual backend models.
 
-## Tested With
+## Overview
 
-- **RunPod Worker Ollama** `ollama@0.18.2` on RunPod Serverless
-- **Model**: Qwen 3.5 27B (`qwen3.5:27b`)
+```
+Client (OpenAI format) → Serverless Proxy (port 8002) → Configured Backends
+```
 
-## Features
-
-- **OpenAI-compatible endpoints** — Works with any OpenAI client library (`openai`, `AI SDK`, etc.)
-- **Tool call parsing** — Automatically extracts tool calls from model output in multiple formats:
-  - Fenced JSON: ` ```tool_call {"name": "...", "arguments": {...}} ``` `
-  - XML-style: `<tool_code>{"name":"...","arguments":{...}}</tool_code>` (OpenCode task format)
-  - `<tool_use code name="...">` format
-  - Bare Python calls: `task(description="...", prompt="...")`
-  - Multiple calls per fence: `{"name":"x"}{"name":"y"}`
-- **Chain-of-thought stripping** — Removes `analysis:`, `final:`, `assistantfinal` prefixes from responses
-- **Streaming & non-streaming** — Full SSE streaming support with proper `chat.completion.chunk` format
-- **Job polling** — Automatically polls for queued job completion (configurable timeout)
-- **Dual endpoint support** — Works with both Ollama and vLLM endpoints via `ENDPOINT_TYPE`
-- **AI Queue Master integration** — Optional routing through [AI Queue Master](https://github.com/TyRoden/ai-queue-master) for priority queuing and request tracking
+- **Universal**: Connect to any LLM backend (RunPod, Ollama, OpenAI, Together AI, etc.)
+- **Virtual Models**: Map user-facing model names to actual backend models
+- **Admin UI**: Configure endpoints and virtual models via web interface
+- **OpenAI-compatible**: Works with any OpenAI client library
 
 ## Quick Start
-
-### Prerequisites
-
-- Docker & Docker Compose
-- A RunPod serverless endpoint with an LLM worker (tested with [RunPod Worker Ollama](https://hub.docker.com/r/ollama/ollama))
-- RunPod API key
-
-### Run with Docker
 
 ```bash
 git clone https://github.com/TyRoden/serverless_proxy.git
 cd serverless_proxy
 cp .env.example .env
-# Edit .env with your RUNPOD_API_KEY and RUNPOD_ENDPOINT_ID
+# Edit .env with your configuration
 docker compose up -d --build
-curl http://localhost:8002/v1/models | jq .
+
+# Access admin UI at https://your-domain/proxy-dashboard
+# API available at http://localhost:8002/v1/chat/completions
 ```
 
-### Configuration
-
-Copy `.env.example` to `.env` and set your values:
-
-```bash
-RUNPOD_API_KEY=your_runpod_api_key
-RUNPOD_ENDPOINT_ID=your_endpoint_id
-MODEL_NAME=qwen3.5:27b
-ENDPOINT_TYPE=ollama
-TIMEOUT=300
-```
-
-The `docker-compose.yml` uses `env_file: .env` to load these automatically.
+## Configuration
 
 ### Environment Variables
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `RUNPOD_API_KEY` | RunPod API key | (required) |
-| `RUNPOD_ENDPOINT_ID` | RunPod serverless endpoint ID | (required) |
-| `MODEL_NAME` | Model identifier exposed by the API | `qwen3.5:27b` |
-| `ENDPOINT_TYPE` | Endpoint format: `ollama` or `vllm` | `ollama` |
-| `TIMEOUT` | Request timeout in seconds | `300` |
+| `DATABASE_PATH` | SQLite database path | `/data/proxy.db` |
+| `FLASK_PORT` | Admin UI port | `5001` |
+| `TIMEOUT` | Request timeout (seconds) | `300` |
+| `AIMENU_URL` | AI Menu System URL for auth | `http://host.docker.internal:5000` |
+
+### Docker Ports
+
+| Port | Service |
+|------|---------|
+| `8002` | OpenAI-compatible API |
+| `5001` | Admin UI API |
+
+## Admin Dashboard
+
+Access the admin dashboard at `/proxy-dashboard`. Authentication is handled by the AI Menu System.
+
+### Features
+
+- **Endpoint Management**: Add, edit, delete backend endpoints
+- **Virtual Model Mapping**: Map virtual model names to actual backend models
+- **Model Discovery**: Fetch available models from endpoints
+- **Enable/Disable**: Toggle endpoints and virtual models
+
+### Endpoint Configuration
+
+Configure backend endpoints with:
+
+- **Name**: Friendly identifier
+- **URL**: Base URL (e.g., `http://localhost:11434`, `https://api.runpod.ai/v2/xxxx`)
+- **API Key**: Authorization token (if required)
+- **Type**: `openai`, `ollama`, `vllm`, `together`, `runpod`
+- **Priority**: Higher priority endpoints are preferred
+- **Enabled**: Enable/disable endpoint
+
+### Virtual Models
+
+Map virtual model names to actual backend models:
+
+- **Virtual Name**: What clients will request (e.g., `gpt-4`, `prod-llama`)
+- **Endpoint**: Which backend to route to
+- **Actual Model**: The model name on the backend (e.g., `gpt-4o`, `llama3:70b`)
 
 ## API Endpoints
 
-### `GET /v1/models`
+### OpenAI-Compatible API (port 8002)
 
 ```bash
+# List models
 curl http://localhost:8002/v1/models
-```
 
-### `POST /v1/chat/completions`
-
-```bash
+# Chat completions
 curl -X POST http://localhost:8002/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model": "qwen3.5:27b", "messages": [{"role": "user", "content": "Hello!"}]}'
+  -d '{"model": "my-virtual-model", "messages": [{"role": "user", "content": "Hello!"}]}'
 ```
 
-#### Streaming
+#### Supported Endpoints
 
-```bash
-curl -X POST http://localhost:8002/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model": "qwen3.5:27b", "messages": [{"role": "user", "content": "Hi"}], "stream": true}'
-```
+- `GET /v1/models` - List available models (virtual models + default)
+- `POST /v1/chat/completions` - Chat completions
+- `POST /v1/completions` - Text completions
+- `POST /v1/embeddings` - Embeddings
+- `GET /health` - Health check
 
-## Endpoint Types
+### Admin API (port 5001)
 
-### Ollama (`ENDPOINT_TYPE=ollama`)
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/admin/endpoints` | GET | List all endpoints |
+| `/endpoints` | GET, POST | Manage endpoints |
+| `/endpoints/<id>` | PUT | Update endpoint |
+| `/endpoints/<id>/delete` | POST | Delete endpoint |
+| `/endpoints/<id>/test` | POST | Test endpoint connection |
+| `/endpoints/<id>/models` | GET | Fetch available models |
+| `/api/admin/virtual-models` | GET | List virtual models |
+| `/virtual-models` | GET, POST | Manage virtual models |
+| `/virtual-models/<id>` | PUT | Update virtual model |
+| `/virtual-models/<id>/delete` | POST | Delete virtual model |
 
-Converts OpenAI message format to a prompt format suitable for RunPod Ollama endpoints.
+## Backend Types
 
-### vLLM (`ENDPOINT_TYPE=vllm`)
+| Type | Description |
+|------|-------------|
+| `openai` | OpenAI-compatible API |
+| `ollama` | Ollama API |
+| `vllm` | vLLM API |
+| `together` | Together AI |
+| `runpod` | RunPod Serverless |
 
-Passes messages directly with `sampling_params`. Suitable for RunPod vLLM endpoints.
+## AI Queue Integration (Optional)
 
-## AI Queue Master Integration (Optional)
-
-Route requests through [AI Queue Master](https://github.com/TyRoden/ai-queue-master) for priority queuing, request tracking, and history.
-
-### Enable AI Queue
+Route requests through AI Queue Master for priority queuing and request tracking.
 
 ```bash
 USE_AI_QUEUE=true
 AI_QUEUE_URL=http://host.docker.internal:8102
 AI_QUEUE_API_KEY=your_queue_api_key
-AI_QUEUE_PRIORITY=NORMAL  # HIGH, NORMAL, or LOW
-AI_QUEUE_SOURCE=runpod-proxy
+AI_QUEUE_PRIORITY=NORMAL
 ```
 
-### Environment Variables for AI Queue
+## Features
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `USE_AI_QUEUE` | Enable AI Queue routing | `false` |
-| `AI_QUEUE_URL` | AI Queue Master URL | `http://host.docker.internal:8102` |
-| `AI_QUEUE_API_KEY` | API key for AI Queue | (required if enabled) |
-| `AI_QUEUE_PRIORITY` | Request priority: `HIGH`, `NORMAL`, `LOW` | `NORMAL` |
-| `AI_QUEUE_SOURCE` | Source identifier for tracking | `runpod-proxy` |
-
-### Docker Network
-
-Ensure both containers are on the same Docker network:
-
-```yaml
-services:
-  runpod-proxy:
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    networks:
-      - default
-      - ai-queue-master_default
-
-networks:
-  ai-queue-master_default:
-    external: true
-```
+- **Tool call parsing** — Automatically extracts tool calls from model output
+- **Chain-of-thought stripping** — Removes reasoning prefixes
+- **Streaming & non-streaming** — Full SSE streaming support
+- **Job polling** — Automatically polls for queued job completion
+- **Session-based auth** — Uses AI Menu System for admin authentication
 
 ## Troubleshooting
 
@@ -150,40 +149,25 @@ docker logs runpod-serverless-proxy
 # Restart container
 docker restart runpod-serverless-proxy
 
-# Check endpoint health
-curl -s -H "Authorization: Bearer $RUNPOD_API_KEY" \
-  https://api.runpod.ai/v2/$RUNPOD_ENDPOINT_ID/health | jq .
-```
-
-## Development
-
-```bash
-pip install -r requirements.txt
-cp .env.example .env
-# Edit .env with your values
-python simple_bridge.py
+# Check health
+curl http://localhost:8002/health
 ```
 
 ## Project Structure
 
 ```
 .
-├── simple_bridge.py      # Main proxy application (FastAPI)
-├── docker-compose.yml    # Docker Compose configuration
-├── Dockerfile            # Container image definition
-├── requirements.txt      # Python dependencies
-├── .env.example          # Environment variable template
-├── .env                  # Your secrets (not committed)
+├── simple_bridge.py          # Main proxy application (FastAPI + Flask)
+├── docker-compose.yml        # Docker Compose configuration
+├── Dockerfile                # Container image definition
+├── requirements.txt          # Python dependencies
+├── templates/
+│   └── admin_dashboard.html # Admin UI (static HTML)
+├── .env.example              # Environment variable template
 ├── README.md
-├── CHANGELOG.md
-└── LICENSE.md
+└── CHANGELOG.md
 ```
 
 ## License
 
 MIT License — see [LICENSE.md](LICENSE.md)
-
-## Acknowledgments
-
-- Based on [runpod-serverless-proxy](https://github.com/dannysemi/runpod-serverless-proxy) by [Daniel Semanisin](https://github.com/dannysemi) — the original proxy implementation
-- Built with [FastAPI](https://fastapi.tiangolo.com/)

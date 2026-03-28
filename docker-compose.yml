@@ -4,6 +4,7 @@ services:
     container_name: runpod-serverless-proxy
     ports:
       - "8002:8002"
+      - "5001:5001"
     env_file:
       - .env
     extra_hosts:
@@ -12,6 +13,8 @@ services:
     networks:
       - default
       - ai-queue-master_default
+    volumes:
+      - ./data:/data
 
 networks:
   default:

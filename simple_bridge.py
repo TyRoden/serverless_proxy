@@ -8,14 +8,99 @@ Supports multiple backends via backend abstraction layer
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from fastapi.requests import Request as FastAPIRequest
 import httpx
 import os
 import time
 import json
 import asyncio
 import re
+import sqlite3
 from abc import ABC, abstractmethod
 from typing import Any, Optional
+from contextlib import contextmanager
+
+# Flask for admin UI
+from flask import (
+    Flask,
+    render_template,
+    request as flask_request,
+    jsonify as flask_jsonify,
+    redirect,
+)
+import secrets
+
+# Flask app for admin routes
+FLASK_PORT = int(os.getenv("FLASK_PORT", 5001))
+flask_app = Flask(__name__, template_folder="templates", static_folder="static")
+flask_app.secret_key = os.getenv("SECRET_KEY", secrets.token_hex(32))
+
+AIMENU_URL = os.getenv("AIMENU_URL", "http://localhost:5000")
+
+# Database setup
+DATABASE_PATH = os.getenv("DATABASE_PATH", "/data/proxy.db")
+
+
+def get_db_connection():
+    """Get database connection."""
+    os.makedirs(os.path.dirname(DATABASE_PATH), exist_ok=True)
+    conn = sqlite3.connect(DATABASE_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+@contextmanager
+def get_db():
+    """Context manager for database."""
+    conn = get_db_connection()
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def init_database():
+    """Initialize database tables."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        # Endpoints table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS endpoints (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                url TEXT NOT NULL,
+                api_key TEXT,
+                endpoint_type TEXT DEFAULT 'ollama',
+                priority INTEGER DEFAULT 0,
+                enabled INTEGER DEFAULT 1,
+                created_at INTEGER DEFAULT (strftime('%s', 'now')),
+                updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+            )
+        """)
+
+        # Virtual models table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS virtual_models (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                endpoint_id INTEGER NOT NULL,
+                actual_model TEXT NOT NULL,
+                description TEXT,
+                enabled INTEGER DEFAULT 1,
+                created_at INTEGER DEFAULT (strftime('%s', 'now')),
+                updated_at INTEGER DEFAULT (strftime('%s', 'now')),
+                FOREIGN KEY (endpoint_id) REFERENCES endpoints(id)
+            )
+        """)
+
+        conn.commit()
+
+
+# Initialize database on startup
+init_database()
 
 KNOWN_TOOL_NAMES = frozenset(
     [
@@ -503,8 +588,142 @@ class RunPodBackend(LLMBackend):
 # ============================================================================
 
 
-def get_backend() -> LLMBackend:
-    """Get the configured backend based on environment variables."""
+def get_virtual_model(model_name: str) -> Optional[dict]:
+    """Look up virtual model in database."""
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT vm.*, e.url as endpoint_url, e.api_key as endpoint_api_key, 
+                       e.endpoint_type as endpoint_type
+                FROM virtual_models vm
+                JOIN endpoints e ON vm.endpoint_id = e.id
+                WHERE vm.name = ? AND vm.enabled = 1 AND e.enabled = 1
+            """,
+                (model_name,),
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+    except Exception:
+        return None
+
+
+def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
+    """Create a backend from virtual model configuration."""
+    endpoint_type = vm.get("endpoint_type", "openai")
+
+    class VirtualModelBackend(LLMBackend):
+        def __init__(self):
+            self.url = vm["endpoint_url"]
+            self.api_key = vm.get("endpoint_api_key", "")
+            self.model = vm["actual_model"]
+            self.endpoint_type = endpoint_type
+
+        async def chat_completion(
+            self,
+            messages,
+            model,
+            temperature=0.7,
+            max_tokens=256,
+            top_p=1.0,
+            stream=False,
+            tools=None,
+            **kwargs,
+        ):
+            headers = {"Content-Type": "application/json"}
+            if self.api_key:
+                headers["Authorization"] = f"Bearer {self.api_key}"
+
+            # Use actual model from virtual model config
+            payload = {
+                "model": self.model,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "top_p": top_p,
+                "stream": stream,
+            }
+            if tools:
+                payload["tools"] = tools
+
+            for k, v in kwargs.items():
+                if v is not None and k not in [
+                    "stop",
+                    "presence_penalty",
+                    "frequency_penalty",
+                ]:
+                    payload[k] = v
+
+            if self.endpoint_type == "openai":
+                endpoint = self.url
+            elif self.endpoint_type == "together":
+                endpoint = f"{self.url}/v1/chat/completions"
+            else:
+                endpoint = f"{self.url}/v1/chat/completions"
+
+            timeout = 1200.0 if stream else 300.0
+
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(endpoint, headers=headers, json=payload)
+
+                if response.status_code != 200:
+                    return (
+                        None,
+                        {
+                            "error": {
+                                "message": f"Error: {response.text}",
+                                "type": "internal_server_error",
+                            }
+                        },
+                        response.status_code,
+                    )
+
+                result = response.json()
+                return result, None, 200
+
+        async def embeddings(self, input_text, model):
+            headers = {"Content-Type": "application/json"}
+            if self.api_key:
+                headers["Authorization"] = f"Bearer {self.api_key}"
+
+            payload = {"model": self.model, "input": input_text}
+
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                response = await client.post(
+                    f"{self.url}/v1/embeddings", headers=headers, json=payload
+                )
+
+                if response.status_code != 200:
+                    return (
+                        None,
+                        {"error": {"message": f"Error: {response.text}"}},
+                        response.status_code,
+                    )
+
+                return response.json(), None, 200
+
+        async def health_check(self) -> bool:
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    response = await client.get(f"{self.url}/health")
+                    return response.status_code == 200
+            except Exception:
+                return False
+
+    return VirtualModelBackend()
+
+
+def get_backend(model_name: str = None) -> LLMBackend:
+    """Get the configured backend based on virtual model or environment variables."""
+
+    # First check if model_name is a virtual model
+    if model_name:
+        vm = get_virtual_model(model_name)
+        if vm:
+            return create_backend_from_virtual_model(vm)
+
+    # Fallback to env var configuration
     use_queue = os.getenv("USE_AI_QUEUE", "false").lower() == "true"
 
     if use_queue:
@@ -513,7 +732,7 @@ def get_backend() -> LLMBackend:
         return RunPodBackend()
 
 
-# Initialize backend
+# Initialize backend (uses env vars for default)
 BACKEND = get_backend()
 
 RUNPOD_API_KEY = os.getenv("RUNPOD_API_KEY", "")
@@ -908,8 +1127,11 @@ async def chat_completions(request: Request):
         "parallel_tool_calls": data.get("parallel_tool_calls", True),
     }
 
+    # Get backend for this model (checks virtual models first, then falls back to env vars)
+    backend = get_backend(model)
+
     # Call backend (handles both AI Queue and RunPod)
-    backend_result, error, status_code = await BACKEND.chat_completion(
+    backend_result, error, status_code = await backend.chat_completion(
         messages=messages,
         model=model,
         temperature=temperature,
@@ -1128,17 +1350,52 @@ async def health_check():
 
 @app.get("/v1/models")
 async def list_models():
-    model_name = os.getenv("MODEL_NAME", "qwen3.5:27b")
-    return {
-        "object": "list",
-        "data": [
+    # Get virtual models from database
+    virtual_models = []
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT vm.name, vm.actual_model, e.name as endpoint_name
+                FROM virtual_models vm
+                JOIN endpoints e ON vm.endpoint_id = e.id
+                WHERE vm.enabled = 1 AND e.enabled = 1
+            """)
+            virtual_models = [dict(row) for row in cursor.fetchall()]
+    except Exception:
+        pass
+
+    # Get default model from env
+    default_model = os.getenv("MODEL_NAME", "project-system-ai")
+
+    # Build response with virtual models + default
+    models = []
+
+    # Add virtual models
+    for vm in virtual_models:
+        models.append(
             {
-                "id": model_name,
+                "id": vm["name"],
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": vm.get("endpoint_name", "configured"),
+            }
+        )
+
+    # Add default model if not already in list
+    if default_model not in [m["id"] for m in models]:
+        models.append(
+            {
+                "id": default_model,
                 "object": "model",
                 "created": int(time.time()),
                 "owned_by": "runpod",
             }
-        ],
+        )
+
+    return {
+        "object": "list",
+        "data": models,
     }
 
 
@@ -1161,8 +1418,11 @@ async def completions(request: Request):
     # Convert to chat format
     messages = [{"role": "user", "content": prompt}]
 
+    # Get backend for this model
+    backend = get_backend(model)
+
     # Call backend
-    backend_result, error, status_code = await BACKEND.chat_completion(
+    backend_result, error, status_code = await backend.chat_completion(
         messages=messages,
         model=model,
         temperature=temperature,
@@ -1232,9 +1492,12 @@ async def embeddings(request: Request):
     input_text = data.get("input", "")
     model = data.get("model", os.getenv("EMBEDDING_MODEL", "nomic-embed-text"))
 
+    # Get backend for this model (checks virtual models first)
+    backend = get_backend(model)
+
     # Check if backend supports embeddings
-    if hasattr(BACKEND, "embeddings"):
-        result, error, status_code = await BACKEND.embeddings(
+    if hasattr(backend, "embeddings"):
+        result, error, status_code = await backend.embeddings(
             input_text=input_text, model=model
         )
         if error:
@@ -1254,7 +1517,396 @@ async def embeddings(request: Request):
     )
 
 
+# ============================================================================
+# Flask Admin Routes
+# ============================================================================
+
+
+def validate_session():
+    """Proxy session validation to ai-menu-system."""
+    try:
+        cookies = flask_request.cookies
+        resp = httpx.get(f"{AIMENU_URL}/session/validate", cookies=cookies, timeout=5)
+        return resp.json()
+    except Exception:
+        return {"valid": False}
+
+
+@flask_app.route("/")
+def admin_index():
+    """Admin dashboard - check auth first."""
+    auth = validate_session()
+    if not auth.get("valid"):
+        return redirect(f"{AIMENU_URL}/login?redirect=/")
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM endpoints ORDER BY name")
+        endpoints = [dict(row) for row in cursor.fetchall()]
+        cursor.execute("""
+            SELECT vm.*, e.name as endpoint_name 
+            FROM virtual_models vm 
+            LEFT JOIN endpoints e ON vm.endpoint_id = e.id 
+            ORDER BY vm.name
+        """)
+        virtual_models = [dict(row) for row in cursor.fetchall()]
+
+    return render_template(
+        "admin_dashboard.html",
+        user=auth.get("username"),
+        endpoints=endpoints,
+        virtual_models=virtual_models,
+    )
+
+
+@flask_app.route("/endpoints", methods=["GET", "POST"])
+def admin_endpoints():
+    """Manage endpoints."""
+    auth = validate_session()
+    if not auth.get("valid"):
+        return redirect(f"{AIMENU_URL}/login?redirect=/endpoints")
+
+    if flask_request.method == "POST":
+        if flask_request.is_json:
+            data = flask_request.get_json()
+        else:
+            data = flask_request.form.to_dict()
+
+        if not data:
+            data = flask_request.get_json(force=True)
+
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO endpoints (name, url, api_key, endpoint_type, priority, enabled)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """,
+                (
+                    data.get("name"),
+                    data.get("url"),
+                    data.get("api_key"),
+                    data.get("endpoint_type", "openai"),
+                    int(data.get("priority", 0)),
+                    1 if data.get("enabled", True) else 0,
+                ),
+            )
+            conn.commit()
+
+        if flask_request.is_json or flask_request.content_type == "application/json":
+            return flask_jsonify({"status": "ok"})
+        return redirect("/endpoints")
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM endpoints ORDER BY name")
+        endpoints = [dict(row) for row in cursor.fetchall()]
+
+    return render_template(
+        "admin_endpoints.html", user=auth.get("username"), endpoints=endpoints
+    )
+
+
+@flask_app.route("/endpoints/<int:endpoint_id>", methods=["PUT"])
+def update_endpoint(endpoint_id):
+    """Update endpoint."""
+    auth = validate_session()
+    if not auth.get("valid"):
+        return flask_jsonify({"error": "Unauthorized"}), 401
+
+    data = flask_request.get_json()
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE endpoints 
+            SET name = ?, url = ?, api_key = ?, endpoint_type = ?, priority = ?, enabled = ?,
+                updated_at = strftime('%s', 'now')
+            WHERE id = ?
+        """,
+            (
+                data.get("name"),
+                data.get("url"),
+                data.get("api_key"),
+                data.get("endpoint_type", "openai"),
+                int(data.get("priority", 0)),
+                1 if data.get("enabled", True) else 0,
+                endpoint_id,
+            ),
+        )
+        conn.commit()
+
+    return flask_jsonify({"status": "ok"})
+
+
+@flask_app.route("/endpoints/<int:endpoint_id>/delete")
+def delete_endpoint(endpoint_id):
+    """Delete endpoint."""
+    auth = validate_session()
+    if not auth.get("valid"):
+        return flask_jsonify({"error": "Unauthorized"}), 401
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "DELETE FROM virtual_models WHERE endpoint_id = ?", (endpoint_id,)
+        )
+        cursor.execute("DELETE FROM endpoints WHERE id = ?", (endpoint_id,))
+        conn.commit()
+
+    return flask_jsonify({"status": "ok"})
+
+
+@flask_app.route("/endpoints/<int:endpoint_id>/test", methods=["POST"])
+def test_endpoint(endpoint_id):
+    """Test endpoint connectivity."""
+    auth = validate_session()
+    if not auth.get("valid"):
+        return flask_jsonify({"error": "Unauthorized"}), 401
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM endpoints WHERE id = ?", (endpoint_id,))
+        endpoint = dict(cursor.fetchone()) if cursor.fetchone() else None
+
+    if not endpoint:
+        return flask_jsonify({"error": "Endpoint not found"}), 404
+
+    try:
+        headers = {}
+        if endpoint.get("api_key"):
+            headers["Authorization"] = f"Bearer {endpoint['api_key']}"
+
+        resp = httpx.get(f"{endpoint['url']}/health", headers=headers, timeout=10)
+        return flask_jsonify({"status": "ok", "endpoint_status": resp.status_code})
+    except Exception as e:
+        return flask_jsonify({"error": str(e)}), 500
+
+
+@flask_app.route("/endpoints/<int:endpoint_id>/models")
+def fetch_endpoint_models(endpoint_id):
+    """Fetch available models from endpoint."""
+    auth = validate_session()
+    if not auth.get("valid"):
+        return flask_jsonify({"error": "Unauthorized"}), 401
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM endpoints WHERE id = ?", (endpoint_id,))
+        row = cursor.fetchone()
+        endpoint = dict(row) if row else None
+
+    if not endpoint:
+        return flask_jsonify({"error": "Endpoint not found"}), 404
+
+    try:
+        headers = {}
+        if endpoint.get("api_key"):
+            headers["Authorization"] = f"Bearer {endpoint['api_key']}"
+
+        # Try /v1/models first
+        resp = httpx.get(f"{endpoint['url']}/v1/models", headers=headers, timeout=15)
+        if resp.status_code == 200:
+            data = resp.json()
+            models = data.get("data", [])
+            return flask_jsonify({"models": [m.get("id") for m in models]})
+
+        # Fallback to /models
+        resp = httpx.get(f"{endpoint['url']}/models", headers=headers, timeout=15)
+        if resp.status_code == 200:
+            data = resp.json()
+            models = data.get("models", []) or data.get("data", [])
+            return flask_jsonify(
+                {"models": [m.get("id") or m.get("name") for m in models]}
+            )
+
+        return flask_jsonify({"error": f"Status: {resp.status_code}"}), resp.status_code
+    except Exception as e:
+        return flask_jsonify({"error": str(e)}), 500
+
+
+@flask_app.route("/virtual-models", methods=["GET", "POST"])
+def admin_virtual_models():
+    """Manage virtual models."""
+    auth = validate_session()
+    if not auth.get("valid"):
+        return redirect(f"{AIMENU_URL}/login?redirect=/virtual-models")
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM endpoints WHERE enabled = 1 ORDER BY name")
+        endpoints = [dict(row) for row in cursor.fetchall()]
+
+        if flask_request.method == "POST":
+            if flask_request.is_json:
+                data = flask_request.get_json()
+            else:
+                data = flask_request.form
+
+            cursor.execute(
+                """
+                INSERT INTO virtual_models (name, endpoint_id, actual_model, description, enabled)
+                VALUES (?, ?, ?, ?, ?)
+            """,
+                (
+                    data.get("name"),
+                    int(data.get("endpoint_id")),
+                    data.get("actual_model"),
+                    data.get("description"),
+                    1 if data.get("enabled", True) else 0,
+                ),
+            )
+            conn.commit()
+
+            if flask_request.is_json:
+                return flask_jsonify({"status": "ok"})
+            return redirect("/virtual-models")
+
+        cursor.execute("""
+            SELECT vm.*, e.name as endpoint_name, e.url as endpoint_url
+            FROM virtual_models vm
+            LEFT JOIN endpoints e ON vm.endpoint_id = e.id
+            ORDER BY vm.name
+        """)
+        virtual_models = [dict(row) for row in cursor.fetchall()]
+
+    return render_template(
+        "admin_virtual_models.html",
+        user=auth.get("username"),
+        endpoints=endpoints,
+        virtual_models=virtual_models,
+    )
+
+
+@flask_app.route("/virtual-models/<int:vm_id>", methods=["PUT"])
+def update_virtual_model(vm_id):
+    """Update virtual model."""
+    auth = validate_session()
+    if not auth.get("valid"):
+        return flask_jsonify({"error": "Unauthorized"}), 401
+
+    data = flask_request.get_json()
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE virtual_models 
+            SET name = ?, endpoint_id = ?, actual_model = ?, description = ?, enabled = ?,
+                updated_at = strftime('%s', 'now')
+            WHERE id = ?
+        """,
+            (
+                data.get("name"),
+                int(data.get("endpoint_id")),
+                data.get("actual_model"),
+                data.get("description"),
+                1 if data.get("enabled", True) else 0,
+                vm_id,
+            ),
+        )
+        conn.commit()
+
+    return flask_jsonify({"status": "ok"})
+
+
+@flask_app.route("/virtual-models/<int:vm_id>/delete")
+def delete_virtual_model(vm_id):
+    """Delete virtual model."""
+    auth = validate_session()
+    if not auth.get("valid"):
+        return flask_jsonify({"error": "Unauthorized"}), 401
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM virtual_models WHERE id = ?", (vm_id,))
+        conn.commit()
+
+    return flask_jsonify({"status": "ok"})
+
+    return redirect("/virtual-models")
+
+
+# API endpoints for AJAX
+@flask_app.route("/api/endpoints", methods=["GET"])
+def api_list_endpoints():
+    """API: List endpoints."""
+    auth = validate_session()
+    if not auth.get("valid"):
+        return flask_jsonify({"error": "Unauthorized"}), 401
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM endpoints ORDER BY name")
+        endpoints = [dict(row) for row in cursor.fetchall()]
+
+    return flask_jsonify(endpoints)
+
+
+@flask_app.route("/api/virtual-models", methods=["GET"])
+def api_list_virtual_models():
+    """API: List virtual models."""
+    auth = validate_session()
+    if not auth.get("valid"):
+        return flask_jsonify({"error": "Unauthorized"}), 401
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT vm.*, e.name as endpoint_name, e.url as endpoint_url
+            FROM virtual_models vm
+            LEFT JOIN endpoints e ON vm.endpoint_id = e.id
+            ORDER BY vm.name
+        """)
+        vms = [dict(row) for row in cursor.fetchall()]
+
+    return flask_jsonify(vms)
+
+
+@flask_app.route("/api/admin/endpoints", methods=["GET"])
+def api_admin_endpoints():
+    """API: List all endpoints."""
+    auth = validate_session()
+    if not auth.get("valid"):
+        return flask_jsonify({"error": "Unauthorized"}), 401
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM endpoints ORDER BY name")
+        endpoints = [dict(row) for row in cursor.fetchall()]
+
+    return flask_jsonify(endpoints)
+
+
+@flask_app.route("/api/admin/virtual-models", methods=["GET"])
+def api_admin_virtual_models():
+    """API: List all virtual models."""
+    auth = validate_session()
+    if not auth.get("valid"):
+        return flask_jsonify({"error": "Unauthorized"}), 401
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT vm.*, e.name as endpoint_name, e.url as endpoint_url
+            FROM virtual_models vm
+            LEFT JOIN endpoints e ON vm.endpoint_id = e.id
+            ORDER BY vm.name
+        """)
+        vms = [dict(row) for row in cursor.fetchall()]
+
+    return flask_jsonify(vms)
+
+
 if __name__ == "__main__":
     import uvicorn
+    import threading
 
+    # Run Flask in background thread
+    def run_flask():
+        flask_app.run(host="0.0.0.0", port=FLASK_PORT, debug=False, use_reloader=False)
+
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+
+    # Run FastAPI
     uvicorn.run(app, host="0.0.0.0", port=8002)
