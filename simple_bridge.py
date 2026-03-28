@@ -914,16 +914,32 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
                     payload[k] = v
 
             if self.endpoint_type == "openai":
-                endpoint = self.url
+                endpoint = f"{self.url}/v1/chat/completions"
             elif self.endpoint_type == "together":
                 endpoint = f"{self.url}/v1/chat/completions"
+            elif self.endpoint_type == "deepinfra":
+                endpoint = f"{self.url}/v1/openai/chat/completions"
             else:
                 endpoint = f"{self.url}/v1/chat/completions"
 
             timeout = 1200.0 if stream else 300.0
 
             async with httpx.AsyncClient(timeout=timeout) as client:
-                response = await client.post(endpoint, headers=headers, json=payload)
+                try:
+                    response = await client.post(
+                        endpoint, headers=headers, json=payload
+                    )
+                except Exception as e:
+                    return (
+                        None,
+                        {
+                            "error": {
+                                "message": f"Request error: {str(e)}",
+                                "type": "internal_server_error",
+                            }
+                        },
+                        500,
+                    )
 
                 if response.status_code != 200:
                     return (
@@ -937,7 +953,22 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
                         response.status_code,
                     )
 
-                result = response.json()
+                try:
+                    if stream:
+                        # For streaming, return the raw text (SSE format)
+                        return {"_stream_data": response.text}, None, 200
+                    result = response.json()
+                except Exception as e:
+                    return (
+                        None,
+                        {
+                            "error": {
+                                "message": f"JSON parse error: {str(e)}, response: {response.text[:500]}",
+                                "type": "internal_server_error",
+                            }
+                        },
+                        500,
+                    )
                 return result, None, 200
 
         async def embeddings(self, input_text, model):
@@ -1417,6 +1448,50 @@ async def chat_completions(request: Request):
     if "result" in backend_result:
         result = backend_result["result"]
 
+    # Check if this is a streaming response from a virtual model backend
+    if "_stream_data" in result:
+        # Forward the streaming SSE response directly
+        async def stream_forwarder():
+            backend = get_backend(model)
+            endpoint = backend.url
+            if hasattr(backend, "endpoint_type"):
+                if backend.endpoint_type == "deepinfra":
+                    endpoint = f"{endpoint}/v1/openai/chat/completions"
+                else:
+                    endpoint = f"{endpoint}/v1/chat/completions"
+            else:
+                endpoint = f"{endpoint}/v1/chat/completions"
+
+            headers = {"Content-Type": "application/json"}
+            if backend.api_key:
+                headers["Authorization"] = f"Bearer {backend.api_key}"
+
+            payload = {
+                "model": backend.model,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "top_p": top_p,
+                "stream": True,
+            }
+
+            async with httpx.AsyncClient(timeout=1200.0) as client:
+                async with client.stream(
+                    "POST", endpoint, headers=headers, json=payload
+                ) as response:
+                    async for line in response.aiter_lines():
+                        if line.strip():
+                            yield line + "\n\n"
+
+        return StreamingResponse(
+            stream_forwarder(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            },
+        )
+
     # Extract content from response
     content = ""
     tool_calls_data = []
@@ -1892,24 +1967,25 @@ async def export_usage_csv(request: Request):
 
 @app.put("/virtual-models/<int:vm_id>/update_cost")
 async def update_virtual_model_cost(vm_id: int, request: Request):
-    """Update cost per 1K tokens for a virtual model."""
+    """Update cost per 1M tokens for a virtual model."""
     auth = validate_session_fastapi(request)
     if not auth.get("valid"):
         return JSONResponse(status_code=401, content={"error": "Unauthorized"})
 
     try:
         data = await request.json()
-        cost_per_1k = data.get("cost_per_1k_tokens")
+        cost_in = data.get("cost_per_1k_tokens_in", 0)
+        cost_out = data.get("cost_per_1k_tokens_out", 0)
 
         with get_db() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
                 UPDATE virtual_models
-                SET cost_per_1k_tokens = ?, updated_at = strftime('%s', 'now')
+                SET cost_per_1k_tokens_in = ?, cost_per_1k_tokens_out = ?, updated_at = strftime('%s', 'now')
                 WHERE id = ?
             """,
-                (cost_per_1k, vm_id),
+                (cost_in, cost_out, vm_id),
             )
             conn.commit()
 
@@ -2417,16 +2493,16 @@ def fetch_endpoint_models(endpoint_id):
         if resp.status_code == 200:
             data = resp.json()
             models = data.get("data", [])
-            return flask_jsonify({"models": [m.get("id") for m in models]})
+            model_list = sorted([m.get("id") for m in models])
+            return flask_jsonify({"models": model_list})
 
         # Fallback to /models
         resp = httpx.get(f"{endpoint['url']}/models", headers=headers, timeout=15)
         if resp.status_code == 200:
             data = resp.json()
             models = data.get("models", []) or data.get("data", [])
-            return flask_jsonify(
-                {"models": [m.get("id") or m.get("name") for m in models]}
-            )
+            model_list = sorted([m.get("id") or m.get("name") for m in models])
+            return flask_jsonify({"models": model_list})
 
         return flask_jsonify({"error": f"Status: {resp.status_code}"}), resp.status_code
     except Exception as e:
@@ -2453,14 +2529,16 @@ def admin_virtual_models():
 
             cursor.execute(
                 """
-                INSERT INTO virtual_models (name, endpoint_id, actual_model, description, enabled)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO virtual_models (name, endpoint_id, actual_model, description, cost_per_1k_tokens_in, cost_per_1k_tokens_out, enabled)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
                 (
                     data.get("name"),
                     int(data.get("endpoint_id")),
                     data.get("actual_model"),
                     data.get("description"),
+                    data.get("cost_per_1k_tokens_in") or 0,
+                    data.get("cost_per_1k_tokens_out") or 0,
                     1 if data.get("enabled", True) else 0,
                 ),
             )
@@ -2499,7 +2577,8 @@ def update_virtual_model(vm_id):
         cursor.execute(
             """
             UPDATE virtual_models 
-            SET name = ?, endpoint_id = ?, actual_model = ?, description = ?, enabled = ?,
+            SET name = ?, endpoint_id = ?, actual_model = ?, description = ?, 
+                cost_per_1k_tokens_in = ?, cost_per_1k_tokens_out = ?, enabled = ?,
                 updated_at = strftime('%s', 'now')
             WHERE id = ?
         """,
@@ -2508,6 +2587,8 @@ def update_virtual_model(vm_id):
                 int(data.get("endpoint_id")),
                 data.get("actual_model"),
                 data.get("description"),
+                data.get("cost_per_1k_tokens_in") or 0,
+                data.get("cost_per_1k_tokens_out") or 0,
                 1 if data.get("enabled", True) else 0,
                 vm_id,
             ),
