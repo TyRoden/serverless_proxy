@@ -2167,10 +2167,21 @@ def validate_session():
     """Proxy session validation to ai-menu-system."""
     try:
         cookies = flask_request.cookies
+        # Forward all cookies to validate endpoint
         resp = httpx.get(f"{AIMENU_URL}/session/validate", cookies=cookies, timeout=5)
-        return resp.json()
-    except Exception:
+        result = resp.json()
+        # Debug log
+        print(f"Session validate: cookies={list(cookies.keys())}, result={result}")
+        return result
+    except Exception as e:
+        print(f"Session validate error: {e}")
         return {"valid": False}
+
+
+def get_menu_login_url():
+    """Get the public URL for menu login (handles HTTPS)."""
+    menu_base = os.getenv("AIMENU_PUBLIC_URL", "https://menu.troden.com")
+    return menu_base
 
 
 @flask_app.route("/")
@@ -2178,7 +2189,34 @@ def admin_index():
     """Admin dashboard - check auth first."""
     auth = validate_session()
     if not auth.get("valid"):
-        return redirect(f"{AIMENU_URL}/login?redirect=/")
+        return redirect(f"{get_menu_login_url()}/login?redirect=/")
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM endpoints ORDER BY name")
+        endpoints = [dict(row) for row in cursor.fetchall()]
+        cursor.execute("""
+            SELECT vm.*, e.name as endpoint_name 
+            FROM virtual_models vm 
+            LEFT JOIN endpoints e ON vm.endpoint_id = e.id 
+            ORDER BY vm.name
+        """)
+        virtual_models = [dict(row) for row in cursor.fetchall()]
+
+    return render_template(
+        "admin_dashboard.html",
+        user=auth.get("username"),
+        endpoints=endpoints,
+        virtual_models=virtual_models,
+    )
+
+
+@flask_app.route("/proxy-dashboard")
+def proxy_dashboard():
+    """Serverless proxy dashboard - check auth server-side."""
+    auth = validate_session()
+    if not auth.get("valid"):
+        return redirect(f"{get_menu_login_url()}/login?redirect=/proxy-dashboard")
 
     with get_db() as conn:
         cursor = conn.cursor()
@@ -2205,7 +2243,7 @@ def admin_endpoints():
     """Manage endpoints."""
     auth = validate_session()
     if not auth.get("valid"):
-        return redirect(f"{AIMENU_URL}/login?redirect=/endpoints")
+        return redirect(f"{get_menu_login_url()}/login?redirect=/endpoints")
 
     if flask_request.method == "POST":
         if flask_request.is_json:
@@ -2371,7 +2409,7 @@ def admin_virtual_models():
     """Manage virtual models."""
     auth = validate_session()
     if not auth.get("valid"):
-        return redirect(f"{AIMENU_URL}/login?redirect=/virtual-models")
+        return redirect(f"{get_menu_login_url()}/login?redirect=/virtual-models")
 
     with get_db() as conn:
         cursor = conn.cursor()

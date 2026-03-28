@@ -151,17 +151,29 @@
     </div>
     
     <script>
-        fetch('/session/validate').then(r => r.json()).then(d => {
-            document.getElementById('auth-overlay').style.display = 'none';
-            if (!d.valid) {
-                window.location.href = '/login?redirect=' + encodeURIComponent(window.location.pathname);
-            } else {
-                document.getElementById('username').textContent = d.username;
-                loadEndpoints();
-                loadVirtualModels();
-            }
-        }).catch(() => {
-            window.location.href = '/login?redirect=' + encodeURIComponent(window.location.pathname);
+        document.addEventListener('DOMContentLoaded', function() {
+            fetch('/session/validate', { credentials: 'same-origin' })
+                .then(r => {
+                    console.log('Session validate status:', r.status);
+                    return r.json();
+                })
+                .then(d => {
+                    console.log('Session validate response:', d);
+                    document.getElementById('auth-overlay').style.display = 'none';
+                    if (!d.valid) {
+                        alert('Session invalid! Response: ' + JSON.stringify(d));
+                        window.location.href = '/login?redirect=' + encodeURIComponent(window.location.pathname);
+                    } else {
+                        document.getElementById('username').textContent = d.username;
+                        loadEndpoints();
+                        loadVirtualModels();
+                    }
+                })
+                .catch((err) => {
+                    console.error('Session validate error:', err);
+                    alert('Session error: ' + err);
+                    window.location.href = '/login?redirect=' + encodeURIComponent(window.location.pathname);
+                });
         });
     </script>
     
@@ -364,7 +376,7 @@
     <script>
     // ==========================================
     // Tab Switching
-    </==========================================
+    // ==========================================
     
     let currentTab = 'dashboard';
     
