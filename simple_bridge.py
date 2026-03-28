@@ -429,30 +429,6 @@ RUNPOD_API_KEY = os.getenv("RUNPOD_API_KEY", "")
 RUNPOD_ENDPOINT_ID = os.getenv("RUNPOD_ENDPOINT_ID", "")
 ENDPOINT_TYPE = os.getenv("ENDPOINT_TYPE", "ollama").lower()  # "ollama" or "vllm"
 
-# AI Queue Master integration (optional)
-USE_AI_QUEUE = os.getenv("USE_AI_QUEUE", "false").lower() == "true"
-AI_QUEUE_URL = os.getenv("AI_QUEUE_URL", "http://host.docker.internal:8102")
-AI_QUEUE_API_KEY = os.getenv("AI_QUEUE_API_KEY", "")
-AI_QUEUE_PRIORITY = os.getenv("AI_QUEUE_PRIORITY", "NORMAL")  # HIGH, NORMAL, LOW
-AI_QUEUE_SOURCE = os.getenv("AI_QUEUE_SOURCE", "runpod-proxy")
-
-
-async def wait_for_completion(client, job_id, max_wait=300):
-    start = time.time()
-    while time.time() - start < max_wait:
-        await asyncio.sleep(2)
-        status_resp = await client.get(
-            f"https://api.runpod.ai/v2/{RUNPOD_ENDPOINT_ID}/status/{job_id}",
-            headers={"Authorization": f"Bearer {RUNPOD_API_KEY}"},
-        )
-        if status_resp.status_code == 200:
-            data = status_resp.json()
-            if data.get("status") == "COMPLETED":
-                return data
-            elif data.get("status") in ["FAILED", "CANCELLED"]:
-                return data
-    return {"status": "TIMEOUT"}
-
 
 def extract_tool_calls(content):
     """Extract tool calls from content and return structured tool_calls + remaining text."""
@@ -815,679 +791,216 @@ def process_content(content):
     return None, content
 
 
-def build_input_payload_vllm(
-    messages,
-    temperature,
-    max_tokens,
-    top_p,
-    tools=None,
-    stop=None,
-    presence_penalty=None,
-    frequency_penalty=None,
-):
-    """Build vLLM format payload."""
-    payload = {
-        "messages": messages,
-        "sampling_params": {
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "top_p": top_p,
-        },
-        "use_openai_format": 1,
-    }
-    # Add additional sampling params (OA-1)
-    if stop is not None:
-        payload["sampling_params"]["stop"] = stop
-    if presence_penalty is not None:
-        payload["sampling_params"]["presence_penalty"] = presence_penalty
-    if frequency_penalty is not None:
-        payload["sampling_params"]["frequency_penalty"] = frequency_penalty
-    if tools:
-        payload["tools"] = tools
-    return payload
-
-
-def build_input_payload_ollama(
-    messages, temperature, max_tokens, top_p, tools=None, stop=None
-):
-    """Build Ollama format payload - convert messages to prompt with tool definitions."""
-    # Include tool definitions in system prompt if tools are provided
-    system_parts = []
-
-    if tools:
-        tool_desc = "You have access to the following tools:\n\n"
-        for tool in tools:
-            func = tool.get("function", {})
-            name = func.get("name", "unknown")
-            desc = func.get("description", "")
-            params = func.get("parameters", {})
-            props = params.get("properties", {})
-            param_str = ", ".join(props.keys()) if props else "none"
-            tool_desc += f"- {name}({param_str}): {desc}\n"
-        tool_desc += "\nWhen you need to use a tool, respond with ONLY the tool call in this format:\n"
-        tool_desc += '```tool_call\n{"name": "tool_name", "arguments": {"arg1": "value1"}}\n```\n'
-        system_parts.append(tool_desc)
-
-    prompt_parts = []
-    for msg in messages:
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-        if role == "system":
-            prompt_parts.append(f"System: {content}")
-        elif role == "user":
-            prompt_parts.append(f"User: {content}")
-        elif role == "assistant":
-            prompt_parts.append(f"Assistant: {content}")
-
-    # Add tool instructions if present
-    if system_parts:
-        prompt_parts = system_parts + prompt_parts
-
-    prompt = "\n\n".join(prompt_parts) + "\n\nAssistant:"
-
-    return {
-        "prompt": prompt,
-        "stream": False,
-        "options": {
-            "temperature": temperature,
-            "num_predict": max_tokens,
-            "top_p": top_p,
-        },
-    }
-
-
-def extract_content_ollama(result):
-    """Extract content from Ollama response format."""
-    output = result.get("output", [])
-
-    if isinstance(output, list) and len(output) > 0:
-        # Try different response formats
-        item = output[0]
-        if isinstance(item, dict):
-            # Format: {"choices": [{"text": "..."}]}
-            if "choices" in item:
-                choices = item.get("choices", [])
-                if choices and isinstance(choices[0], dict):
-                    text = choices[0].get("text", "")
-                    if text:
-                        return text
-            # Format: {"response": "..."}
-            if "response" in item:
-                return item.get("response", "")
-            # Format: {"text": "..."}
-            if "text" in item:
-                return item.get("text", "")
-
-    return ""
-
-
-async def handle_ai_queue_request(
-    messages,
-    model,
-    tools,
-    timeout=1200,
-    temperature=None,
-    max_tokens=None,
-    top_p=None,
-    stop=None,
-    presence_penalty=None,
-    frequency_penalty=None,
-    logit_bias=None,
-    user=None,
-    tool_choice=None,
-    response_format=None,
-    seed=None,
-    parallel_tool_calls=None,
-):
-    """Route request through AI Queue Master instead of directly to RunPod."""
-    headers = {
-        "Authorization": f"Bearer {AI_QUEUE_API_KEY}",
-        "Content-Type": "application/json",
-        "X-Source": AI_QUEUE_SOURCE,
-        "X-Priority": AI_QUEUE_PRIORITY,
-        "X-Model": model,
-    }
-
-    # Add user ID if provided (OA-1)
-    if user:
-        headers["X-User-ID"] = user
-
-    payload = {
-        "model": model,
-        "messages": messages,
-        "stream": False,
-    }
-
-    # Add optional parameters (OA-1)
-    if temperature is not None:
-        payload["temperature"] = temperature
-    if max_tokens is not None:
-        payload["max_tokens"] = max_tokens
-    if top_p is not None:
-        payload["top_p"] = top_p
-    if stop is not None:
-        payload["stop"] = stop
-    if presence_penalty is not None:
-        payload["presence_penalty"] = presence_penalty
-    if frequency_penalty is not None:
-        payload["frequency_penalty"] = frequency_penalty
-    if logit_bias is not None:
-        payload["logit_bias"] = logit_bias
-    if tool_choice is not None:
-        payload["tool_choice"] = tool_choice
-    if response_format is not None:
-        payload["response_format"] = response_format
-    if seed is not None:
-        payload["seed"] = seed
-    if parallel_tool_calls is not None:
-        payload["parallel_tool_calls"] = parallel_tool_calls
-
-    if tools:
-        payload["tools"] = tools
-
-    async with httpx.AsyncClient(timeout=float(timeout)) as client:
-        response = await client.post(
-            f"{AI_QUEUE_URL}/v1/chat/completions",
-            headers=headers,
-            json=payload,
-        )
-
-        if response.status_code != 200:
-            try:
-                error_data = response.json()
-                if "error" in error_data:
-                    return (
-                        None,
-                        {"error": error_data["error"]},
-                        response.status_code,
-                    )
-            except Exception:
-                pass
-            return (
-                None,
-                {
-                    "error": {
-                        "message": f"AI Queue error: {response.text}",
-                        "type": "internal_server_error",
-                        "code": "queue_error",
-                    }
-                },
-                response.status_code,
-            )
-
-        result = response.json()
-
-        # Handle error responses from queue
-        if result.get("error"):
-            error_info = result.get("error")
-            if isinstance(error_info, str):
-                error_info = {"message": error_info, "type": "internal_server_error"}
-            return None, {"error": error_info}, 500
-
-        return result, None, 200
-
-
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
+    """OpenAI-compatible chat completions endpoint."""
     data = await request.json()
 
     messages = data.get("messages", [])
-    model = data.get("model", os.getenv("MODEL_NAME", "qwen3.5:27b"))
+    model = data.get("model", os.getenv("MODEL_NAME", "project-system-ai"))
     temperature = data.get("temperature", 0.7)
     max_tokens = data.get("max_tokens", 256)
     top_p = data.get("top_p", 1.0)
     stream = data.get("stream", False)
     tools = data.get("tools", [])
 
-    # Additional OpenAI parameters (OA-1)
-    stop = data.get("stop")
-    presence_penalty = data.get("presence_penalty")
-    frequency_penalty = data.get("frequency_penalty")
-    logit_bias = data.get("logit_bias")
-    user = data.get("user")
-    tool_choice = data.get("tool_choice")
-    response_format = data.get("response_format")
-    seed = data.get("seed")
-    parallel_tool_calls = data.get("parallel_tool_calls", True)
+    # Additional OpenAI parameters
+    extra_params = {
+        "stop": data.get("stop"),
+        "presence_penalty": data.get("presence_penalty"),
+        "frequency_penalty": data.get("frequency_penalty"),
+        "logit_bias": data.get("logit_bias"),
+        "user": data.get("user"),
+        "tool_choice": data.get("tool_choice"),
+        "response_format": data.get("response_format"),
+        "seed": data.get("seed"),
+        "parallel_tool_calls": data.get("parallel_tool_calls", True),
+    }
 
-    # Route through AI Queue Master if enabled
-    if USE_AI_QUEUE:
-        import logging
+    # Call backend (handles both AI Queue and RunPod)
+    backend_result, error, status_code = await BACKEND.chat_completion(
+        messages=messages,
+        model=model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        top_p=top_p,
+        stream=stream,
+        tools=tools,
+        **extra_params,
+    )
 
-        logger = logging.getLogger("uvicorn")
-        logger.warning(
-            f"[AI_QUEUE] Received request: model={model}, stream={stream}, tools={len(tools)}"
+    if error:
+        return JSONResponse(status_code=status_code, content=error)
+
+    # For RunPod backend, extract result from wrapper
+    result = backend_result
+    if "result" in backend_result:
+        result = backend_result["result"]
+
+    # Extract content from response
+    content = ""
+    tool_calls_data = []
+    usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+    if "choices" in result and result["choices"]:
+        choice = result["choices"][0]
+        content = choice.get("message", {}).get("content", "") or ""
+        tool_calls_data = choice.get("message", {}).get("tool_calls", []) or []
+        usage = result.get("usage", usage)
+
+    # Process content to extract tool calls
+    extracted_tc, text_content = process_content(content)
+    if extracted_tc:
+        tool_calls_data = extracted_tc
+    elif not tool_calls_data:
+        text_content = text_content or content
+
+    job_id = result.get("id", f"chat-{int(time.time())}")
+
+    # Handle streaming response
+    if stream:
+        return StreamingResponse(
+            _generate_sse(
+                job_id=job_id,
+                model=model,
+                tool_calls_data=tool_calls_data,
+                text_content=text_content,
+            ),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            },
         )
 
-        queue_result, error, status_code = await handle_ai_queue_request(
-            messages,
-            model,
-            tools,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            top_p=top_p,
-            stop=stop,
-            presence_penalty=presence_penalty,
-            frequency_penalty=frequency_penalty,
-            logit_bias=logit_bias,
-            user=user,
-            tool_choice=tool_choice,
-            response_format=response_format,
-            seed=seed,
-            parallel_tool_calls=parallel_tool_calls,
-        )
+    # Non-streaming response
+    response_content = {
+        "id": job_id,
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [],
+        "usage": usage,
+    }
 
-        if error:
-            logger.error(f"[AI_QUEUE] Error: {error}")
-            return JSONResponse(status_code=status_code, content=error)
-
-        logger.warning(
-            f"[AI_QUEUE] Raw result keys: {list(queue_result.keys()) if queue_result else 'None'}"
-        )
-
-        # Extract content from queue response (OpenAI format)
-        content = ""
-        tool_calls_data = []
-        usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-
-        if "choices" in queue_result and queue_result["choices"]:
-            choice = queue_result["choices"][0]
-            content = choice.get("message", {}).get("content", "") or ""
-            tool_calls_data = choice.get("message", {}).get("tool_calls", []) or []
-            usage = queue_result.get("usage", usage)
-
-        # Process content to extract tool calls
-        extracted_tc, text_content = process_content(content)
-        if extracted_tc:
-            tool_calls_data = extracted_tc
-        elif not tool_calls_data:
-            text_content = text_content or content
-
-        job_id = queue_result.get("id", f"chat-{int(time.time())}")
-
-        # Handle streaming response
-        if stream:
-
-            async def generate_sse():
-                created = int(time.time())
-                chunk_id = job_id
-
-                if tool_calls_data:
-                    for tc_index, tc in enumerate(tool_calls_data):
-                        chunk = {
-                            "id": chunk_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {
-                                        "tool_calls": [
-                                            {
-                                                "index": tc_index,
-                                                "id": tc["id"],
-                                                "type": "function",
-                                                "function": {
-                                                    "name": tc["function"]["name"],
-                                                    "arguments": "",
-                                                },
-                                            }
-                                        ]
-                                    },
-                                    "finish_reason": None,
-                                }
-                            ],
-                        }
-                        yield f"data: {json.dumps(chunk)}\n\n"
-                        await asyncio.sleep(0.01)
-                        args = tc["function"]["arguments"]
-                        chunk = {
-                            "id": chunk_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {
-                                        "tool_calls": [
-                                            {
-                                                "index": tc_index,
-                                                "id": tc["id"],
-                                                "function": {"arguments": args},
-                                            }
-                                        ]
-                                    },
-                                    "finish_reason": None,
-                                }
-                            ],
-                        }
-                        yield f"data: {json.dumps(chunk)}\n\n"
-                        await asyncio.sleep(0.01)
-
-                if text_content:
-                    chunk = {
-                        "id": chunk_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {"content": text_content},
-                                "finish_reason": None,
-                            }
-                        ],
-                    }
-                    yield f"data: {json.dumps(chunk)}\n\n"
-
-                final_chunk = {
-                    "id": chunk_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {},
-                            "finish_reason": "tool_calls"
-                            if tool_calls_data
-                            else "stop",
-                        }
-                    ],
-                }
-                yield f"data: {json.dumps(final_chunk)}\n\n"
-                yield "data: [DONE]\n\n"
-
-            return StreamingResponse(
-                generate_sse(),
-                media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
+    if tool_calls_data:
+        response_content["choices"].append(
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": text_content,
                 },
-            )
-
-        # Non-streaming response
-        if tool_calls_data:
-            return JSONResponse(
-                content={
-                    "id": job_id,
-                    "object": "chat.completion",
-                    "created": int(time.time()),
-                    "model": model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "message": {
-                                "role": "assistant",
-                                "content": text_content,
-                            },
-                            "tool_calls": tool_calls_data,
-                            "finish_reason": "tool_calls",
-                        }
-                    ],
-                    "usage": usage,
-                }
-            )
-
-        return JSONResponse(
-            content={
-                "id": job_id,
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": text_content,
-                        },
-                        "finish_reason": "stop",
-                    }
-                ],
-                "usage": usage,
+                "tool_calls": tool_calls_data,
+                "finish_reason": "tool_calls",
             }
-        )
-
-    # Direct RunPod mode (existing logic)
-    # Build payload based on endpoint type
-    if ENDPOINT_TYPE == "ollama":
-        input_data = build_input_payload_ollama(
-            messages, temperature, max_tokens, top_p, tools, stop=stop
         )
     else:
-        input_data = build_input_payload_vllm(
-            messages,
-            temperature,
-            max_tokens,
-            top_p,
-            tools,
-            stop=stop,
-            presence_penalty=presence_penalty,
-            frequency_penalty=frequency_penalty,
+        response_content["choices"].append(
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": text_content,
+                },
+                "finish_reason": "stop",
+            }
         )
 
-    async with httpx.AsyncClient(timeout=300.0) as client:
-        response = await client.post(
-            f"https://api.runpod.ai/v2/{RUNPOD_ENDPOINT_ID}/runsync",
-            headers={
-                "Authorization": f"Bearer {RUNPOD_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={"input": input_data},
-        )
+    return JSONResponse(content=response_content)
 
-        if response.status_code != 200:
-            return JSONResponse(
-                status_code=500,
-                content={
-                    "error": {
-                        "message": f"RunPod error: {response.text}",
-                        "type": "internal_server_error",
-                        "code": "runpod_error",
-                    }
-                },
-            )
 
-        result = response.json()
-        job_id = result.get("id", f"chat-{int(time.time())}")
+async def _generate_sse(job_id, model, tool_calls_data, text_content):
+    """Generate SSE stream for streaming responses."""
+    created = int(time.time())
+    chunk_id = job_id
 
-        if result.get("status") != "COMPLETED":
-            result = await wait_for_completion(client, job_id)
-            if result.get("status") == "TIMEOUT":
-                return JSONResponse(
-                    status_code=408,
-                    content={
-                        "error": {
-                            "message": "Request timed out",
-                            "type": "timeout_error",
-                            "code": "request_timeout",
-                        }
-                    },
-                )
-            if result.get("status") in ["FAILED", "CANCELLED"]:
-                return JSONResponse(
-                    status_code=500,
-                    content={
-                        "error": {
-                            "message": f"Job {result.get('status', 'unknown').lower()}",
-                            "type": "internal_server_error",
-                            "code": "job_failed",
-                        }
-                    },
-                )
-
-        # Extract content based on endpoint type
-        if ENDPOINT_TYPE == "ollama":
-            content = extract_content_ollama(result)
-        else:
-            output = result.get("output", [])
-            if isinstance(output, list) and len(output) > 0:
-                choice_data = output[0].get("choices", [{}])[0]
-                tokens = choice_data.get("tokens", [])
-                content = tokens[0] if tokens else ""
-            else:
-                content = ""
-
-        tool_calls_data, text_content = process_content(content)
-        if not tool_calls_data:
-            text_content = text_content or content
-
-        # Get usage if available
-        usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-        if ENDPOINT_TYPE != "ollama":
-            output = result.get("output", [])
-            if isinstance(output, list) and len(output) > 0:
-                usage = output[0].get("usage", usage)
-
-        if stream:
-
-            async def generate_stream():
-                created = int(time.time())
-                chunk_id = f"chatcmpl-{job_id}"
-
-                if tool_calls_data:
-                    for tc_index, tc in enumerate(tool_calls_data):
-                        chunk = {
-                            "id": chunk_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {
-                                        "tool_calls": [
-                                            {
-                                                "index": tc_index,
-                                                "id": tc["id"],
-                                                "type": "function",
-                                                "function": {
-                                                    "name": tc["function"]["name"],
-                                                    "arguments": "",
-                                                },
-                                            }
-                                        ]
-                                    },
-                                    "finish_reason": None,
-                                }
-                            ],
-                        }
-                        yield f"data: {json.dumps(chunk)}\n\n"
-                        await asyncio.sleep(0.01)
-                        args = tc["function"]["arguments"]
-                        chunk = {
-                            "id": chunk_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {
-                                        "tool_calls": [
-                                            {
-                                                "index": tc_index,
-                                                "id": tc["id"],
-                                                "function": {"arguments": args},
-                                            }
-                                        ]
-                                    },
-                                    "finish_reason": None,
-                                }
-                            ],
-                        }
-                        yield f"data: {json.dumps(chunk)}\n\n"
-                        await asyncio.sleep(0.01)
-
-                if text_content:
-                    chunk = {
-                        "id": chunk_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {"content": text_content},
-                                "finish_reason": None,
-                            }
-                        ],
-                    }
-                    yield f"data: {json.dumps(chunk)}\n\n"
-
-                final_chunk = {
-                    "id": chunk_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {},
-                            "finish_reason": "tool_calls"
-                            if tool_calls_data
-                            else "stop",
-                        }
-                    ],
-                }
-                yield f"data: {json.dumps(final_chunk)}\n\n"
-                yield "data: [DONE]\n\n"
-
-            return StreamingResponse(
-                generate_stream(),
-                media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                },
-            )
-
-        # Non-streaming response
-        if tool_calls_data:
-            return JSONResponse(
-                content={
-                    "id": job_id,
-                    "object": "chat.completion",
-                    "created": int(time.time()),
-                    "model": model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "message": {
-                                "role": "assistant",
-                                "content": text_content,
-                            },
-                            "tool_calls": tool_calls_data,
-                            "finish_reason": "tool_calls",
-                        }
-                    ],
-                    "usage": usage,
-                }
-            )
-
-        return JSONResponse(
-            content={
-                "id": job_id,
-                "object": "chat.completion",
-                "created": int(time.time()),
+    if tool_calls_data:
+        for tc_index, tc in enumerate(tool_calls_data):
+            chunk = {
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": created,
                 "model": model,
                 "choices": [
                     {
                         "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": text_content,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": tc_index,
+                                    "id": tc["id"],
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc["function"]["name"],
+                                        "arguments": "",
+                                    },
+                                }
+                            ]
                         },
-                        "finish_reason": "stop",
+                        "finish_reason": None,
                     }
                 ],
-                "usage": usage,
             }
-        )
+            yield f"data: {json.dumps(chunk)}\n\n"
+            await asyncio.sleep(0.01)
+
+            args = tc["function"]["arguments"]
+            chunk = {
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": tc_index,
+                                    "id": tc["id"],
+                                    "function": {"arguments": args},
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ],
+            }
+            yield f"data: {json.dumps(chunk)}\n\n"
+            await asyncio.sleep(0.01)
+
+    if text_content:
+        chunk = {
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"content": text_content},
+                    "finish_reason": None,
+                }
+            ],
+        }
+        yield f"data: {json.dumps(chunk)}\n\n"
+
+    final_chunk = {
+        "id": chunk_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {},
+                "finish_reason": "tool_calls" if tool_calls_data else "stop",
+            }
+        ],
+    }
+    yield f"data: {json.dumps(final_chunk)}\n\n"
+    yield "data: [DONE]\n\n"
 
 
 @app.get("/health")
