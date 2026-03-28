@@ -140,6 +140,7 @@
         .status-error { background: rgba(239, 68, 68, 0.2); color: var(--accent-red); }
         .status-success { background: rgba(16, 185, 129, 0.2); color: var(--accent-green); }
     </style>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
     <div id="auth-overlay" style="position:fixed;top:0;left:0;width:100%;height:100%;background:var(--bg-primary);z-index:9999;display:flex;justify-content:center;align-items:center;">
@@ -171,7 +172,8 @@
         </header>
         
         <nav class="nav">
-            <a href="/">Dashboard</a>
+            <a href="/" onclick="showTab('dashboard')">Dashboard</a>
+            <a href="/" onclick="showTab('usage')">Usage & Cost</a>
             <a href="/menu">Menu</a>
             <a href="/queue-dashboard">AI Queue</a>
         </nav>
@@ -188,19 +190,67 @@
             </div>
         </div>
         
-        <!-- Virtual Models Card -->
+    <!-- Usage and Cost Card -->
+    <div id="usage-section" class="hidden">
         <div class="card">
-            <h2>Virtual Models</h2>
+            <h2>Usage & Cost</h2>
             <p style="color:var(--text-secondary);margin-bottom:16px;font-size:14px;">
-                Map virtual model names to actual models on endpoints. Tools will see the virtual name, and requests route to the configured endpoint.
+                Track token usage and costs for your virtual models. Set cost per 1K tokens on virtual models to compare against paid services.
             </p>
-            <div id="virtual-models-list" class="loading">Loading...</div>
-            <div style="margin-top: 16px;">
-                <button class="btn btn-primary" onclick="openVMModal()">+ Add Virtual Model</button>
+            <div style="display:flex;gap:16px;align-items:center;margin-bottom:16px;">
+                <div class="form-group">
+                    <label>Date Range</label>
+                    <select id="date-range" onchange="loadUsage()">
+                        <option value="24h" selected>Last 24 hours</option>
+                        <option value="7d">Last 7 days</option>
+                        <option value="30d">Last 30 days</option>
+                        <option value="custom">Custom</option>
+                    </select>
+                </div>
+                <div id="custom-date-range" class="hidden">
+                    <div class="form-group">
+                        <label>From</label>
+                        <input type="date" id="date-from" onchange="loadUsage()">
+                    </div>
+                    <div class="form-group">
+                        <label>To</label>
+                        <input type="date" id="date-to" onchange="loadUsage()">
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>Virtual Model (optional)</label>
+                    <select id="virtual-model-filter" onchange="loadUsage()">
+                        <option value="">All models</option>
+                    </select>
+                </div>
+                <button class="btn btn-secondary btn-sm" onclick="toggleCustomDateRange()">Custom Dates</button>
+                <button class="btn btn-primary btn-sm" onclick="exportUsageCSV()">Export CSV</button>
             </div>
+            <div id="usage-loading" class="loading" style="display:none;">Loading...</div>
+            <div id="usage-error" style="color:var(--accent-red);display:none;"></div>
+            <div id="summary-cards" style="display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-top:16px;">
+            </div>
+            <canvas id="token-usage-chart" style="margin-top:24px;max-height:400px;"></canvas>
         </div>
-        
-        <!-- Endpoint Modal -->
+        <div class="card">
+            <h2>Daily Breakdown</h2>
+            <div id="daily-breakdown" style="margin-top:16px;"></div>
+        </div>
+    </div>
+
+    <!-- Virtual Models Card -->
+    <div id="dashboard-section">
+    <div class="card">
+        <h2>Virtual Models</h2>
+        <p style="color:var(--text-secondary);margin-bottom:16px;font-size:14px;">
+            Map virtual model names to actual models on endpoints. Tools will see the virtual name, and requests route to the configured endpoint.
+        </p>
+        <div id="virtual-models-list" class="loading">Loading...</div>
+        <div style="margin-top: 16px;">
+            <button class="btn btn-primary" onclick="openVMModal()">+ Add Virtual Model</button>
+        </div>
+    </div>
+    <!-- Endpoint Modal -->
         <div id="endpoint-modal" class="hidden">
             <div class="modal-overlay" onclick="if(event.target===this)closeEndpointModal()">
                 <div class="modal-card card">
@@ -285,6 +335,18 @@
                             <label for="vm-desc">Description</label>
                             <input type="text" id="vm-desc" name="description" placeholder="Production GPT-4 model">
                         </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="vm-cost-in">Cost per 1K Input Tokens ($)</label>
+                                <input type="number" id="vm-cost-in" name="cost_per_1k_tokens_in" value="0" step="0.0001" min="0">
+                                <small>Price per 1K tokens you send (prompt)</small>
+                            </div>
+                            <div class="form-group">
+                                <label for="vm-cost-out">Cost per 1K Output Tokens ($)</label>
+                                <input type="number" id="vm-cost-out" name="cost_per_1k_tokens_out" value="0" step="0.0001" min="0">
+                                <small>Price per 1K tokens you receive (completion)</small>
+                            </div>
+                        </div>
                         <div class="checkbox-row">
                             <input type="checkbox" id="vm-enabled" name="enabled" checked>
                             <label for="vm-enabled">Enabled</label>
@@ -300,6 +362,253 @@
     </div>
     
     <script>
+    // ==========================================
+    // Tab Switching
+    </==========================================
+    
+    let currentTab = 'dashboard';
+    
+    function showTab(tabName) {
+        currentTab = tabName;
+        
+        if (tabName === 'usage') {
+            document.getElementById('dashboard-section').classList.add('hidden');
+            document.getElementById('usage-section').classList.remove('hidden');
+            loadUsage();
+        } else {
+            document.getElementById('dashboard-section').classList.remove('hidden');
+            document.getElementById('usage-section').classList.add('hidden');
+            loadEndpoints();
+            loadVirtualModels();
+        }
+    }
+    
+    function toggleCustomDateRange() {
+        const customRange = document.getElementById('custom-date-range');
+        const rangeSelect = document.getElementById('date-range');
+        
+        if (rangeSelect.value === 'custom') {
+            customRange.classList.remove('hidden');
+        } else {
+            customRange.classList.add('hidden');
+        }
+        loadUsage();
+    }
+    
+    // ==========================================
+    // Usage Tracking
+    // ==========================================
+    
+    function loadUsage() {
+        document.getElementById('usage-loading').style.display = 'block';
+        document.getElementById('summary-cards').innerHTML = '';
+        document.getElementById('daily-breakdown').innerHTML = '';
+        document.getElementById('usage-error').style.display = 'none';
+        
+        const dateRange = document.getElementById('date-range').value;
+        let startDate, endDate;
+        
+        if (dateRange === 'custom') {
+            startDate = document.getElementById('date-from').value;
+            endDate = document.getElementById('date-to').value;
+            if (!startDate || !endDate) {
+                showUsageError('Please select both start and end dates');
+                return;
+            }
+            startDate = Math.floor(new Date(startDate).getTime() / 1000);
+            endDate = Math.floor(new Date(endDate).getTime() / 1000) + 86400;
+        } else {
+            const now = Math.floor(Date.now() / 1000);
+            const hours = {'24h': 24, '7d': 168, '30d': 720}[dateRange];
+            startDate = now - (hours * 3600);
+            endDate = now;
+        }
+        
+        const virtualModel = document.getElementById('virtual-model-filter').value;
+        const params = new URLSearchParams({
+            start_date: startDate.toString(),
+            end_date: endDate.toString(),
+            ...(virtualModel ? {virtual_model: virtualModel} : {})
+        });
+        
+        fetch('/api/admin/usage?' + params.toString())
+            .then(r => r.json())
+            .then(data => {
+                renderSummaryCards(data.summary);
+                renderDailyBreakdown(data.daily_breakdown);
+                document.getElementById('usage-loading').style.display = 'none';
+            })
+            .catch(err => {
+                showUsageError(err.message);
+                document.getElementById('usage-loading').style.display = 'none';
+            });
+    }
+    
+    function renderSummaryCards(summary) {
+        const cardsHTML = `
+            <div class="card" style="margin-top:0;padding:16px;">
+                <div style="color:var(--text-secondary);font-size:12px;text-transform:uppercase;">Total Requests</div>
+                <div style="font-size:28px;font-weight:bold;color:var(--accent);margin-top:8px;">${summary.request_count}</div>
+            </div>
+            <div class="card" style="margin-top:0;padding:16px;">
+                <div style="color:var(--text-secondary);font-size:12px;text-transform:uppercase;">Total Tokens</div>
+                <div style="font-size:28px;font-weight:bold;color:var(--accent-green);margin-top:8px;">${formatNumber(summary.total_tokens)}</div>
+                <div style="font-size:12px;margin-top:4px;">In: ${formatNumber(summary.total_prompt_tokens)} | Out: ${formatNumber(summary.total_completion_tokens)}</div>
+            </div>
+            <div class="card" style="margin-top:0;padding:16px;">
+                <div style="color:var(--text-secondary);font-size:12px;text-transform:uppercase;">Total Cost</div>
+                <div style="font-size:28px;font-weight:bold;color:var(--accent-yellow);margin-top:8px;">$${summary.total_cost.toFixed(4)}</div>
+            </div>
+            <div class="card" style="margin-top:0;padding:16px;">
+                <div style="color:var(--text-secondary);font-size:12px;text-transform:uppercase;">Avg Response</div>
+                <div style="font-size:28px;font-weight:bold;color:var(--accent);margin-top:8px;">${summary.avg_response_time_ms?.toFixed(0) || 0}ms</div>
+            </div>
+        `;
+        document.getElementById('summary-cards').innerHTML = cardsHTML;
+    }
+    
+    function renderDailyBreakdown(dailyData) {
+        if (!dailyData.length) {
+            document.getElementById('daily-breakdown').innerHTML = '<p class="empty">No data in selected date range</p>';
+            return;
+        }
+        
+        const rows = dailyData.map(day => `
+            <tr>
+                <td><strong>${day.date}</strong></td>
+                <td>${formatNumber(day.prompt_tokens)}</td>
+                <td>${formatNumber(day.completion_tokens)}</td>
+                <td>${formatNumber(day.requests)}</td>
+            </tr>
+        `).join('');
+        
+        document.getElementById('daily-breakdown').innerHTML = `
+            <table>
+                <thead><tr><th>Date</th><th>Prompt Tokens</th><th>Completion Tokens</th><th>Requests</th></tr></thead>
+                <tbody>${rows}</tbody>
+            </table>
+        `;
+    }
+    
+    function showUsageError(msg) {
+        const errorEl = document.getElementById('usage-error');
+        errorEl.textContent = 'Error: ' + msg;
+        errorEl.style.display = 'block';
+    }
+    
+    function formatNumber(num) {
+        if (num >= 1000000) return (num / 1000000).toFixed(1) + 'M';
+        if (num >= 1000) return (num / 1000).toFixed(1) + 'K';
+        return num.toString();
+    }
+    
+    function exportUsageCSV() {
+        const dateRange = document.getElementById('date-range').value;
+        let startDate, endDate;
+        
+        if (dateRange === 'custom') {
+            startDate = document.getElementById('date-from').value;
+            endDate = document.getElementById('date-to').value;
+            if (!startDate || !endDate) {
+                alert('Please select both start and end dates');
+                return;
+            }
+            startDate = Math.floor(new Date(startDate).getTime() / 1000);
+            endDate = Math.floor(new Date(endDate).getTime() / 1000) + 86400;
+        } else {
+            const now = Math.floor(Date.now() / 1000);
+            const hours = {'24h': 24, '7d': 168, '30d': 720}[dateRange];
+            startDate = now - (hours * 3600);
+            endDate = now;
+        }
+        
+        const virtualModel = document.getElementById('virtual-model-filter').value || undefined;
+        
+        fetch('/api/admin/usage/export', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({start_date: startDate, end_date: endDate, virtual_model: virtualModel})
+        })
+        .then(r => {
+            if (!r.ok) throw new Error('Export failed');
+            return r.blob();
+        })
+        .then(blob => {
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `usage_report_${new Date().toISOString().split('T')[0]}.csv`;
+            document.body.appendChild(a);
+            a.click();
+            window.URL.revokeObjectURL(url);
+            a.remove();
+        })
+        .catch(err => {
+            alert('Export failed: ' + err.message);
+        });
+    }
+    
+    // ==========================================
+    // Token Usage Chart
+    // ==========================================
+    
+    let tokenChart = null;
+    
+    function loadTokenChart() {
+        const ctx = document.getElementById('token-usage-chart');
+        if (!ctx) return;
+        
+        tokenChart = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: [],
+                datasets: [
+                    {
+                        label: 'Prompt Tokens',
+                        data: [],
+                        borderColor: '#4f8cff',
+                        backgroundColor: 'rgba(79, 140, 255, 0.1)',
+                        fill: true,
+                        tension: 0.4
+                    },
+                    {
+                        label: 'Completion Tokens',
+                        data: [],
+                        borderColor: '#10b981',
+                        backgroundColor: 'rgba(16, 185, 129, 0.1)',
+                        fill: true,
+                        tension: 0.4
+                    }
+                ]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: true,
+                plugins: {
+                    legend: {
+                        display: true,
+                        position: 'top'
+                    },
+                    tooltip: {
+                        mode: 'index',
+                        intersect: false
+                    }
+                },
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        ticks: {
+                            callback: function(value) {
+                                if (value >= 1000) return (value / 1000) + 'K';
+                                return value;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+    
     // ==========================================
     // Endpoint CRUD
     // ==========================================
@@ -432,6 +741,8 @@
         document.getElementById('vm-name').value = data ? data.name : '';
         document.getElementById('vm-model').value = data ? data.actual_model : '';
         document.getElementById('vm-desc').value = data ? (data.description || '') : '';
+        document.getElementById('vm-cost-in').value = data ? (data.cost_per_1k_tokens_in || 0) : '0';
+        document.getElementById('vm-cost-out').value = data ? (data.cost_per_1k_tokens_out || 0) : '0';
         document.getElementById('vm-enabled').checked = data ? data.enabled : true;
         document.getElementById('vm-model-list').classList.add('hidden');
         document.getElementById('vm-fetch-status').innerHTML = '';
@@ -518,6 +829,8 @@
             endpoint_id: parseInt(form.endpoint_id.value),
             actual_model: form.actual_model.value,
             description: form.description.value,
+            cost_per_1k_tokens_in: parseFloat(form.cost_per_1k_tokens_in.value) || 0,
+            cost_per_1k_tokens_out: parseFloat(form.cost_per_1k_tokens_out.value) || 0,
             enabled: form.enabled.checked
         };
         
@@ -547,14 +860,14 @@
             .then(data => {
                 const html = data.length ? `
                     <table>
-                        <thead><tr><th>Virtual Name</th><th>Endpoint</th><th>Actual Model</th><th>Description</th><th>Actions</th></tr></thead>
+                        <thead><tr><th>Virtual Name</th><th>Endpoint</th><th>Actual Model</th><th>Cost In/Out ($/1K)</th><th>Actions</th></tr></thead>
                         <tbody>
                             ${data.map(vm => `
                                 <tr>
                                     <td><strong>${vm.name}</strong></td>
                                     <td>${vm.endpoint_name || 'N/A'}</td>
                                     <td><code>${vm.actual_model}</code></td>
-                                    <td>${vm.description || '-'}</td>
+                                    <td>${(vm.cost_per_1k_tokens_in || 0)} / ${(vm.cost_per_1k_tokens_out || 0)}</td>
                                     <td class="actions">
                                         <button class="btn btn-secondary btn-sm" onclick="editVM(${vm.id})">Edit</button>
                                         <button class="btn btn-danger btn-sm" onclick="deleteVirtualModel(${vm.id})">Delete</button>

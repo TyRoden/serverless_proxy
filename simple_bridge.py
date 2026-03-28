@@ -89,6 +89,8 @@ def init_database():
                 endpoint_id INTEGER NOT NULL,
                 actual_model TEXT NOT NULL,
                 description TEXT,
+                cost_per_1k_tokens_in REAL DEFAULT 0,
+                cost_per_1k_tokens_out REAL DEFAULT 0,
                 enabled INTEGER DEFAULT 1,
                 created_at INTEGER DEFAULT (strftime('%s', 'now')),
                 updated_at INTEGER DEFAULT (strftime('%s', 'now')),
@@ -96,11 +98,267 @@ def init_database():
             )
         """)
 
+        # Request usage tracking table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS request_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                virtual_model TEXT NOT NULL,
+                endpoint_name TEXT,
+                endpoint_id INTEGER,
+                request_type TEXT DEFAULT 'chat',
+                prompt_tokens INTEGER DEFAULT 0,
+                completion_tokens INTEGER DEFAULT 0,
+                total_tokens INTEGER DEFAULT 0,
+                cost_estimate REAL DEFAULT 0,
+                cost_in REAL DEFAULT 0,
+                cost_out REAL DEFAULT 0,
+                response_time_ms INTEGER DEFAULT 0,
+                created_at INTEGER DEFAULT (strftime('%s', 'now')),
+                FOREIGN KEY (endpoint_id) REFERENCES endpoints(id)
+            )
+        """)
+
+        # Embedding usage tracking table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS embedding_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                virtual_model TEXT NOT NULL,
+                endpoint_name TEXT,
+                endpoint_id INTEGER,
+                input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0,
+                total_tokens INTEGER DEFAULT 0,
+                cost_estimate REAL DEFAULT 0,
+                response_time_ms INTEGER DEFAULT 0,
+                created_at INTEGER DEFAULT (strftime('%s', 'now')),
+                FOREIGN KEY (endpoint_id) REFERENCES endpoints(id)
+            )
+        """)
+
+        # Migration: Add new columns if they don't exist
+        try:
+            cursor.execute("SELECT cost_per_1k_tokens_in FROM virtual_models LIMIT 1")
+        except:
+            try:
+                cursor.execute(
+                    "ALTER TABLE virtual_models ADD COLUMN cost_per_1k_tokens_in REAL DEFAULT 0"
+                )
+            except:
+                pass
+            try:
+                cursor.execute(
+                    "ALTER TABLE virtual_models ADD COLUMN cost_per_1k_tokens_out REAL DEFAULT 0"
+                )
+            except:
+                pass
+
+        try:
+            cursor.execute("SELECT cost_in FROM request_usage LIMIT 1")
+        except:
+            try:
+                cursor.execute(
+                    "ALTER TABLE request_usage ADD COLUMN cost_in REAL DEFAULT 0"
+                )
+            except:
+                pass
+            try:
+                cursor.execute(
+                    "ALTER TABLE request_usage ADD COLUMN cost_out REAL DEFAULT 0"
+                )
+            except:
+                pass
+
+        try:
+            cursor.execute("SELECT cost_in FROM embedding_usage LIMIT 1")
+        except:
+            try:
+                cursor.execute(
+                    "ALTER TABLE embedding_usage ADD COLUMN cost_in REAL DEFAULT 0"
+                )
+            except:
+                pass
+            try:
+                cursor.execute(
+                    "ALTER TABLE embedding_usage ADD COLUMN cost_out REAL DEFAULT 0"
+                )
+            except:
+                pass
+
+        # Create indexes for performance
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_request_usage_virtual_model ON request_usage(virtual_model)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_request_usage_created_at ON request_usage(created_at)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_embedding_usage_virtual_model ON embedding_usage(virtual_model)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_embedding_usage_created_at ON embedding_usage(created_at)"
+        )
+
         conn.commit()
 
 
 # Initialize database on startup
 init_database()
+
+
+# ============================================================================
+# Token Usage Logging Functions
+# ============================================================================
+
+
+def get_virtual_model_cost(virtual_model_name):
+    """Get cost_per_1k_tokens for a virtual model (both in and out)."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT cost_per_1k_tokens_in, cost_per_1k_tokens_out FROM virtual_models WHERE name = ?",
+            (virtual_model_name,),
+        )
+        result = cursor.fetchone()
+        if result:
+            in_cost = float(result[0]) if result[0] is not None else 0.0
+            out_cost = (
+                float(result[1]) if result[1] is not None else in_cost
+            )  # default to in_cost if not set
+            return in_cost, out_cost
+        return 0.0, 0.0
+
+
+def log_chat_usage(virtual_model, endpoint_name, endpoint_id, usage, response_time_ms):
+    """Log chat completion usage to request_usage table."""
+    try:
+        prompt_tokens = usage.get("prompt_tokens", 0) or 0
+        completion_tokens = usage.get("completion_tokens", 0) or 0
+        total_tokens = usage.get("total_tokens", 0) or (
+            prompt_tokens + completion_tokens
+        )
+
+        cost_in, cost_out = get_virtual_model_cost(virtual_model)
+        cost_estimate = (prompt_tokens / 1000 * cost_in) + (
+            completion_tokens / 1000 * cost_out
+        )
+
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO request_usage 
+                (virtual_model, endpoint_name, endpoint_id, request_type, 
+                 prompt_tokens, completion_tokens, total_tokens, 
+                 cost_estimate, cost_in, cost_out, response_time_ms)
+                VALUES (?, ?, ?, 'chat', ?, ?, ?, ?, ?, ?, ?)
+            """,
+                (
+                    virtual_model,
+                    endpoint_name,
+                    endpoint_id,
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens,
+                    cost_estimate,
+                    prompt_tokens / 1000 * cost_in,
+                    completion_tokens / 1000 * cost_out,
+                    response_time_ms,
+                ),
+            )
+            conn.commit()
+    except Exception as e:
+        # Log error but don't fail request
+        print(f"Error logging chat usage: {e}")
+
+
+def log_completion_usage(
+    virtual_model, endpoint_name, endpoint_id, usage, response_time_ms
+):
+    """Log text completion usage to request_usage table."""
+    try:
+        prompt_tokens = usage.get("prompt_tokens", 0) or 0
+        completion_tokens = usage.get("completion_tokens", 0) or 0
+        total_tokens = usage.get("total_tokens", 0) or (
+            prompt_tokens + completion_tokens
+        )
+
+        cost_in, cost_out = get_virtual_model_cost(virtual_model)
+        cost_estimate = (prompt_tokens / 1000 * cost_in) + (
+            completion_tokens / 1000 * cost_out
+        )
+
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO request_usage 
+                (virtual_model, endpoint_name, endpoint_id, request_type, 
+                 prompt_tokens, completion_tokens, total_tokens, 
+                 cost_estimate, cost_in, cost_out, response_time_ms)
+                VALUES (?, ?, ?, 'completion', ?, ?, ?, ?, ?, ?, ?)
+            """,
+                (
+                    virtual_model,
+                    endpoint_name,
+                    endpoint_id,
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens,
+                    cost_estimate,
+                    prompt_tokens / 1000 * cost_in,
+                    completion_tokens / 1000 * cost_out,
+                    response_time_ms,
+                ),
+            )
+            conn.commit()
+    except Exception as e:
+        print(f"Error logging completion usage: {e}")
+
+
+def log_embedding_usage(
+    virtual_model,
+    endpoint_name,
+    endpoint_id,
+    input_tokens,
+    output_tokens,
+    response_time_ms,
+):
+    """Log embedding usage to embedding_usage table."""
+    try:
+        total_tokens = input_tokens + output_tokens
+
+        cost_in, cost_out = get_virtual_model_cost(virtual_model)
+        cost_estimate = (input_tokens / 1000 * cost_in) + (
+            output_tokens / 1000 * cost_out
+        )
+
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO embedding_usage 
+                (virtual_model, endpoint_name, endpoint_id, 
+                 input_tokens, output_tokens, total_tokens, 
+                 cost_estimate, cost_in, cost_out, response_time_ms)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+                (
+                    virtual_model,
+                    endpoint_name,
+                    endpoint_id,
+                    input_tokens,
+                    output_tokens,
+                    total_tokens,
+                    cost_estimate,
+                    input_tokens / 1000 * cost_in,
+                    output_tokens / 1000 * cost_out,
+                    response_time_ms,
+                ),
+            )
+            conn.commit()
+    except Exception as e:
+        print(f"Error logging embedding usage: {e}")
+
 
 KNOWN_TOOL_NAMES = frozenset(
     [
@@ -1104,6 +1362,10 @@ def process_content(content):
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     """OpenAI-compatible chat completions endpoint."""
+    import time as time_module
+
+    start_time = time_module.time()
+
     data = await request.json()
 
     messages = data.get("messages", [])
@@ -1113,6 +1375,12 @@ async def chat_completions(request: Request):
     top_p = data.get("top_p", 1.0)
     stream = data.get("stream", False)
     tools = data.get("tools", [])
+
+    # Get the actual model name from virtual models if applicable
+    virtual_model = model
+    backend = get_backend(model)
+    if hasattr(backend, "virtual_model_name"):
+        virtual_model = backend.virtual_model_name
 
     # Additional OpenAI parameters
     extra_params = {
@@ -1128,7 +1396,6 @@ async def chat_completions(request: Request):
     }
 
     # Get backend for this model (checks virtual models first, then falls back to env vars)
-    backend = get_backend(model)
 
     # Call backend (handles both AI Queue and RunPod)
     backend_result, error, status_code = await backend.chat_completion(
@@ -1171,7 +1438,7 @@ async def chat_completions(request: Request):
     elif not tool_calls_data:
         text_content = text_content or content
 
-    job_id = result.get("id", f"chat-{int(time.time())}")
+    job_id = result.get("id", f"chat-{int(time_module.time())}")
 
     # Handle streaming response
     if stream:
@@ -1229,6 +1496,36 @@ async def chat_completions(request: Request):
                 },
                 "finish_reason": finish_reason,
             }
+        )
+
+    # Log usage
+    if not stream:
+        response_time_ms = int((time_module.time() - start_time) * 1000)
+        endpoint_name = None
+        endpoint_id = None
+        try:
+            with get_db() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT name, id FROM virtual_models WHERE name = ?
+                """,
+                    (virtual_model,),
+                )
+                row = cursor.fetchone()
+                if row:
+                    endpoint_name = row[0] if row[0] else virtual_model
+                    cursor.execute(
+                        """
+                        SELECT endpoint_id FROM virtual_models WHERE name = ?
+                    """,
+                        (virtual_model,),
+                    )
+                    endpoint_id = cursor.fetchone()[0]
+        except:
+            pass
+        log_chat_usage(
+            virtual_model, endpoint_name, endpoint_id, usage, response_time_ms
         )
 
     return JSONResponse(content=response_content)
@@ -1348,6 +1645,325 @@ async def health_check():
     }
 
 
+# ==================================================================================
+# Usage Tracking API Endpoints
+# ==================================================================================
+
+
+@app.get("/api/admin/usage")
+async def get_usage_summary(request: Request):
+    """Get usage summary with date filtering."""
+    auth = validate_session()
+    if not auth.get("valid"):
+        return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+
+    query_params = request.query_params
+    start_date = query_params.get("start_date")
+    end_date = query_params.get("end_date")
+    virtual_model = query_params.get("virtual_model")
+
+    # Default to last 24 hours if no dates specified
+    if not start_date:
+        start_date = str(int(time.time()) - 86400)
+    if not end_date:
+        end_date = str(int(time.time()))
+
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+
+            # Build base query
+            base_query = """
+                SELECT 
+                    SUM(prompt_tokens) as total_prompt_tokens,
+                    SUM(completion_tokens) as total_completion_tokens,
+                    SUM(total_tokens) as total_tokens,
+                    SUM(cost_estimate) as total_cost,
+                    COUNT(*) as request_count,
+                    AVG(response_time_ms) as avg_response_time_ms
+                FROM request_usage
+                WHERE created_at >= ? AND created_at <= ?
+            """
+            params = [start_date, end_date]
+
+            # Add virtual model filter if specified
+            if virtual_model:
+                base_query += " AND virtual_model = ?"
+                params.append(virtual_model)
+
+            cursor.execute(base_query, params)
+            summary = cursor.fetchone()
+
+            # Daily breakdown
+            daily_query = """
+                SELECT 
+                    strftime('%Y-%m-%d', datetime(created_at, 'unixepoch')) as date,
+                    SUM(prompt_tokens) as prompt_tokens,
+                    SUM(completion_tokens) as completion_tokens,
+                    COUNT(*) as requests
+                FROM request_usage
+                WHERE created_at >= ? AND created_at <= ?
+            """
+            daily_params = [start_date, end_date]
+
+            if virtual_model:
+                daily_query += " AND virtual_model = ?"
+                daily_params.append(virtual_model)
+
+            daily_query += " GROUP BY date ORDER BY date DESC"
+            cursor.execute(daily_query, daily_params)
+            daily_breakdown = [dict(row) for row in cursor.fetchall()]
+
+            return JSONResponse(
+                content={
+                    "summary": {
+                        "total_prompt_tokens": summary[0] or 0,
+                        "total_completion_tokens": summary[1] or 0,
+                        "total_tokens": summary[2] or 0,
+                        "total_cost": round(summary[3] or 0, 4),
+                        "request_count": summary[4] or 0,
+                        "avg_response_time_ms": round(summary[5] or 0, 2),
+                    },
+                    "daily_breakdown": daily_breakdown,
+                }
+            )
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.get("/api/admin/usage/by_model")
+async def get_usage_by_model(request: Request):
+    """Get usage breakdown by virtual model."""
+    auth = validate_session()
+    if not auth.get("valid"):
+        return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+
+    query_params = request.query_params
+    start_date = query_params.get("start_date")
+    end_date = query_params.get("end_date")
+
+    if not start_date:
+        start_date = str(int(time.time()) - 86400)
+    if not end_date:
+        end_date = str(int(time.time()))
+
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT 
+                    virtual_model,
+                    SUM(prompt_tokens) as prompt_tokens,
+                    SUM(completion_tokens) as completion_tokens,
+                    SUM(total_tokens) as total_tokens,
+                    SUM(cost_estimate) as cost_estimate,
+                    COUNT(*) as request_count
+                FROM request_usage
+                WHERE created_at >= ? AND created_at <= ?
+                GROUP BY virtual_model
+                ORDER BY total_tokens DESC
+            """,
+                [start_date, end_date],
+            )
+
+            results = [dict(row) for row in cursor.fetchall()]
+            return JSONResponse(content=results)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.get("/api/admin/usage/by_endpoint")
+async def get_usage_by_endpoint(request: Request):
+    """Get usage breakdown by endpoint."""
+    auth = validate_session()
+    if not auth.get("valid"):
+        return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+
+    query_params = request.query_params
+    start_date = query_params.get("start_date")
+    end_date = query_params.get("end_date")
+
+    if not start_date:
+        start_date = str(int(time.time()) - 86400)
+    if not end_date:
+        end_date = str(int(time.time()))
+
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT 
+                    endpoint_name,
+                    SUM(prompt_tokens) as prompt_tokens,
+                    SUM(completion_tokens) as completion_tokens,
+                    SUM(total_tokens) as total_tokens,
+                    COUNT(*) as request_count
+                FROM request_usage
+                WHERE created_at >= ? AND created_at <= ? AND endpoint_name IS NOT NULL
+                GROUP BY endpoint_name
+                ORDER BY total_tokens DESC
+            """,
+                [start_date, end_date],
+            )
+
+            results = [dict(row) for row in cursor.fetchall()]
+            return JSONResponse(content=results)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.post("/api/admin/usage/export")
+async def export_usage_csv(request: Request):
+    """Export usage data as CSV."""
+    auth = validate_session()
+    if not auth.get("valid"):
+        return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+
+    data = await request.json()
+    start_date = data.get("start_date")
+    end_date = data.get("end_date")
+    virtual_model = data.get("virtual_model")
+
+    if not start_date:
+        start_date = str(int(time.time()) - 86400)
+    if not end_date:
+        end_date = str(int(time.time()))
+
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+
+            base_query = """
+                SELECT 
+                    datetime(created_at, 'unixepoch', 'localtime') as date,
+                    virtual_model,
+                    COALESCE(endpoint_name, 'N/A') as endpoint,
+                    request_type,
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens,
+                    cost_estimate,
+                    response_time_ms
+                FROM request_usage
+                WHERE created_at >= ? AND created_at <= ?
+            """
+            params = [start_date, end_date]
+
+            if virtual_model:
+                base_query += " AND virtual_model = ?"
+                params.append(virtual_model)
+
+            base_query += " ORDER BY created_at DESC"
+
+            cursor.execute(base_query, params)
+            rows = cursor.fetchall()
+
+            # Build CSV
+            csv_lines = [
+                "Date,Virtual Model,Endpoint,Request Type,Prompt Tokens,Completion Tokens,Total Tokens,Cost ($),Response Time (ms)"
+            ]
+            for row in rows:
+                csv_lines.append(
+                    f"{row[0]},{row[1]},{row[2]},{row[3]},{row[4]},{row[5]},{row[6]},{row[7]:.4f},{row[8]}"
+                )
+
+            csv_content = "\n".join(csv_lines)
+            return Response(
+                content=csv_content,
+                media_type="text/csv",
+                headers={
+                    "Content-Disposition": f"attachment; filename=usage_report_{int(time.time())}.csv"
+                },
+            )
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.put("/virtual-models/<int:vm_id>/update_cost")
+async def update_virtual_model_cost(vm_id: int, request: Request):
+    """Update cost per 1K tokens for a virtual model."""
+    auth = validate_session()
+    if not auth.get("valid"):
+        return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+
+    try:
+        data = await request.json()
+        cost_per_1k = data.get("cost_per_1k_tokens")
+
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE virtual_models
+                SET cost_per_1k_tokens = ?, updated_at = strftime('%s', 'now')
+                WHERE id = ?
+            """,
+                (cost_per_1k, vm_id),
+            )
+            conn.commit()
+
+            cursor.execute(
+                """
+                SELECT * FROM virtual_models WHERE id = ?
+            """,
+                (vm_id,),
+            )
+            result = cursor.fetchone()
+
+            return JSONResponse(content=dict(result))
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.get("/api/admin/usage/embeddings")
+async def get_embedding_usage(request: Request):
+    """Get embedding usage summary."""
+    auth = validate_session()
+    if not auth.get("valid"):
+        return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+
+    query_params = request.query_params
+    start_date = query_params.get("start_date")
+    end_date = query_params.get("end_date")
+
+    if not start_date:
+        start_date = str(int(time.time()) - 86400)
+    if not end_date:
+        end_date = str(int(time.time()))
+
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT 
+                    SUM(input_tokens) as total_input_tokens,
+                    SUM(output_tokens) as total_output_tokens,
+                    SUM(total_tokens) as total_tokens,
+                    SUM(cost_estimate) as total_cost,
+                    COUNT(*) as request_count
+                FROM embedding_usage
+                WHERE created_at >= ? AND created_at <= ?
+            """,
+                [start_date, end_date],
+            )
+
+            summary = cursor.fetchone()
+            return JSONResponse(
+                content={
+                    "total_input_tokens": summary[0] or 0,
+                    "total_output_tokens": summary[1] or 0,
+                    "total_tokens": summary[2] or 0,
+                    "total_cost": round(summary[3] or 0, 4),
+                    "request_count": summary[4] or 0,
+                }
+            )
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
 @app.get("/v1/models")
 async def list_models():
     # Get virtual models from database
@@ -1405,6 +2021,7 @@ async def completions(request: Request):
     Legacy completions endpoint - converts to chat completions format.
     Many tools still use this for text-only completions.
     """
+    start_time = time_module.time()
     data = await request.json()
 
     prompt = data.get("prompt", "")
@@ -1444,7 +2061,7 @@ async def completions(request: Request):
     if "choices" in result and result["choices"]:
         content = result["choices"][0].get("message", {}).get("content", "") or ""
 
-    job_id = result.get("id", f"cmpl-{int(time.time())}")
+    job_id = result.get("id", f"cmpl-{int(time_module.time())}")
     usage = result.get(
         "usage", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     )
@@ -1452,7 +2069,7 @@ async def completions(request: Request):
     if stream:
 
         async def generate_sse():
-            created = int(time.time())
+            created = int(time_module.time())
             if content:
                 yield f"data: {json.dumps({'id': job_id, 'choices': [{'text': content, 'index': 0}], 'model': model})}\n\n"
             yield "data: [DONE]\n\n"
@@ -1463,11 +2080,15 @@ async def completions(request: Request):
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
 
+    # Log usage
+    response_time_ms = int((time_module.time() - start_time) * 1000)
+    log_completion_usage(model, None, None, usage, response_time_ms)
+
     return JSONResponse(
         content={
             "id": job_id,
             "object": "text_completion",
-            "created": int(time.time()),
+            "created": int(time_module.time()),
             "model": model,
             "choices": [
                 {
@@ -1487,6 +2108,7 @@ async def embeddings(request: Request):
     Embeddings endpoint for vector representations.
     Routes to backend if supported, otherwise returns error.
     """
+    start_time = time_module.time()
     data = await request.json()
 
     input_text = data.get("input", "")
@@ -1502,6 +2124,25 @@ async def embeddings(request: Request):
         )
         if error:
             return JSONResponse(status_code=status_code, content=error)
+
+        # Log usage if backend returns token info
+        response_time_ms = int((time_module.time() - start_time) * 1000)
+        try:
+            usage_data = result.get("usage", {})
+            input_tokens = (
+                usage_data.get("prompt_tokens", 0)
+                or usage_data.get("input_tokens", 0)
+                or 0
+            )
+            output_tokens = usage_data.get("completion_tokens", 0) or 0
+
+            if input_tokens > 0 or output_tokens > 0:
+                log_embedding_usage(
+                    model, None, None, input_tokens, output_tokens, response_time_ms
+                )
+        except:
+            pass  # Embeddings might not return token usage
+
         return JSONResponse(content=result)
 
     # Embeddings not supported - return error with OpenAI format

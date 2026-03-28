@@ -2,6 +2,34 @@
 
 All notable changes to the Serverless Proxy will be documented in this file.
 
+## [2.1.0] - 2026-03-28
+
+### Added
+
+- **Token & Cost Tracking** - Track token usage and compare costs against paid services:
+  - Logs prompt tokens (input), completion tokens (output) separately
+  - Tracks response time per request
+  - Per-virtual-model cost configuration (different rates for input/output tokens)
+  - Usage API endpoints:
+    - `GET /api/admin/usage` - Summary with daily breakdown
+    - `GET /api/admin/usage/by_model` - Per-model breakdown
+    - `GET /api/admin/usage/by_endpoint` - Per-endpoint breakdown
+    - `POST /api/admin/usage/export` - CSV export
+    - `GET /api/admin/usage/embeddings` - Embedding usage
+  - Admin UI "Usage & Cost" tab with:
+    - Summary cards (requests, tokens, cost, avg response time)
+    - Date range filtering (24h, 7d, 30d, custom)
+    - Virtual model filter
+    - Daily breakdown table
+    - CSV export button
+
+### Database Changes
+
+- New `request_usage` table - tracks chat/completion usage
+- New `embedding_usage` table - tracks embedding usage separately
+- Added `cost_per_1k_tokens_in` and `cost_per_1k_tokens_out` to virtual_models
+- Automatic migration for existing databases
+
 ## [2.0.0] - 2026-03-28
 
 ### Added
