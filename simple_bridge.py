@@ -99,6 +99,21 @@ class LLMBackend(ABC):
         pass
 
     @abstractmethod
+    async def embeddings(
+        self,
+        input_text: str,
+        model: str,
+    ) -> tuple[Optional[dict], Optional[dict], int]:
+        """
+        Execute an embeddings request.
+        Returns: (result, error, status_code)
+        - result: Response dict on success
+        - error: Error dict on failure
+        - status_code: HTTP status code
+        """
+        pass
+
+    @abstractmethod
     async def health_check(self) -> bool:
         """Check if backend is healthy."""
         pass
@@ -214,6 +229,52 @@ class AIQueueBackend(LLMBackend):
                 return response.status_code == 200
         except Exception:
             return False
+
+    async def embeddings(
+        self,
+        input_text: str,
+        model: str,
+    ) -> tuple[Optional[dict], Optional[dict], int]:
+        """Route embeddings request to AI Queue."""
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "X-Source": self.source,
+        }
+
+        payload = {
+            "model": model,
+            "input": input_text,
+        }
+
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            try:
+                response = await client.post(
+                    f"{self.url}/v1/embeddings",
+                    headers=headers,
+                    json=payload,
+                )
+
+                if response.status_code != 200:
+                    return (
+                        None,
+                        {
+                            "error": {
+                                "message": f"AI Queue error: {response.text}",
+                                "type": "internal_server_error",
+                            }
+                        },
+                        response.status_code,
+                    )
+
+                result = response.json()
+                return result, None, 200
+            except Exception as e:
+                return (
+                    None,
+                    {"error": {"message": str(e), "type": "internal_server_error"}},
+                    500,
+                )
 
 
 class RunPodBackend(LLMBackend):
@@ -415,6 +476,26 @@ class RunPodBackend(LLMBackend):
                 return response.status_code == 200
         except Exception:
             return False
+
+    async def embeddings(
+        self,
+        input_text: str,
+        model: str,
+    ) -> tuple[Optional[dict], Optional[dict], int]:
+        """Route embeddings request to RunPod."""
+        # RunPod doesn't have a standard embeddings API via /runsync
+        # This would need a separate endpoint or worker
+        return (
+            None,
+            {
+                "error": {
+                    "message": "Embeddings not supported in direct RunPod mode. Use AI Queue mode.",
+                    "type": "invalid_request_error",
+                    "code": "not_implemented",
+                }
+            },
+            501,
+        )
 
 
 # ============================================================================
@@ -1059,6 +1140,118 @@ async def list_models():
             }
         ],
     }
+
+
+@app.post("/v1/completions")
+async def completions(request: Request):
+    """
+    Legacy completions endpoint - converts to chat completions format.
+    Many tools still use this for text-only completions.
+    """
+    data = await request.json()
+
+    prompt = data.get("prompt", "")
+    model = data.get("model", os.getenv("MODEL_NAME", "project-system-ai"))
+    temperature = data.get("temperature", 0.7)
+    max_tokens = data.get("max_tokens", 256)
+    top_p = data.get("top_p", 1.0)
+    stream = data.get("stream", False)
+    stop = data.get("stop")
+
+    # Convert to chat format
+    messages = [{"role": "user", "content": prompt}]
+
+    # Call backend
+    backend_result, error, status_code = await BACKEND.chat_completion(
+        messages=messages,
+        model=model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        top_p=top_p,
+        stream=stream,
+        stop=stop,
+    )
+
+    if error:
+        return JSONResponse(status_code=status_code, content=error)
+
+    # Extract result
+    result = backend_result
+    if "result" in backend_result:
+        result = backend_result["result"]
+
+    content = ""
+    if "choices" in result and result["choices"]:
+        content = result["choices"][0].get("message", {}).get("content", "") or ""
+
+    job_id = result.get("id", f"cmpl-{int(time.time())}")
+    usage = result.get(
+        "usage", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    )
+
+    if stream:
+
+        async def generate_sse():
+            created = int(time.time())
+            if content:
+                yield f"data: {json.dumps({'id': job_id, 'choices': [{'text': content, 'index': 0}], 'model': model})}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(
+            generate_sse(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+
+    return JSONResponse(
+        content={
+            "id": job_id,
+            "object": "text_completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [
+                {
+                    "text": content,
+                    "index": 0,
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": usage,
+        }
+    )
+
+
+@app.post("/v1/embeddings")
+async def embeddings(request: Request):
+    """
+    Embeddings endpoint for vector representations.
+    Routes to backend if supported, otherwise returns error.
+    """
+    data = await request.json()
+
+    input_text = data.get("input", "")
+    model = data.get("model", os.getenv("EMBEDDING_MODEL", "nomic-embed-text"))
+
+    # Check if backend supports embeddings
+    if hasattr(BACKEND, "embeddings"):
+        result, error, status_code = await BACKEND.embeddings(
+            input_text=input_text, model=model
+        )
+        if error:
+            return JSONResponse(status_code=status_code, content=error)
+        return JSONResponse(content=result)
+
+    # Embeddings not supported - return error with OpenAI format
+    return JSONResponse(
+        status_code=501,
+        content={
+            "error": {
+                "message": "Embeddings not supported by current backend",
+                "type": "invalid_request_error",
+                "code": "not_implemented",
+            }
+        },
+    )
 
 
 if __name__ == "__main__":
