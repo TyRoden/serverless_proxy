@@ -35,7 +35,15 @@ docker compose up -d --build
 | `DATABASE_PATH` | SQLite database path | `/data/proxy.db` |
 | `FLASK_PORT` | Admin UI port | `5001` |
 | `TIMEOUT` | Request timeout (seconds) | `300` |
-| `AIMENU_URL` | AI Menu System URL for auth | `http://host.docker.internal:5000` |
+| `AUTH_ENABLED` | Enable admin authentication | `true` |
+| `AIMENU_URL` | Auth service URL | `http://localhost:5000` |
+
+### Authentication
+
+By default, the admin dashboard requires authentication. See [docs/authentication.md](docs/authentication.md) for:
+- How to disable authentication for fresh installs
+- How to implement your own auth service
+- Full API specification for the `/session/validate` endpoint
 
 ### Docker Ports
 
