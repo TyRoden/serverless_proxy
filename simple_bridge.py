@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
-Simple proxy to bridge OpenAI-compatible requests to RunPod Serverless
-Supports both vLLM and Ollama endpoints via ENDPOINT_TYPE env var
-Supports multiple backends via backend abstraction layer
+Universal LLM Gateway - OpenAI and Anthropic API compatible proxy
 
-Based on the RunPod serverless API patterns and extended with:
-- Virtual model configuration
-- Anthropic API compatibility
-- Admin UI for endpoint management
+Features:
+- Virtual model mapping to multiple backends (RunPod, DeepInfra, Ollama, etc.)
+- OpenAI-compatible API (/v1/chat/completions, /v1/models, etc.)
+- Anthropic-compatible API (/v1/messages) - works with Claude Code
+- Admin UI for endpoint and model configuration
+- Token usage tracking and cost calculation
+- Tool call extraction from various model output formats
+- Streaming support for both APIs
 """
 
-# Based on RunPod serverless API patterns
-# Extended with virtual model support, Anthropic API compatibility, and admin UI
+from fastapi import FastAPI, Request
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
