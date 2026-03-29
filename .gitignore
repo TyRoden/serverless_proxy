@@ -49,3 +49,6 @@ AGENTS.md
 *.pyc
 .pytest_cache/
 .ruff_cache/
+
+# Archive (legacy code reference)
+archive/
