@@ -179,7 +179,6 @@
                     console.log('Session validate response:', d);
                     document.getElementById('auth-overlay').style.display = 'none';
                     if (!d.valid) {
-                        alert('Session invalid! Response: ' + JSON.stringify(d));
                         window.location.href = '/login?redirect=' + encodeURIComponent(window.location.pathname);
                     } else {
                         document.getElementById('username').textContent = d.username;
@@ -190,7 +189,6 @@
                 })
                 .catch((err) => {
                     console.error('Session validate error:', err);
-                    alert('Session error: ' + err);
                     window.location.href = '/login?redirect=' + encodeURIComponent(window.location.pathname);
                 });
         });
