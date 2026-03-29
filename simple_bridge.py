@@ -2284,8 +2284,38 @@ async def anthropic_messages(request: Request):
     stream = data.get("stream", False)
     tools = data.get("tools", [])
 
+    # Convert Claude Code tool format to OpenAI format
+    # Claude Code sends: {"name": "...", "description": "...", "parameters": {...}}
+    # OpenAI expects: {"type": "function", "function": {"name": "...", "description": "...", "parameters": {...}}}
+    if tools:
+        converted_tools = []
+        for tool in tools:
+            if "function" in tool:
+                converted_tools.append(tool)
+            elif "name" in tool:
+                converted_tools.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": tool.get("name"),
+                            "description": tool.get("description", ""),
+                            "parameters": tool.get(
+                                "parameters", {"type": "object", "properties": {}}
+                            ),
+                        },
+                    }
+                )
+        tools = converted_tools
+
+    # Handle system at top level (Anthropic newer format)
+    system_message = data.get("system")
+    if not system_message and messages and messages[0].get("role") == "system":
+        # Fallback to first message if it's system
+        pass  # Will be handled in loop below
+
     # Convert Anthropic system messages to OpenAI format
-    system_message = None
+    if not system_message:
+        system_message = None
     converted_messages = []
     for msg in messages:
         role = msg.get("role", "user")
