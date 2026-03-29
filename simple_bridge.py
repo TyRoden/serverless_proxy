@@ -1344,14 +1344,47 @@ def extract_tool_calls(content):
 
             # Check for Task/subtask patterns first
             if "using task" in action_text.lower() or "task to" in action_text.lower():
-                # Extract everything after "to" as the prompt for subtask
                 import re as re_module
 
-                prompt_match = re_module.search(
-                    r"(?:using\s+)?task\s+to\s+(.+)$", action_text, re.IGNORECASE
+                # Pattern: "add X to list of Y to inspect" -> treat as inspect with path
+                list_pattern = re_module.search(
+                    r"(?:using\s+)?task\s+to\s+add\s+(.+?)\s+to\s+list\s+of\s+([^:]+?)(?:\s+to\s+(\w+))?\s*$",
+                    action_text,
+                    re.IGNORECASE,
                 )
-                prompt = prompt_match.group(1).strip() if prompt_match else action_text
-                args_dict = {"prompt": prompt}
+                if list_pattern:
+                    path = list_pattern.group(1).strip()
+                    directive = (
+                        list_pattern.group(3).strip().lower()
+                        if list_pattern.group(3)
+                        else "inspect"
+                    )
+                    args_dict = {"directive": directive, "prompt": path}
+
+                else:
+                    # Standard pattern: "using Task to <directive> <prompt>" or "Task to <directive> <prompt>"
+                    task_match = re_module.search(
+                        r"(?:using\s+)?task\s+to\s+(\w+)\s+(.+)$",
+                        action_text,
+                        re.IGNORECASE,
+                    )
+                    if task_match:
+                        directive = task_match.group(1).strip().lower()
+                        prompt = task_match.group(2).strip()
+                        args_dict = {"directive": directive, "prompt": prompt}
+                    else:
+                        # Fallback: extract everything after "to" as prompt
+                        prompt_match = re_module.search(
+                            r"(?:using\s+)?task\s+to\s+(.+)$",
+                            action_text,
+                            re.IGNORECASE,
+                        )
+                        prompt = (
+                            prompt_match.group(1).strip()
+                            if prompt_match
+                            else action_text
+                        )
+                        args_dict = {"prompt": prompt}
                 args_str = json.dumps(args_dict, ensure_ascii=False)
                 tool_calls.append(
                     {
@@ -1587,12 +1620,175 @@ def _parse_bare_call(text):
     return (func_name, json.dumps(args, ensure_ascii=False))
 
 
+def fix_action_based_tool_calls(tool_calls):
+    """Fix tool calls that use wrong field names or malformed parameters."""
+    if not tool_calls:
+        return tool_calls
+
+    def detect_tool_from_args(args, func_name):
+        """Detect intended tool from any available information."""
+        text_fields = [
+            args.get("action"),
+            args.get("description"),
+            args.get("query"),
+            args.get("text"),
+        ]
+        text = " ".join(str(f) for f in text_fields if f).lower()
+
+        if not text and func_name and func_name != "task":
+            text = func_name.lower()
+
+        tool_keywords = {
+            "search": "grep",
+            "grep": "grep",
+            "find": "grep",
+            "read": "read",
+            "cat": "read",
+            "view": "read",
+            "list": "glob",
+            "ls": "glob",
+            "glob": "glob",
+            "write": "write",
+            "save": "write",
+            "edit": "edit",
+            "modify": "edit",
+            "run": "bash",
+            "execute": "bash",
+            "bash": "bash",
+            "shell": "bash",
+            "cmd": "bash",
+            "inspect": "task",
+            "analyze": "task",
+            "explore": "task",
+            "task": "task",
+        }
+
+        for kw, tool in tool_keywords.items():
+            if kw in text:
+                return tool, text
+
+        return None, text
+
+    def parse_action_to_args(tool_name, action):
+        """Parse natural language action to proper tool arguments."""
+        if not action:
+            return {}
+
+        if tool_name == "grep":
+            match = re.search(
+                r"(?:search|find|grep)\s+(?:for\s+)?[\"']?([^\"']+)[\"']?(?:\s+in\s+|\s+at\s+|\s+)(.+)",
+                action,
+                re.IGNORECASE,
+            )
+            if match:
+                return {
+                    "pattern": match.group(1).strip(),
+                    "path": match.group(2).strip(),
+                }
+            match = re.search(
+                r"(?:search|find|grep)\s+(?:for\s+)?(.+)", action, re.IGNORECASE
+            )
+            if match:
+                return {"pattern": match.group(1).strip()}
+            return {"pattern": action.strip(), "path": "."}
+
+        elif tool_name == "read":
+            match = re.search(r"(?:read|cat|view|open)\s+(.+)", action, re.IGNORECASE)
+            if match:
+                return {"filePath": match.group(1).strip()}
+            if "/" in action or "\\" in action:
+                return {"filePath": action.strip()}
+            return {"filePath": action.strip()}
+
+        elif tool_name == "glob":
+            match = re.search(
+                r"(?:list|ls|glob)\s+(?:files\s+)?(?:in\s+)?(.+)", action, re.IGNORECASE
+            )
+            if match:
+                return {"pattern": match.group(1).strip()}
+            return {"pattern": action.strip() if action.strip() else "*"}
+
+        elif tool_name == "write":
+            return {"filePath": "output.txt", "content": action}
+
+        elif tool_name == "edit":
+            return {"filePath": "file.txt", "oldString": "old", "newString": action}
+
+        elif tool_name == "bash":
+            match = re.search(
+                r"(?:run|execute|bash|command)\s+(.+)", action, re.IGNORECASE
+            )
+            if match:
+                return {"command": match.group(1).strip()}
+            return {"command": action}
+
+        elif tool_name == "task":
+            return {"prompt": action}
+
+        return {"query": action}
+
+    fixed = []
+    for tc in tool_calls:
+        func = tc.get("function", {})
+        func_name = func.get("name", "").lower()
+        args_str = func.get("arguments", "{}")
+
+        try:
+            args = json.loads(args_str) if isinstance(args_str, str) else args_str
+        except (json.JSONDecodeError, TypeError):
+            args = {}
+
+        needs_fix = False
+        new_args = {}
+
+        if "action" in args or "description" in args or "query" in args:
+            needs_fix = True
+            action = (
+                args.get("action") or args.get("description") or args.get("query") or ""
+            )
+
+            if not func_name or func_name == "task":
+                detected_tool, _ = detect_tool_from_args(args, func_name)
+                func_name = detected_tool or "task"
+
+            new_args = parse_action_to_args(func_name, action)
+
+        elif not args or args == {}:
+            if func_name and func_name not in KNOWN_TOOL_NAMES:
+                needs_fix = True
+                new_args = {"prompt": args_str} if args_str else {"prompt": func_name}
+                func_name = "task"
+
+        elif func_name and func_name not in KNOWN_TOOL_NAMES:
+            needs_fix = True
+            new_args = {"prompt": json.dumps(args, ensure_ascii=False)}
+            func_name = "task"
+
+        if needs_fix and new_args:
+            tc = {
+                "id": tc.get("id", f"call_{int(time.time() * 1000)}_{len(fixed)}"),
+                "type": "function",
+                "function": {
+                    "name": func_name,
+                    "arguments": json.dumps(new_args, ensure_ascii=False),
+                },
+            }
+            fixed.append(tc)
+            continue
+
+        fixed.append(tc)
+
+    return fixed
+
+
 def process_content(content):
     """Process model output, removing chain-of-thought and extracting tool calls."""
     if not content:
         return None, None
 
     tool_calls, remaining = extract_tool_calls(content)
+
+    tool_calls = fix_action_based_tool_calls(tool_calls)
 
     if remaining is not None:
         for m in re.finditer(r"(\w+)\s*\(([^)]+)\)", remaining, re.DOTALL):

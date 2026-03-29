@@ -1,7 +1,7 @@
 services:
   runpod-proxy:
     build: .
-    container_name: runpod-serverless-proxy
+    container_name: serverless-proxy
     ports:
       - "8002:8002"
       - "5001:5001"

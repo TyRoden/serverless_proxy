@@ -2,6 +2,25 @@
 
 All notable changes to the Serverless Proxy will be documented in this file.
 
+## [2.2.1] - 2026-03-29
+
+### Fixed
+
+- **Tool Call Auto-Fix** - Enhanced robustness when models output malformed tool calls. The proxy now automatically fixes common mistakes:
+
+  **Handled Patterns:**
+  - Models using `action` field instead of proper parameters (e.g., `{"action": "searching for..."}`)
+  - Models using `description` or `query` fields
+  - Empty arguments with unknown tool names
+  - Wrong tool names in the function call
+
+  **Auto-Detection:**
+  - Analyzes the text to detect intended tool (grep, read, glob, bash, task)
+  - Parses natural language actions to proper parameters
+  - Falls back to `task` tool with the original content as prompt
+
+  **This fix significantly improves compatibility with models like Qwen3-80B** that may output tool calls in non-standard formats.
+
 ## [2.2.0] - 2026-03-28
 
 ### Added
