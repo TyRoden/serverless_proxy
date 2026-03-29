@@ -1341,12 +1341,31 @@ def extract_tool_calls(content):
             )
         elif match_type == "action":
             action_text = match.group(1).strip()
+
+            # Check for Task/subtask patterns first
+            if "using task" in action_text.lower() or "task to" in action_text.lower():
+                # Extract everything after "to" as the prompt for subtask
+                import re as re_module
+
+                prompt_match = re_module.search(
+                    r"(?:using\s+)?task\s+to\s+(.+)$", action_text, re.IGNORECASE
+                )
+                prompt = prompt_match.group(1).strip() if prompt_match else action_text
+                args_dict = {"prompt": prompt}
+                args_str = json.dumps(args_dict, ensure_ascii=False)
+                tool_calls.append(
+                    {
+                        "id": f"call_{int(time.time() * 1000)}_{len(tool_calls)}",
+                        "type": "function",
+                        "function": {"name": "task", "arguments": args_str},
+                    }
+                )
+                continue
+
             # Try to identify tool from action text
             tool_map = {
                 "searching": "grep",
                 "search": "grep",
-                "using task": "task",
-                "task": "task",
                 "reading": "read",
                 "read": "read",
                 "listing": "glob",
@@ -1366,7 +1385,14 @@ def extract_tool_calls(content):
                     detected_tool = tool
                     break
             if detected_tool:
-                args_dict = {"action": action_text}
+                # Extract path if present
+                import re as re_module
+
+                path_match = re_module.search(r"(?:in\s+)?(/[^\s]+)", action_text)
+                if path_match:
+                    args_dict = {"filePath": path_match.group(1)}
+                else:
+                    args_dict = {"query": action_text}
                 args_str = json.dumps(args_dict, ensure_ascii=False)
                 tool_calls.append(
                     {
