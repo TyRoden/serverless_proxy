@@ -1,290 +1,48 @@
-tyroden.duckdns.org, ai.completeupdates.com {
-	encode gzip zstd
+# Caddyfile Example - Serverless Proxy Routes
+# 
+# This is an example configuration showing how to route requests to the Serverless Proxy.
+# Adjust hostnames, paths, and port numbers to match your setup.
+#
+# The Serverless Proxy exposes:
+#   - FastAPI on port 8002 (API endpoints)
+#   - Flask admin UI on port 5001 (admin dashboard)
+#
+# Key routes for the proxy:
+#   - /v1/* - OpenAI-compatible API endpoints
+#   - /v1/messages - Anthropic API compatible endpoint
+#   - /api/admin/* - Admin API endpoints
+#   - /proxy-dashboard - Admin UI
+#   - /endpoints - Flask endpoints API
+#   - /virtual-models - Flask virtual models API
 
-	log {
-		output stdout
-		format console
-	}
+# ------------------
+# Serverless Proxy Routes
+# ------------------
 
-	# ------------------
-	# Proxy OpenClaw under /openclaw (LAN only)
-	# ------------------
-	@openclaw_lan {
-		path /openclaw*
-		remote_ip 192.168.0.0/16 10.0.0.0/8 172.16.0.0/12 127.0.0.1
-	}
-	handle @openclaw_lan {
-		reverse_proxy 127.0.0.1:18789
-	}
-
-	# ------------------
-	# Proxy Calibre under /calibre (STRIP /calibre)
-	# ------------------
-	handle_path /calibre* {
-		reverse_proxy 192.168.50.11:81
-	}
-
-	# ------------------
-	# Serve OpenAPI spec (STATIC)
-	# ------------------
-	@openapi_get {
-		method GET HEAD
-		path /n8n/openapi.json
-	}
-	handle @openapi_get {
-		root * /etc/caddy/n8n
-		uri strip_prefix /n8n
-		header Access-Control-Allow-Origin "*"
-		header Access-Control-Allow-Methods "GET,OPTIONS"
-		header Access-Control-Allow-Headers "Authorization,Content-Type,X-Webhook-Token"
-		file_server
-	}
-
-	@openapi_options {
-		method OPTIONS
-		path /n8n/openapi.json
-	}
-	handle @openapi_options {
-		header Access-Control-Allow-Origin "*"
-		header Access-Control-Allow-Methods "GET,OPTIONS"
-		header Access-Control-Allow-Headers "Authorization,Content-Type,X-Webhook-Token"
-		header Access-Control-Max-Age "86400"
-		respond "" 204
-	}
-
-	# ------------------
-	# CORS preflight for /n8n/*
-	# ------------------
-	@n8n_preflight {
-		method OPTIONS
-		path /n8n/*
-	}
-	handle @n8n_preflight {
-		header Access-Control-Allow-Origin "*"
-		header Access-Control-Allow-Methods "GET,POST,OPTIONS"
-		header Access-Control-Allow-Headers "Authorization,Content-Type,X-Webhook-Token"
-		header Access-Control-Max-Age "86400"
-		respond "" 204
-	}
-
-	# ------------------
-	# Proxy n8n under /n8n (STRIP /n8n)
-	# ------------------
-	handle_path /n8n* {
-		header Access-Control-Allow-Origin "*"
-		header Access-Control-Allow-Methods "GET,POST,OPTIONS"
-		header Access-Control-Allow-Headers "Authorization,Content-Type,X-Webhook-Token"
-		reverse_proxy 127.0.0.1:5678
-	}
-
-	# ------------------
-	# Proxy Agent Zero under /agentzero (STRIP /agentzero)
-	# ------------------
-	handle_path /agentzero* {
-		reverse_proxy 127.0.0.1:50080
-	}
-
-	# ------------------
-	# MS Teams webhook for OpenClaw
-	# ------------------
-	handle /download/* {
-		reverse_proxy 127.0.0.1:4980
-	}
-
-	handle /api/messages {
-		reverse_proxy 127.0.0.1:4980
-	}
-
-	# ------------------
-	# AI-SEM-Engine file downloads
-	# ------------------
-	handle_path /ai-sem-files/* {
-		root * /mnt/ai/ai-sem-engine/files
-		file_server
-	}
-
-	# ------------------
-	# AI-SEM-Engine API (STRIP /ai-sem)
-	# ------------------
-	handle_path /ai-sem/* {
-		reverse_proxy 127.0.0.1:8100
-	}
-
-	# ------------------
-	# AI Audio Processor - BBB Webhook for Meeting Notes
-	# ------------------
-	handle /bbb-webhook* {
-		reverse_proxy 127.0.0.1:8120
-	}
-
-	# ------------------
-	# AI Audio Processor - API endpoints
-	# ------------------
-	handle /audio-api* {
-		reverse_proxy 127.0.0.1:8120
-	}
-
-	# ------------------
-	# AI Audio Processor - Speaker Identification UI and API
-	# ------------------
-	handle /speaker-id* {
-		reverse_proxy 127.0.0.1:8120
-	}
-
-	handle /api/speaker-id* {
-		reverse_proxy 127.0.0.1:8120
-	}
-
-	handle /audio-clip* {
-		reverse_proxy 127.0.0.1:8120
-	}
-
-	handle /transcript/* {
-		reverse_proxy 127.0.0.1:8120
-	}
-
-	# ------------------
-	# AI Audio Processor - BBB Recordings Manager
-	# ------------------
-	handle /bbb-recordings* {
-		reverse_proxy 127.0.0.1:8120
-	}
-
-	handle /api/bbb-recordings* {
-		reverse_proxy 127.0.0.1:8120
-	}
-
-	# ------------------
-	# AI Menu System Authentication Service
-	# ------------------
-	handle /login* {
-		reverse_proxy 127.0.0.1:5000
-	}
-	handle /logout* {
-		reverse_proxy 127.0.0.1:5000
-	}
-	handle /menu* {
-		reverse_proxy 127.0.0.1:5000
-	}
-	handle /session* {
-		reverse_proxy 127.0.0.1:5000
-	}
-	handle /admin/* {
-		reverse_proxy 127.0.0.1:5000
-	}
-	handle /static/* {
-		reverse_proxy 127.0.0.1:5000
-	}
-
-	# ------------------
-	# AI Audio Processor Dashboard (protected by AI Menu System)
-	# ------------------
-	handle /audio-dashboard {
-		root * /mnt/ai/ai-audio-processor/static
-		rewrite * /dashboard.html
-		file_server
-	}
-
-	# ------------------
-	# Local AI Data Dashboard (protected by AI Menu System)
-	# ------------------
-	handle /knowledge-dashboard {
-		root * /mnt/ai/qdrant/static
-		rewrite * /dashboard.html
-		file_server
-	}
-
-	# ------------------
-	# Knowledge Base API
-	# ------------------
-	handle /knowledge-api* {
-		reverse_proxy 127.0.0.1:6336
-	}
-
-	# ------------------
-	# Google Ads Walker API (no auth) - MUST be before OpenWebUI catch-all
-	# ------------------
-	@gads-walker-api path /gads-walker/api/* /gads-walker/status/*
-	handle @gads-walker-api {
-		reverse_proxy 127.0.0.1:8101
-	}
-
-
-
-	# ------------------
-	# Serverless Proxy Admin API (MUST be before OpenWebUI catch-all)
-	# ------------------
-	@proxy-api-usage path /api/admin/usage*
-	handle @proxy-api-usage {
-		reverse_proxy 127.0.0.1:8002
-	}
-
-	@proxy-api path /api/admin/endpoints* /api/admin/virtual-models* /endpoints* /virtual-models*
-	handle @proxy-api {
-		reverse_proxy 127.0.0.1:5001
-	}
-
-	# ------------------
-	# Let OpenWebUI API/auth/websocket pass WITHOUT basic auth
-	# ------------------
-	@api path /api/* /ws* /socket.io/* /auth* /oauth* /v1/* /openapi* /docs* /health* /metrics*
-	handle @api {
-		reverse_proxy 127.0.0.1:8080
-	}
-
-	# ------------------
-	# Protect OpenWebUI UI + static assets WITH basic auth
-	# ------------------
-	@ui path / /index.html /favicon.ico /manifest* /logo* /fonts/*
-	handle @ui {
-		basicauth {
-			ty $2a$14$u0Nh4nRzE3rGC/RqwUau4eIaFVT7KCviMkOJGAwmHjfVsX0iTGG.W
-			gabriel $2a$14$nRjcBagFMwp8LA9.lJ6Vsemou49HRDj5muUU/Oj1YKnljQ4B.Cv4K
-			alex $2a$14$nRjcBagFMwp8LA9.lJ6Vsemou49HRDj5muUU/Oj1YKnljQ4B.Cv4K
-			kknorr $2a$14$eQ.yGIJl65gSxOLgNs.saOORDfS6gswAnfqEM5q9aUD5qdESWTtOS
-		}
-		reverse_proxy 127.0.0.1:8080
-	}
-
-	# ------------------
-	# AI Queue Dashboard (protected by AI Menu System)
-	# ------------------
-	handle /queue-dashboard {
-		root * /mnt/ai/ai-queue-master/static
-		rewrite * /dashboard.html
-		file_server
-	}
-
-	# ------------------
-	# Serverless Proxy Dashboard (static HTML with client-side auth)
-	# ------------------
-	handle /proxy-dashboard {
-		root * /mnt/ai/serverless-proxy/templates
-		rewrite * /admin_dashboard.html
-		file_server
-	}
-
-	# AI Queue Master proxy under /aiq (STRIP /aiq)
-	# ------------------
-	handle_path /aiq/* {
-		reverse_proxy 127.0.0.1:8102
-	}
-
-	# Google Ads Walker Dashboard (protected by AI Menu System)
-	# ------------------
-	handle /gads-walker/dashboard {
-		reverse_proxy 127.0.0.1:8101
-	}
-
-	# Google Ads Walker root
-	# ------------------
-	handle /gads-walker* {
-		reverse_proxy 127.0.0.1:8101
-	}
-
-	# Everything else (fallback) - now properly after all specific routes
-	@everything_else path *
-	handle @everything_else {
-		reverse_proxy 127.0.0.1:8080
-	}
+# Reverse proxy API requests to the proxy (port 8002)
+@proxy-api path /v1/* /api/* /v1/models /v1/chat/completions /v1/completions /v1/embeddings
+handle @proxy-api {
+    reverse_proxy localhost:8002
 }
+
+# Reverse proxy admin API to Flask admin (port 5001)
+# Must be BEFORE the generic /api/* handler above
+@proxy-admin path /api/admin/* /endpoints* /virtual-models*
+handle @proxy-admin {
+    reverse_proxy localhost:5001
+}
+
+# Serve admin dashboard static files
+handle /proxy-dashboard {
+    reverse_proxy localhost:5001
+}
+
+# ------------------
+# Note: Add more routes above this line for your other services
+# ------------------
+
+# Catch-all for other services (OpenWebUI, etc.)
+# @everything_else path *
+# handle @everything_else {
+#     reverse_proxy localhost:8080
+# }
