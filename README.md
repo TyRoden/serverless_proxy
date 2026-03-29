@@ -171,3 +171,7 @@ curl http://localhost:8002/health
 ## License
 
 MIT License — see [LICENSE.md](LICENSE.md)
+
+## Acknowledgments
+
+Based on RunPod serverless API patterns. Extended with virtual model configuration, Anthropic API compatibility, and admin UI capabilities.

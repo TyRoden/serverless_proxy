@@ -3,7 +3,15 @@
 Simple proxy to bridge OpenAI-compatible requests to RunPod Serverless
 Supports both vLLM and Ollama endpoints via ENDPOINT_TYPE env var
 Supports multiple backends via backend abstraction layer
+
+Based on the RunPod serverless API patterns and extended with:
+- Virtual model configuration
+- Anthropic API compatibility
+- Admin UI for endpoint management
 """
+
+# Based on RunPod serverless API patterns
+# Extended with virtual model support, Anthropic API compatibility, and admin UI
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
