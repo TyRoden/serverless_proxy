@@ -185,6 +185,7 @@
                         document.getElementById('username').textContent = d.username;
                         loadEndpoints();
                         loadVirtualModels();
+                        loadModelFilter();
                     }
                 })
                 .catch((err) => {
@@ -380,6 +381,23 @@
                                 <input type="number" id="vm-cost-out" name="cost_per_1k_tokens_out" value="0" step="0.0001" min="0">
                                 <small>Price per 1M tokens you receive (completion)</small>
                             </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group" style="width:100%;">
+                                <label>Custom Headers</label>
+                                <div id="custom-headers-list"></div>
+                                <button type="button" class="btn btn-secondary" onclick="addHeaderField()" style="margin-top:8px;">+ Add Header</button>
+                            </div>
+                        </div>
+                        <div class="checkbox-row">
+                            <input type="checkbox" id="vm-disable-streaming" name="disable_streaming">
+                            <label for="vm-disable-streaming">Disable Streaming (force non-streaming requests)</label>
+                            <small style="display:block;margin-left:24px;color:#666;">May reduce costs if provider charges more for streaming</small>
+                        </div>
+                        <div class="checkbox-row">
+                            <input type="checkbox" id="vm-force-non-streaming" name="force_non_streaming">
+                            <label for="vm-force-non-streaming">Force Non-Streaming (return JSON, not SSE)</label>
+                            <small style="display:block;margin-left:24px;color:#666;">Disables streaming for clients entirely</small>
                         </div>
                         <div class="checkbox-row">
                             <input type="checkbox" id="vm-enabled" name="enabled" checked>
@@ -795,6 +813,8 @@
         document.getElementById('vm-desc').value = data ? (data.description || '') : '';
         document.getElementById('vm-cost-in').value = data ? (data.cost_per_1k_tokens_in || 0) : '0';
         document.getElementById('vm-cost-out').value = data ? (data.cost_per_1k_tokens_out || 0) : '0';
+        document.getElementById('vm-disable-streaming').checked = data ? (data.disable_streaming === 1) : false;
+        document.getElementById('vm-force-non-streaming').checked = data ? (data.force_non_streaming === 1) : false;
         document.getElementById('vm-enabled').checked = data ? data.enabled : true;
         document.getElementById('vm-model-list').classList.add('hidden');
         document.getElementById('vm-fetch-status').innerHTML = '';
@@ -802,7 +822,58 @@
         // Load endpoints dropdown
         loadEndpointDropdown(data ? data.endpoint_id : null);
         
+        // Load custom headers
+        loadCustomHeaders(data ? data.custom_headers : '');
+        
         document.getElementById('vm-modal').classList.remove('hidden');
+    }
+    
+    function loadCustomHeaders(headersJson) {
+        const container = document.getElementById('custom-headers-list');
+        container.innerHTML = '';
+        if (!headersJson) {
+            addHeaderField();
+            return;
+        }
+        try {
+            const headers = JSON.parse(headersJson);
+            if (headers && typeof headers === 'object') {
+                Object.entries(headers).forEach(([key, value]) => {
+                    addHeaderField(key, value);
+                });
+            }
+            if (container.children.length === 0) {
+                addHeaderField();
+            }
+        } catch {
+            addHeaderField();
+        }
+    }
+    
+    function addHeaderField(name = '', value = '') {
+        const container = document.getElementById('custom-headers-list');
+        const div = document.createElement('div');
+        div.className = 'header-field-row';
+        div.style.cssText = 'display:flex;gap:10px;margin-bottom:10px;align-items:center;';
+        div.innerHTML = `
+            <input type="text" placeholder="Header Name" value="${name}" class="header-name" style="flex:1;min-width:200px;padding:10px 12px;border:1px solid #ddd;border-radius:4px;">
+            <input type="text" placeholder="Value" value="${value}" class="header-value" style="flex:1;min-width:200px;padding:10px 12px;border:1px solid #ddd;border-radius:4px;">
+            <button type="button" onclick="this.parentElement.remove()" style="background:#dc3545;color:white;border:none;padding:6px 10px;border-radius:4px;cursor:pointer;">✕</button>
+        `;
+        container.appendChild(div);
+    }
+    
+    function getCustomHeadersFromForm() {
+        const container = document.getElementById('custom-headers-list');
+        const headers = {};
+        container.querySelectorAll('.header-field-row').forEach(row => {
+            const name = row.querySelector('.header-name').value.trim();
+            const value = row.querySelector('.header-value').value.trim();
+            if (name) {
+                headers[name] = value;
+            }
+        });
+        return Object.keys(headers).length > 0 ? JSON.stringify(headers) : '';
     }
     
     function closeVMModal() {
@@ -883,6 +954,9 @@
             description: form.description.value,
             cost_per_1k_tokens_in: parseFloat(form.cost_per_1k_tokens_in.value) || 0,
             cost_per_1k_tokens_out: parseFloat(form.cost_per_1k_tokens_out.value) || 0,
+            custom_headers: getCustomHeadersFromForm(),
+            disable_streaming: form.disable_streaming.checked ? 1 : 0,
+            force_non_streaming: form.force_non_streaming.checked ? 1 : 0,
             enabled: form.enabled.checked
         };
         
@@ -904,6 +978,17 @@
             fetch('/virtual-models/' + id + '/delete')
                 .then(() => loadVirtualModels());
         }
+    }
+    
+    function loadModelFilter() {
+        fetch('/api/admin/virtual-models', { credentials: 'same-origin' })
+            .then(r => r.json())
+            .then(data => {
+                const select = document.getElementById('virtual-model-filter');
+                select.innerHTML = '<option value="">All models</option>' +
+                    data.map(vm => `<option value="${vm.name}">${vm.name}</option>`).join('');
+            })
+            .catch(err => console.error('Error loading model filter:', err));
     }
     
     function loadVirtualModels() {

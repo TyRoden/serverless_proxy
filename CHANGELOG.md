@@ -6,6 +6,29 @@ All notable changes to the Serverless Proxy will be documented in this file.
 
 ### Added
 
+- **Tool Call Extraction** - The proxy now extracts tool calls from various model output formats and converts them to OpenAI function calling format:
+
+  **Supported Input Formats:**
+  - `<tool_call>{"name": "read", "arguments": {"filePath": "/path"}}</tool_call>` - Qwen3 Next format
+  - `<tool_code>{"name": "read", "arguments": {"filePath": "/path"}}</tool_code>` - Generic XML format
+  - `<tool_use code name="read">{"filePath": "/path"}</tool_use>` - Tool use tag format
+  - Code fences: ```bash\nread /etc/hostname\n``` or ```tool_call\n{...}```
+  - Bracket notation: `[Use the read_file tool to read /mnt/ai/file.md]`
+  - Inline patterns: `commentary to=read {"filePath": "/path"}`
+
+  **Tool Name Mapping:**
+  - `read_file` → `read`
+  - `write_file` → `write`
+  - `edit_file` → `edit`
+  - `ls` / `glob` → `glob`
+  - `grep` / `search` → `grep`
+  - `bash` → `bash`
+
+  **Output:**
+  - Converts all formats to OpenAI function calling format
+  - Extracts arguments and wraps in proper JSON
+  - Works for both streaming and non-streaming responses
+
 - **Tool Call Extraction for Streaming** - Extract and process tool calls from streaming responses:
   - Accumulates streaming chunks to extract tool call content
   - Parses `<tool_call>`, `<tool_code>`, `<tool_use>` formats

@@ -74,6 +74,7 @@ def init_database():
                 url TEXT NOT NULL,
                 api_key TEXT,
                 endpoint_type TEXT DEFAULT 'ollama',
+                custom_headers TEXT,
                 priority INTEGER DEFAULT 0,
                 enabled INTEGER DEFAULT 1,
                 created_at INTEGER DEFAULT (strftime('%s', 'now')),
@@ -91,6 +92,9 @@ def init_database():
                 description TEXT,
                 cost_per_1k_tokens_in REAL DEFAULT 0,
                 cost_per_1k_tokens_out REAL DEFAULT 0,
+                disable_streaming INTEGER DEFAULT 0,
+                force_non_streaming INTEGER DEFAULT 0,
+                custom_headers TEXT,
                 enabled INTEGER DEFAULT 1,
                 created_at INTEGER DEFAULT (strftime('%s', 'now')),
                 updated_at INTEGER DEFAULT (strftime('%s', 'now')),
@@ -137,6 +141,14 @@ def init_database():
 
         # Migration: Add new columns if they don't exist
         try:
+            cursor.execute("SELECT custom_headers FROM endpoints LIMIT 1")
+        except:
+            try:
+                cursor.execute("ALTER TABLE endpoints ADD COLUMN custom_headers TEXT")
+            except:
+                pass
+
+        try:
             cursor.execute("SELECT cost_per_1k_tokens_in FROM virtual_models LIMIT 1")
         except:
             try:
@@ -151,6 +163,24 @@ def init_database():
                 )
             except:
                 pass
+                try:
+                    cursor.execute(
+                        "ALTER TABLE virtual_models ADD COLUMN disable_streaming INTEGER DEFAULT 0"
+                    )
+                except:
+                    pass
+                try:
+                    cursor.execute(
+                        "ALTER TABLE virtual_models ADD COLUMN force_non_streaming INTEGER DEFAULT 0"
+                    )
+                except:
+                    pass
+                try:
+                    cursor.execute(
+                        "ALTER TABLE virtual_models ADD COLUMN custom_headers TEXT"
+                    )
+                except:
+                    pass
 
         try:
             cursor.execute("SELECT cost_in FROM request_usage LIMIT 1")
@@ -877,6 +907,9 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
             self.api_key = vm.get("endpoint_api_key", "")
             self.model = vm["actual_model"]
             self.endpoint_type = endpoint_type
+            self.disable_streaming = vm.get("disable_streaming", 0) == 1
+            self.virtual_model_name = vm.get("name")
+            self.custom_headers = vm.get("custom_headers", "")
 
         async def chat_completion(
             self,
@@ -889,9 +922,22 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
             tools=None,
             **kwargs,
         ):
+            # Force non-streaming if disabled in model config
+            if self.disable_streaming:
+                stream = False
+
             headers = {"Content-Type": "application/json"}
             if self.api_key:
                 headers["Authorization"] = f"Bearer {self.api_key}"
+
+            # Add custom headers if configured
+            if self.custom_headers:
+                try:
+                    custom = json.loads(self.custom_headers)
+                    if isinstance(custom, dict):
+                        headers.update(custom)
+                except:
+                    pass
 
             # Use actual model from virtual model config
             payload = {
@@ -1044,12 +1090,16 @@ def extract_tool_calls(content):
     )
     tool_code_pattern = re.compile(r"<tool_code>(.*?)</tool_code>", re.DOTALL)
     tool_call_pattern = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+    bracket_tool_pattern = re.compile(
+        r"\[Use the (\w+) tool to ([^\]]+)\]", re.IGNORECASE
+    )
 
     fence_matches = list(fence_pattern.finditer(content))
     inline_matches = list(inline_pattern.finditer(content))
     tool_use_matches = list(tool_use_pattern.finditer(content))
     tool_code_matches = list(tool_code_pattern.finditer(content))
     tool_call_matches = list(tool_call_pattern.finditer(content))
+    bracket_tool_matches = list(bracket_tool_pattern.finditer(content))
 
     all_ranges = []
     for m in fence_matches:
@@ -1062,6 +1112,8 @@ def extract_tool_calls(content):
         all_ranges.append(("tool_code", m.start(), m.end(), m))
     for m in tool_call_matches:
         all_ranges.append(("tool_call", m.start(), m.end(), m))
+    for m in bracket_tool_matches:
+        all_ranges.append(("bracket_tool", m.start(), m.end(), m))
     all_ranges.sort(key=lambda x: x[1])
 
     if not all_ranges:
@@ -1225,6 +1277,53 @@ def extract_tool_calls(content):
                             "function": {"name": name, "arguments": args_str},
                         }
                     )
+        elif match_type == "bracket_tool":
+            tool_name = match.group(1).strip().lower()
+            args_text = match.group(2).strip()
+            tool_map = {
+                "ls": "glob",
+                "glob": "glob",
+                "read_file": "read",
+                "read": "read",
+                "grep": "grep",
+                "write_file": "write",
+                "write": "write",
+                "edit_file": "edit",
+                "edit": "edit",
+                "bash": "bash",
+                "search": "grep",
+            }
+            mapped_name = tool_map.get(tool_name, tool_name)
+            # Extract path - look for patterns like "/path" or "in /path"
+            import re as re_module
+
+            path_match = re_module.search(r"(?:in\s+)?(/[^\s]+)", args_text)
+            if path_match:
+                args_text = path_match.group(1)
+            else:
+                # Remove common prefixes
+                for prefix in [
+                    "list files in ",
+                    "search for ",
+                    "read ",
+                    "write ",
+                    "edit ",
+                ]:
+                    if args_text.lower().startswith(prefix):
+                        args_text = args_text[len(prefix) :]
+                        break
+            if "/" in args_text or "\\" in args_text:
+                args_dict = {"filePath": args_text}
+            else:
+                args_dict = {"query": args_text}
+            args_str = json.dumps(args_dict, ensure_ascii=False)
+            tool_calls.append(
+                {
+                    "id": f"call_{int(time.time() * 1000)}_{len(tool_calls)}",
+                    "type": "function",
+                    "function": {"name": mapped_name, "arguments": args_str},
+                }
+            )
         else:
             tool_name = match.group(1)
             args_str = match.group(2)
@@ -1476,6 +1575,11 @@ async def chat_completions(request: Request):
     if hasattr(backend, "virtual_model_name"):
         virtual_model = backend.virtual_model_name
 
+    # Check if we should force non-streaming for this model
+    vm = get_virtual_model(model)
+    if vm and vm.get("force_non_streaming", 0) == 1:
+        stream = False
+
     # Additional OpenAI parameters
     extra_params = {
         "stop": data.get("stop"),
@@ -1564,6 +1668,22 @@ async def chat_completions(request: Request):
 
             # Process accumulated content to extract tool calls
             extracted_tc, text_content = process_content(full_content)
+
+            # Log usage for streaming request
+            try:
+                response_time_ms = int((time_module.time() - start_time) * 1000)
+                vm = get_virtual_model(model)
+                if vm:
+                    endpoint_name = vm.get("name", model)
+                    endpoint_id = vm.get("endpoint_id")
+                else:
+                    endpoint_name = model
+                    endpoint_id = None
+                log_chat_usage(
+                    model, endpoint_name, endpoint_id, usage, response_time_ms
+                )
+            except Exception as e:
+                print(f"Error logging streaming usage: {e}")
 
             # Generate proper SSE with extracted tool calls
             job_id = f"chat-{int(time_module.time())}"
@@ -2621,8 +2741,8 @@ def admin_virtual_models():
 
             cursor.execute(
                 """
-                INSERT INTO virtual_models (name, endpoint_id, actual_model, description, cost_per_1k_tokens_in, cost_per_1k_tokens_out, enabled)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO virtual_models (name, endpoint_id, actual_model, description, cost_per_1k_tokens_in, cost_per_1k_tokens_out, disable_streaming, force_non_streaming, custom_headers, enabled)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
                 (
                     data.get("name"),
@@ -2631,6 +2751,9 @@ def admin_virtual_models():
                     data.get("description"),
                     data.get("cost_per_1k_tokens_in") or 0,
                     data.get("cost_per_1k_tokens_out") or 0,
+                    1 if data.get("disable_streaming") else 0,
+                    1 if data.get("force_non_streaming") else 0,
+                    data.get("custom_headers") or "",
                     1 if data.get("enabled", True) else 0,
                 ),
             )
@@ -2670,8 +2793,9 @@ def update_virtual_model(vm_id):
             """
             UPDATE virtual_models 
             SET name = ?, endpoint_id = ?, actual_model = ?, description = ?, 
-                cost_per_1k_tokens_in = ?, cost_per_1k_tokens_out = ?, enabled = ?,
-                updated_at = strftime('%s', 'now')
+                cost_per_1k_tokens_in = ?, cost_per_1k_tokens_out = ?, 
+                disable_streaming = ?, force_non_streaming = ?, custom_headers = ?,
+                enabled = ?, updated_at = strftime('%s', 'now')
             WHERE id = ?
         """,
             (
@@ -2681,6 +2805,9 @@ def update_virtual_model(vm_id):
                 data.get("description"),
                 data.get("cost_per_1k_tokens_in") or 0,
                 data.get("cost_per_1k_tokens_out") or 0,
+                1 if data.get("disable_streaming") else 0,
+                1 if data.get("force_non_streaming") else 0,
+                data.get("custom_headers") or "",
                 1 if data.get("enabled", True) else 0,
                 vm_id,
             ),
