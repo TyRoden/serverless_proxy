@@ -2367,9 +2367,16 @@ async def anthropic_messages(request: Request):
     if system_message:
         converted_messages.insert(0, {"role": "system", "content": system_message})
 
-    # Build request for chat/completions
+    # Get backend
+    backend = get_backend(model)
+    virtual_model = model
+    if hasattr(backend, "virtual_model_name"):
+        virtual_model = backend.virtual_model_name
+
+    # Build request for chat/completions - use actual model from backend
+    actual_model = backend.model if hasattr(backend, "model") else model
     chat_data = {
-        "model": model,
+        "model": actual_model,
         "messages": converted_messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
@@ -2378,12 +2385,6 @@ async def anthropic_messages(request: Request):
     }
     if tools:
         chat_data["tools"] = tools
-
-    # Get backend
-    backend = get_backend(model)
-    virtual_model = model
-    if hasattr(backend, "virtual_model_name"):
-        virtual_model = backend.virtual_model_name
 
     # Check for streaming
     if stream:
@@ -2407,7 +2408,7 @@ async def anthropic_messages(request: Request):
             import json as json_module
 
             message_id = f"msg_{int(time_module.time() * 1000)}"
-            first_chunk = True
+            sent_message_start = False
 
             async with httpx.AsyncClient(timeout=1200.0) as client:
                 async with client.stream(
@@ -2415,23 +2416,34 @@ async def anthropic_messages(request: Request):
                 ) as resp:
                     async for line in resp.aiter_lines():
                         if line.strip() and line.startswith("data: "):
+                            data_str = line[6:]
+                            if data_str == "[DONE]":
+                                yield f'data: {{"type":"message_delta","delta":{{"stop_reason":"end_turn","type":"message_delta"}},"usage":{{"output_tokens":0}}}}\n\n'
+                                yield "data: [DONE]\n\n"
+                                continue
                             try:
-                                chunk = json_module.loads(line[6:])
-                                if chunk.get("choices") and chunk["choices"][0].get(
-                                    "delta", {}
-                                ).get("content"):
-                                    content = chunk["choices"][0]["delta"]["content"]
-                                    if first_chunk:
-                                        # First chunk - send in Anthropic format
-                                        yield f'data: {{"type":"message_start","message":{{"id":"{message_id}","type":"message","role":"assistant","content":[{{"type":"text","text":""}}],"model":"{model}","stop_reason":null,"stop_sequence":null,"usage":{{"input_tokens":0,"output_tokens":0}}}}}}\n\n'
-                                        first_chunk = False
+                                chunk = json_module.loads(data_str)
+                                delta = chunk.get("choices", [{}])[0].get("delta", {})
+                                content = delta.get("content")
+                                finish = delta.get("finish_reason")
 
-                                    # Content chunk
-                                    yield f'data: {{"type":"content_block_delta","delta":{{"type":"text_delta","text":"{content}"}},"index":0}}\n\n'
-                            except:
+                                if content:
+                                    if not sent_message_start:
+                                        # Send message_start first
+                                        yield f'data: {{"type":"message_start","message":{{"id":"{message_id}","type":"message","role":"assistant","content":[{{"type":"text","text":""}}],"model":"{model}","stop_reason":null,"stop_sequence":null,"usage":{{"input_tokens":0,"output_tokens":0}}}}}}\n\n'
+                                        sent_message_start = True
+
+                                    # Escape content for JSON
+                                    content_escaped = (
+                                        content.replace("\\", "\\\\")
+                                        .replace('"', '\\"')
+                                        .replace("\n", "\\n")
+                                        .replace("\r", "\\r")
+                                        .replace("\t", "\\t")
+                                    )
+                                    yield f'data: {{"type":"content_block_delta","delta":{{"type":"text_delta","text":"{content_escaped}"}},"index":0}}\n\n'
+                            except Exception as e:
                                 pass
-                    # Final chunk
-                    yield f'data: {{"type":"message_delta","delta":{{"stop_reason":"end_turn","type":"message_delta"}},"usage":{{"output_tokens":0}}}}\n\n'
                     yield "data: [DONE]\n\n"
 
         return StreamingResponse(
