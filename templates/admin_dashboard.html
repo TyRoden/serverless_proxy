@@ -743,7 +743,7 @@
     }
     
     function fetchModels(id) {
-        fetch('/endpoints/' + id + '/models')
+        fetch('/endpoints/' + id + '/models', {credentials: 'same-origin'})
             .then(r => r.json())
             .then(d => {
                 if (d.error) {
