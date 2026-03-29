@@ -52,3 +52,6 @@ AGENTS.md
 
 # Archive (legacy code reference)
 archive/
+
+# Data (SQLite database, etc)
+data/
