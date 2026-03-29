@@ -2261,6 +2261,260 @@ async def get_embedding_usage(request: Request):
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
+@app.head("/v1")
+async def head_v1():
+    """Anthropic API health check."""
+    return JSONResponse(content={})
+
+
+@app.post("/v1/messages")
+async def anthropic_messages(request: Request):
+    """Anthropic API compatible /v1/messages endpoint."""
+    import time as time_module
+    import json as json_module
+
+    start_time = time_module.time()
+    data = await request.json()
+
+    model = data.get("model", os.getenv("MODEL_NAME", "project-system-ai"))
+    messages = data.get("messages", [])
+    max_tokens = data.get("max_tokens", 1024)
+    temperature = data.get("temperature", 0.7)
+    top_p = data.get("top_p", 1.0)
+    stream = data.get("stream", False)
+    tools = data.get("tools", [])
+
+    # Convert Anthropic system messages to OpenAI format
+    system_message = None
+    converted_messages = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+
+        if role == "system":
+            if isinstance(content, str):
+                system_message = content
+            elif isinstance(content, list):
+                system_message = "".join(
+                    [c.get("text", "") for c in content if c.get("type") == "text"]
+                )
+        elif role == "assistant":
+            # Handle tool_use in content
+            if isinstance(content, list):
+                # Check for tool_use blocks
+                tool_calls = []
+                text_content = ""
+                for block in content:
+                    if block.get("type") == "tool_use":
+                        tool_calls.append(
+                            {
+                                "id": block.get(
+                                    "id", f"call_{int(time_module.time() * 1000)}"
+                                ),
+                                "type": "function",
+                                "function": {
+                                    "name": block.get("name", ""),
+                                    "arguments": json_module.dumps(
+                                        block.get("input", {})
+                                    ),
+                                },
+                            }
+                        )
+                    elif block.get("type") == "text":
+                        text_content += block.get("text", "")
+
+                if tool_calls:
+                    converted_messages.append(
+                        {
+                            "role": "assistant",
+                            "content": text_content,
+                            "tool_calls": tool_calls,
+                        }
+                    )
+                else:
+                    converted_messages.append(
+                        {"role": "assistant", "content": text_content}
+                    )
+            else:
+                converted_messages.append(
+                    {"role": "assistant", "content": str(content) if content else ""}
+                )
+        elif role == "user":
+            # Handle tool_result in content
+            if isinstance(content, list):
+                for block in content:
+                    if block.get("type") == "tool_result":
+                        converted_messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": block.get("tool_use_id", ""),
+                                "content": block.get("content", ""),
+                            }
+                        )
+                    else:
+                        converted_messages.append(
+                            {"role": "user", "content": block.get("text", "")}
+                        )
+            else:
+                converted_messages.append(
+                    {"role": "user", "content": str(content) if content else ""}
+                )
+        else:
+            converted_messages.append(
+                {"role": role, "content": str(content) if content else ""}
+            )
+
+    if system_message:
+        converted_messages.insert(0, {"role": "system", "content": system_message})
+
+    # Build request for chat/completions
+    chat_data = {
+        "model": model,
+        "messages": converted_messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "top_p": top_p,
+        "stream": stream,
+    }
+    if tools:
+        chat_data["tools"] = tools
+
+    # Get backend
+    backend = get_backend(model)
+    virtual_model = model
+    if hasattr(backend, "virtual_model_name"):
+        virtual_model = backend.virtual_model_name
+
+    # Check for streaming
+    if stream:
+        # Handle streaming - similar to chat_completions but return SSE
+        headers = {"Content-Type": "application/json"}
+        if hasattr(backend, "api_key") and backend.api_key:
+            headers["Authorization"] = f"Bearer {backend.api_key}"
+
+        # Get endpoint URL
+        endpoint = backend.url
+        if hasattr(backend, "endpoint_type"):
+            if backend.endpoint_type == "deepinfra":
+                endpoint = f"{endpoint}/v1/openai/chat/completions"
+            else:
+                endpoint = f"{endpoint}/v1/chat/completions"
+        else:
+            endpoint = f"{endpoint}/v1/chat/completions"
+
+        async def stream_generator():
+            import httpx
+            import json as json_module
+
+            message_id = f"msg_{int(time_module.time() * 1000)}"
+            first_chunk = True
+
+            async with httpx.AsyncClient(timeout=1200.0) as client:
+                async with client.stream(
+                    "POST", endpoint, headers=headers, json=chat_data
+                ) as resp:
+                    async for line in resp.aiter_lines():
+                        if line.strip() and line.startswith("data: "):
+                            try:
+                                chunk = json_module.loads(line[6:])
+                                if chunk.get("choices") and chunk["choices"][0].get(
+                                    "delta", {}
+                                ).get("content"):
+                                    content = chunk["choices"][0]["delta"]["content"]
+                                    if first_chunk:
+                                        # First chunk - send in Anthropic format
+                                        yield f'data: {{"type":"message_start","message":{{"id":"{message_id}","type":"message","role":"assistant","content":[{{"type":"text","text":""}}],"model":"{model}","stop_reason":null,"stop_sequence":null,"usage":{{"input_tokens":0,"output_tokens":0}}}}}}\n\n'
+                                        first_chunk = False
+
+                                    # Content chunk
+                                    yield f'data: {{"type":"content_block_delta","delta":{{"type":"text_delta","text":"{content}"}},"index":0}}\n\n'
+                            except:
+                                pass
+                    # Final chunk
+                    yield f'data: {{"type":"message_delta","delta":{{"stop_reason":"end_turn","type":"message_delta"}},"usage":{{"output_tokens":0}}}}\n\n'
+                    yield "data: [DONE]\n\n"
+
+        return StreamingResponse(
+            stream_generator(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+
+    # Non-streaming
+    backend_result, error, status_code = await backend.chat_completion(
+        messages=converted_messages,
+        model=model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        top_p=top_p,
+        stream=False,
+        tools=tools,
+    )
+
+    if error:
+        return JSONResponse(status_code=status_code, content=error)
+
+    result = backend_result
+    if "result" in backend_result:
+        result = backend_result["result"]
+
+    # Convert OpenAI format back to Anthropic format
+    content_blocks = []
+    tool_calls_data = []
+
+    if "choices" in result and result["choices"]:
+        message = result["choices"][0].get("message", {})
+        content = message.get("content", "") or ""
+        tool_calls_data = message.get("tool_calls", []) or []
+        finish_reason = message.get("finish_reason", "end_turn")
+
+    # Convert text content
+    if content:
+        content_blocks.append({"type": "text", "text": content})
+
+    # Convert tool calls to Anthropic format
+    stop_reason = finish_reason
+    for tc in tool_calls_data:
+        func = tc.get("function", {})
+        args = func.get("arguments", {})
+        if isinstance(args, str):
+            import json as json_module
+
+            try:
+                args = json_module.loads(args)
+            except:
+                args = {"raw": args}
+        content_blocks.append(
+            {
+                "type": "tool_use",
+                "id": tc.get("id", f"toolu_{int(time_module.time() * 1000)}"),
+                "name": func.get("name", ""),
+                "input": args,
+            }
+        )
+        if stop_reason != "tool_calls":
+            stop_reason = "tool_use"
+
+    usage = result.get("usage", {})
+
+    # Build Anthropic response
+    response = {
+        "id": result.get("id", f"msg_{int(time_module.time() * 1000)}"),
+        "type": "message",
+        "role": "assistant",
+        "content": content_blocks,
+        "model": model,
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": usage.get("prompt_tokens", 0),
+            "output_tokens": usage.get("completion_tokens", 0),
+        },
+    }
+
+    return JSONResponse(content=response)
+
+
 @app.get("/v1/models")
 async def list_models():
     # Get virtual models from database

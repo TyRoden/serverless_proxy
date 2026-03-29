@@ -6,6 +6,17 @@ All notable changes to the Serverless Proxy will be documented in this file.
 
 ### Added
 
+- **Anthropic API Compatibility** - The proxy now supports Anthropic API format (`/v1/messages`), enabling use with Claude Code and other Anthropic-compatible clients:
+  - Translates Anthropic message format to OpenAI chat completions
+  - Supports tool calls and tool results
+  - Handles system messages, content blocks, and tool_use/tool_result blocks
+  - Works with Claude Code by setting:
+    ```
+    export ANTHROPIC_BASE_URL=http://localhost:8002
+    export ANTHROPIC_AUTH_TOKEN=your-api-key
+    export CLAUDE_CODE_MODEL="your-model-name"
+    ```
+
 - **Tool Call Extraction** - The proxy now extracts tool calls from various model output formats and converts them to OpenAI function calling format:
 
   **Supported Input Formats:**
