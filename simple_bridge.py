@@ -47,6 +47,7 @@ flask_app = Flask(__name__, template_folder="templates", static_folder="static")
 flask_app.secret_key = os.getenv("SECRET_KEY", secrets.token_hex(32))
 
 AIMENU_URL = os.getenv("AIMENU_URL", "http://localhost:5000")
+AUTH_ENABLED = os.getenv("AUTH_ENABLED", "true").lower() == "true"
 
 # Database setup
 DATABASE_PATH = os.getenv("DATABASE_PATH", "/data/proxy.db")
@@ -2767,6 +2768,10 @@ async def embeddings(request: Request):
 
 def validate_session(flask_cookies=None):
     """Proxy session validation to ai-menu-system. Accepts cookies dict for FastAPI compatibility."""
+    # Skip auth if disabled
+    if not AUTH_ENABLED:
+        return {"valid": True, "user": "admin"}
+
     try:
         if flask_cookies is not None:
             cookies = flask_cookies
@@ -2787,6 +2792,10 @@ def validate_session(flask_cookies=None):
 
 def validate_session_fastapi(request: Request):
     """FastAPI version of session validation."""
+    # Skip auth if disabled
+    if not AUTH_ENABLED:
+        return {"valid": True, "user": "admin"}
+
     try:
         cookies = dict(request.cookies)
         resp = httpx.get(f"{AIMENU_URL}/session/validate", cookies=cookies, timeout=5)
