@@ -1103,6 +1103,8 @@ def extract_tool_calls(content):
     bracket_tool_pattern = re.compile(
         r"\[Use the (\w+) tool to ([^\]]+)\]", re.IGNORECASE
     )
+    # Pattern for [action description] format (e.g., "[searching for files]", "[using Task to do something]")
+    action_pattern = re.compile(r"\[([a-zA-Z][^\]]+)\]", re.IGNORECASE)
 
     fence_matches = list(fence_pattern.finditer(content))
     inline_matches = list(inline_pattern.finditer(content))
@@ -1110,6 +1112,7 @@ def extract_tool_calls(content):
     tool_code_matches = list(tool_code_pattern.finditer(content))
     tool_call_matches = list(tool_call_pattern.finditer(content))
     bracket_tool_matches = list(bracket_tool_pattern.finditer(content))
+    action_matches = list(action_pattern.finditer(content))
 
     all_ranges = []
     for m in fence_matches:
@@ -1124,6 +1127,8 @@ def extract_tool_calls(content):
         all_ranges.append(("tool_call", m.start(), m.end(), m))
     for m in bracket_tool_matches:
         all_ranges.append(("bracket_tool", m.start(), m.end(), m))
+    for m in action_matches:
+        all_ranges.append(("action", m.start(), m.end(), m))
     all_ranges.sort(key=lambda x: x[1])
 
     if not all_ranges:
@@ -1334,6 +1339,42 @@ def extract_tool_calls(content):
                     "function": {"name": mapped_name, "arguments": args_str},
                 }
             )
+        elif match_type == "action":
+            action_text = match.group(1).strip()
+            # Try to identify tool from action text
+            tool_map = {
+                "searching": "grep",
+                "search": "grep",
+                "using task": "task",
+                "task": "task",
+                "reading": "read",
+                "read": "read",
+                "listing": "glob",
+                "ls": "glob",
+                "glob": "glob",
+                "writing": "write",
+                "write": "write",
+                "editing": "edit",
+                "edit": "edit",
+                "running": "bash",
+                "bash": "bash",
+                "executing": "bash",
+            }
+            detected_tool = None
+            for key, tool in tool_map.items():
+                if key in action_text.lower():
+                    detected_tool = tool
+                    break
+            if detected_tool:
+                args_dict = {"action": action_text}
+                args_str = json.dumps(args_dict, ensure_ascii=False)
+                tool_calls.append(
+                    {
+                        "id": f"call_{int(time.time() * 1000)}_{len(tool_calls)}",
+                        "type": "function",
+                        "function": {"name": detected_tool, "arguments": args_str},
+                    }
+                )
         else:
             tool_name = match.group(1)
             args_str = match.group(2)
