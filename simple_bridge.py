@@ -2346,6 +2346,7 @@ async def head_v1():
 @app.post("/v1/messages")
 async def anthropic_messages(request: Request):
     """Anthropic API compatible /v1/messages endpoint."""
+    import json as json_module
     import time as time_module
 
     start_time = time_module.time()
@@ -2475,9 +2476,6 @@ async def anthropic_messages(request: Request):
 
     # Get backend
     backend = get_backend(model)
-    print(
-        f"[DEBUG] model={model} -> backend={type(backend).__name__}, source={getattr(backend, 'source', 'N/A')}"
-    )
     virtual_model = model
     if hasattr(backend, "virtual_model_name"):
         virtual_model = backend.virtual_model_name
