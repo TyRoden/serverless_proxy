@@ -1712,6 +1712,26 @@ async def chat_completions(request: Request):
     # Get incoming X-Source to forward
     incoming_source = request.headers.get("x-source", "serverless-proxy")
 
+    # Preserve original stream request from client (before any modifications)
+    original_stream = stream
+
+    # Compat mode: if client asks for stream but doesn't accept SSE, force non-streaming
+    # BUT still track original request to return proper response format to client
+    accept_header = request.headers.get("accept", "")
+    user_agent = request.headers.get("user-agent", "")
+    wants_sse = "text/event-stream" in accept_header.lower()
+    # Also accept */* as valid - it means client accepts anything
+    accepts_all = accept_header.strip() == "*/*"
+    ua_lower = user_agent.lower()
+    is_openai_js = "openai/js" in ua_lower or "openclaw" in ua_lower
+    is_opencode = "opencode" in ua_lower or "ai-sdk" in ua_lower
+    if stream and (is_openai_js or is_opencode) and not wants_sse and not accepts_all:
+        print(
+            f"[COMPAT] Forcing non-streaming: accept={accept_header} user-agent={user_agent}",
+            flush=True,
+        )
+        stream = False
+
     # Call backend (handles both AI Queue and RunPod)
     backend_result, error, status_code = await backend.chat_completion(
         messages=messages,
@@ -1803,8 +1823,8 @@ async def chat_completions(request: Request):
 
     job_id = result.get("id", f"chat-{int(time_module.time())}")
 
-    # Handle streaming response
-    if stream:
+    # Handle streaming response - use original_stream to match client's request
+    if original_stream:
         return StreamingResponse(
             _generate_sse(
                 job_id=job_id,
