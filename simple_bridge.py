@@ -563,6 +563,7 @@ class AIQueueBackend(LLMBackend):
             payload["tools"] = tools
 
         async with httpx.AsyncClient(timeout=1200.0) as client:
+            print(f"[HTTX_CALL] Sending to {self.url}, headers: {headers}")
             response = await client.post(
                 f"{self.url}/v1/chat/completions",
                 headers=headers,
@@ -940,8 +941,9 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
             if self.api_key:
                 headers["Authorization"] = f"Bearer {self.api_key}"
 
-            # Add X-Source header for tracking
-            headers["X-Source"] = "serverless-proxy"
+            # Add X-Source header for tracking - use incoming from kwargs if available
+            incoming_src = kwargs.get("_incoming_source", "serverless-proxy")
+            headers["X-Source"] = incoming_src
 
             # Add custom headers if configured
             if self.custom_headers:
@@ -1707,7 +1709,8 @@ async def chat_completions(request: Request):
     if tools and data.get("parallel_tool_calls") is not None:
         extra_params["parallel_tool_calls"] = data.get("parallel_tool_calls")
 
-    # Get backend for this model (checks virtual models first, then falls back to env vars)
+    # Get incoming X-Source to forward
+    incoming_source = request.headers.get("x-source", "serverless-proxy")
 
     # Call backend (handles both AI Queue and RunPod)
     backend_result, error, status_code = await backend.chat_completion(
@@ -1731,76 +1734,35 @@ async def chat_completions(request: Request):
 
     # Check if this is a streaming response from a virtual model backend
     if "_stream_data" in result:
-        # Accumulate streaming response, extract tool calls, then stream properly
-        async def stream_processor():
-            backend = get_backend(model)
-            endpoint = backend.url
-            if hasattr(backend, "endpoint_type"):
-                if backend.endpoint_type == "deepinfra":
-                    endpoint = f"{endpoint}/v1/openai/chat/completions"
-                else:
-                    endpoint = f"{endpoint}/v1/chat/completions"
-            else:
-                endpoint = f"{endpoint}/v1/chat/completions"
+        # Parse existing SSE data instead of making another request
+        stream_data = result["_stream_data"]
+        full_content = ""
+        usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
-            headers = {"Content-Type": "application/json"}
-            if backend.api_key:
-                headers["Authorization"] = f"Bearer {backend.api_key}"
+        for line in stream_data.split("\n"):
+            if line.strip() and line.startswith("data: "):
+                if line[6:].strip() == "[DONE]":
+                    continue
+                try:
+                    chunk = json.loads(line[6:])
+                    if "choices" in chunk and chunk["choices"]:
+                        delta = chunk["choices"][0].get("delta", {})
+                        if delta.get("content"):
+                            full_content += delta["content"]
+                        tc = delta.get("tool_calls")
+                        if tc:
+                            pass
+                    if "usage" in chunk and chunk["usage"]:
+                        usage = chunk["usage"]
+                except:
+                    pass
 
-            payload = {
-                "model": backend.model,
-                "messages": messages,
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-                "top_p": top_p,
-                "stream": True,
-            }
+        extracted_tc, text_content = process_content(full_content)
 
-            full_content = ""
-            usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        # Generate proper SSE with extracted tool calls
+        job_id = f"chat-{int(time_module.time())}"
 
-            async with httpx.AsyncClient(timeout=1200.0) as client:
-                async with client.stream(
-                    "POST", endpoint, headers=headers, json=payload
-                ) as response:
-                    async for line in response.aiter_lines():
-                        if line.strip() and line.startswith("data: "):
-                            try:
-                                chunk = json.loads(line[6:])
-                                if "choices" in chunk and chunk["choices"]:
-                                    delta = chunk["choices"][0].get("delta", {})
-                                    if delta.get("content"):
-                                        full_content += delta["content"]
-                                    # Check for tool_calls in delta
-                                    tc = delta.get("tool_calls")
-                                    if tc:
-                                        pass  # Already formatted tool_calls
-                                if "usage" in chunk and chunk["usage"]:
-                                    usage = chunk["usage"]
-                            except:
-                                pass
-
-            # Process accumulated content to extract tool calls
-            extracted_tc, text_content = process_content(full_content)
-
-            # Log usage for streaming request
-            try:
-                response_time_ms = int((time_module.time() - start_time) * 1000)
-                vm = get_virtual_model(model)
-                if vm:
-                    endpoint_name = vm.get("name", model)
-                    endpoint_id = vm.get("endpoint_id")
-                else:
-                    endpoint_name = model
-                    endpoint_id = None
-                log_chat_usage(
-                    model, endpoint_name, endpoint_id, usage, response_time_ms
-                )
-            except Exception as e:
-                print(f"Error logging streaming usage: {e}")
-
-            # Generate proper SSE with extracted tool calls
-            job_id = f"chat-{int(time_module.time())}"
+        async def stream_generator():
             async for chunk_data in _generate_sse(
                 job_id=job_id,
                 model=model,
@@ -1810,7 +1772,7 @@ async def chat_completions(request: Request):
                 yield chunk_data
 
         return StreamingResponse(
-            stream_processor(),
+            stream_generator(),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -2385,9 +2347,9 @@ async def head_v1():
 async def anthropic_messages(request: Request):
     """Anthropic API compatible /v1/messages endpoint."""
     import time as time_module
-    import json as json_module
 
     start_time = time_module.time()
+    incoming_source = request.headers.get("x-source", "serverless-proxy")
     data = await request.json()
 
     model = data.get("model", os.getenv("MODEL_NAME", "project-system-ai"))
@@ -2513,6 +2475,9 @@ async def anthropic_messages(request: Request):
 
     # Get backend
     backend = get_backend(model)
+    print(
+        f"[DEBUG] model={model} -> backend={type(backend).__name__}, source={getattr(backend, 'source', 'N/A')}"
+    )
     virtual_model = model
     if hasattr(backend, "virtual_model_name"):
         virtual_model = backend.virtual_model_name
@@ -2537,8 +2502,8 @@ async def anthropic_messages(request: Request):
         if hasattr(backend, "api_key") and backend.api_key:
             headers["Authorization"] = f"Bearer {backend.api_key}"
 
-        # Add tracking headers
-        headers["X-Source"] = "serverless-proxy"
+        # Add tracking headers - use incoming source
+        headers["X-Source"] = incoming_source
         headers["X-Model"] = actual_model
         headers["X-Priority"] = "NORMAL"
 
