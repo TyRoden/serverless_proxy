@@ -106,6 +106,10 @@ def init_database():
                 force_non_streaming INTEGER DEFAULT 0,
                 custom_headers TEXT,
                 enabled INTEGER DEFAULT 1,
+                max_tokens INTEGER DEFAULT 0,
+                temperature REAL DEFAULT 0,
+                top_p REAL DEFAULT 1.0,
+                system_prompt TEXT,
                 created_at INTEGER DEFAULT (strftime('%s', 'now')),
                 updated_at INTEGER DEFAULT (strftime('%s', 'now')),
                 FOREIGN KEY (endpoint_id) REFERENCES endpoints(id)
@@ -191,6 +195,46 @@ def init_database():
                     )
                 except:
                     pass
+
+        try:
+            cursor.execute("SELECT max_tokens FROM virtual_models LIMIT 1")
+        except:
+            try:
+                cursor.execute(
+                    "ALTER TABLE virtual_models ADD COLUMN max_tokens INTEGER DEFAULT 0"
+                )
+            except:
+                pass
+
+        try:
+            cursor.execute("SELECT temperature FROM virtual_models LIMIT 1")
+        except:
+            try:
+                cursor.execute(
+                    "ALTER TABLE virtual_models ADD COLUMN temperature REAL DEFAULT 0"
+                )
+            except:
+                pass
+
+        try:
+            cursor.execute("SELECT top_p FROM virtual_models LIMIT 1")
+        except:
+            try:
+                cursor.execute(
+                    "ALTER TABLE virtual_models ADD COLUMN top_p REAL DEFAULT 1.0"
+                )
+            except:
+                pass
+
+        try:
+            cursor.execute("SELECT system_prompt FROM virtual_models LIMIT 1")
+        except:
+            try:
+                cursor.execute(
+                    "ALTER TABLE virtual_models ADD COLUMN system_prompt TEXT"
+                )
+            except:
+                pass
 
         try:
             cursor.execute("SELECT cost_in FROM request_usage LIMIT 1")
@@ -563,7 +607,12 @@ class AIQueueBackend(LLMBackend):
             payload["tools"] = tools
 
         async with httpx.AsyncClient(timeout=1200.0) as client:
-            print(f"[HTTX_CALL] Sending to {self.url}, headers: {headers}")
+            print(
+                f"[AIQ_CALL] Model: {model}, Messages: {len(messages)}, Tools: {len(tools) if tools else 0}"
+            )
+            print(
+                f"[AIQ_CALL] Payload: model={payload.get('model')}, stream={payload.get('stream')}"
+            )
             response = await client.post(
                 f"{self.url}/v1/chat/completions",
                 headers=headers,
@@ -594,6 +643,20 @@ class AIQueueBackend(LLMBackend):
                 )
 
             result = response.json()
+
+            # Debug: log response details
+            choices = result.get("choices", [])
+            if choices:
+                first_choice = choices[0]
+                msg = first_choice.get("message", {})
+                content = msg.get("content", "")
+                tc = msg.get("tool_calls", [])
+                finish = first_choice.get("finish_reason")
+                print(
+                    f"[AIQ_RESP] Content length: {len(content) if content else 0}, Tool calls: {len(tc)}, Finish: {finish}"
+                )
+            else:
+                print(f"[AIQ_RESP] No choices in response: {result.keys()}")
 
             if result.get("error"):
                 error_info = result.get("error")
@@ -974,16 +1037,31 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
                 ]:
                     payload[k] = v
 
-            if self.endpoint_type == "openai":
+            # For RunPod serverless, use /runsync endpoint which waits for completion
+            if self.endpoint_type == "runpod":
+                # Extract endpoint ID from URL (e.g., https://api.runpod.ai/v2/endpoint_id/run)
+                endpoint_id = (
+                    self.url.split("/")[-2]
+                    if self.url.endswith("/run")
+                    else self.url.split("/")[-1]
+                )
+                endpoint = f"https://api.runpod.ai/v2/{endpoint_id}/runsync"
+                payload = {"input": payload}
+            elif self.endpoint_type == "openai":
                 endpoint = f"{self.url}/v1/chat/completions"
             elif self.endpoint_type == "together":
                 endpoint = f"{self.url}/v1/chat/completions"
             elif self.endpoint_type == "deepinfra":
                 endpoint = f"{self.url}/v1/openai/chat/completions"
+            elif self.endpoint_type == "queue":
+                endpoint = f"{self.url}/v1/chat/completions"
             else:
                 endpoint = f"{self.url}/v1/chat/completions"
 
             timeout = 1200.0 if stream else 300.0
+            print(
+                f"[VM_BACKEND] Calling {endpoint}, model={payload.get('model')}, stream={stream}"
+            )
 
             async with httpx.AsyncClient(timeout=timeout) as client:
                 try:
@@ -1019,6 +1097,23 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
                         # For streaming, return the raw text (SSE format)
                         return {"_stream_data": response.text}, None, 200
                     result = response.json()
+                    # Debug: log response details
+                    choices = result.get("choices", [])
+                    if choices:
+                        first_choice = choices[0]
+                        msg = first_choice.get("message", {})
+                        content = msg.get("content") or ""
+                        tc = msg.get("tool_calls") or []
+                        finish = first_choice.get("finish_reason")
+                        print(
+                            f"[VM_BACKEND_RESP] Content: '{content[:100]}', Tool calls: {len(tc)}, Finish: {finish}"
+                        )
+                        if tc:
+                            print(f"[VM_BACKEND_RESP] Tool calls raw: {tc[:500]}")
+                    else:
+                        print(
+                            f"[VM_BACKEND_RESP] No choices in response: {result.keys()}"
+                        )
                 except Exception as e:
                     return (
                         None,
@@ -1683,16 +1778,31 @@ async def chat_completions(request: Request):
     stream = data.get("stream", False)
     tools = data.get("tools", [])
 
+    # Get virtual model settings first
+    vm = get_virtual_model(model)
+    if vm:
+        # Use default max_tokens from virtual model if not specified by client
+        if vm.get("max_tokens") and "max_tokens" not in data:
+            max_tokens = vm.get("max_tokens")
+        # Use default temperature from virtual model if not specified
+        if vm.get("temperature") and "temperature" not in data:
+            temperature = vm.get("temperature")
+        # Use default top_p from virtual model if not specified
+        if vm.get("top_p") and "top_p" not in data:
+            top_p = vm.get("top_p")
+        # Prepend system prompt if set
+        if vm.get("system_prompt"):
+            system_msg = {"role": "system", "content": vm.get("system_prompt")}
+            messages = [system_msg] + messages
+        # Check if we should force non-streaming for this model
+        if vm.get("force_non_streaming", 0) == 1:
+            stream = False
+
     # Get the actual model name from virtual models if applicable
     virtual_model = model
     backend = get_backend(model)
     if hasattr(backend, "virtual_model_name"):
         virtual_model = backend.virtual_model_name
-
-    # Check if we should force non-streaming for this model
-    vm = get_virtual_model(model)
-    if vm and vm.get("force_non_streaming", 0) == 1:
-        stream = False
 
     # Additional OpenAI parameters
     extra_params = {
@@ -1758,6 +1868,9 @@ async def chat_completions(request: Request):
         stream_data = result["_stream_data"]
         full_content = ""
         usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        stream_tool_calls = []
+        has_tool_calls = False
+        finish_reason = None
 
         for line in stream_data.split("\n"):
             if line.strip() and line.startswith("data: "):
@@ -1767,17 +1880,28 @@ async def chat_completions(request: Request):
                     chunk = json.loads(line[6:])
                     if "choices" in chunk and chunk["choices"]:
                         delta = chunk["choices"][0].get("delta", {})
-                        if delta.get("content"):
-                            full_content += delta["content"]
                         tc = delta.get("tool_calls")
                         if tc:
-                            pass
+                            stream_tool_calls.extend(tc)
+                            has_tool_calls = True
+                        # Skip ALL content when tool calls were detected (MiniMax puts thinking in content)
+                        if not has_tool_calls:
+                            if delta.get("content"):
+                                full_content += delta["content"]
+                            elif delta.get("reasoning_content"):
+                                full_content += delta["reasoning_content"]
+                        finish_reason = chunk["choices"][0].get("finish_reason")
                     if "usage" in chunk and chunk["usage"]:
                         usage = chunk["usage"]
                 except:
                     pass
 
         extracted_tc, text_content = process_content(full_content)
+        if stream_tool_calls and not extracted_tc:
+            extracted_tc = stream_tool_calls
+        # If we have tool calls, clear text_content to avoid leaking thinking
+        if extracted_tc:
+            text_content = None
 
         # Generate proper SSE with extracted tool calls
         job_id = f"chat-{int(time_module.time())}"
@@ -1807,8 +1931,13 @@ async def chat_completions(request: Request):
 
     if "choices" in result and result["choices"]:
         choice = result["choices"][0]
-        content = choice.get("message", {}).get("content", "") or ""
-        tool_calls_data = choice.get("message", {}).get("tool_calls", []) or []
+        message = choice.get("message", {})
+        content = message.get("content", "") or ""
+        reasoning_content = message.get("reasoning_content", "") or ""
+        tool_calls_data = message.get("tool_calls", []) or []
+        # Only use reasoning_content as fallback if NO tool calls (otherwise it leaks thinking)
+        if not content and reasoning_content and not tool_calls_data:
+            content = reasoning_content
         usage = result.get("usage", usage)
 
     # Extract system_fingerprint if present (OA-4)
@@ -2530,6 +2659,8 @@ async def anthropic_messages(request: Request):
         if hasattr(backend, "endpoint_type"):
             if backend.endpoint_type == "deepinfra":
                 endpoint = f"{endpoint}/v1/openai/chat/completions"
+            elif backend.endpoint_type == "queue":
+                endpoint = f"{endpoint}/v1/chat/completions"
             else:
                 endpoint = f"{endpoint}/v1/chat/completions"
         else:
@@ -3127,64 +3258,6 @@ def fetch_endpoint_models(endpoint_id):
         return flask_jsonify({"error": str(e)}), 500
 
 
-@flask_app.route("/virtual-models", methods=["GET", "POST"])
-def admin_virtual_models():
-    """Manage virtual models."""
-    auth = validate_session()
-    if not auth.get("valid"):
-        return redirect(f"{get_menu_login_url()}/login?redirect=/virtual-models")
-
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM endpoints WHERE enabled = 1 ORDER BY name")
-        endpoints = [dict(row) for row in cursor.fetchall()]
-
-        if flask_request.method == "POST":
-            if flask_request.is_json:
-                data = flask_request.get_json()
-            else:
-                data = flask_request.form
-
-            cursor.execute(
-                """
-                INSERT INTO virtual_models (name, endpoint_id, actual_model, description, cost_per_1k_tokens_in, cost_per_1k_tokens_out, disable_streaming, force_non_streaming, custom_headers, enabled)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-                (
-                    data.get("name"),
-                    int(data.get("endpoint_id")),
-                    data.get("actual_model"),
-                    data.get("description"),
-                    data.get("cost_per_1k_tokens_in") or 0,
-                    data.get("cost_per_1k_tokens_out") or 0,
-                    1 if data.get("disable_streaming") else 0,
-                    1 if data.get("force_non_streaming") else 0,
-                    data.get("custom_headers") or "",
-                    1 if data.get("enabled", True) else 0,
-                ),
-            )
-            conn.commit()
-
-            if flask_request.is_json:
-                return flask_jsonify({"status": "ok"})
-            return redirect("/virtual-models")
-
-        cursor.execute("""
-            SELECT vm.*, e.name as endpoint_name, e.url as endpoint_url
-            FROM virtual_models vm
-            LEFT JOIN endpoints e ON vm.endpoint_id = e.id
-            ORDER BY vm.name
-        """)
-        virtual_models = [dict(row) for row in cursor.fetchall()]
-
-    return render_template(
-        "admin_virtual_models.html",
-        user=auth.get("username"),
-        endpoints=endpoints,
-        virtual_models=virtual_models,
-    )
-
-
 @flask_app.route("/virtual-models/<int:vm_id>", methods=["PUT"])
 def update_virtual_model(vm_id):
     """Update virtual model."""
@@ -3201,7 +3274,8 @@ def update_virtual_model(vm_id):
             SET name = ?, endpoint_id = ?, actual_model = ?, description = ?, 
                 cost_per_1k_tokens_in = ?, cost_per_1k_tokens_out = ?, 
                 disable_streaming = ?, force_non_streaming = ?, custom_headers = ?,
-                enabled = ?, updated_at = strftime('%s', 'now')
+                enabled = ?, max_tokens = ?, temperature = ?, top_p = ?, system_prompt = ?,
+                updated_at = strftime('%s', 'now')
             WHERE id = ?
         """,
             (
@@ -3215,6 +3289,10 @@ def update_virtual_model(vm_id):
                 1 if data.get("force_non_streaming") else 0,
                 data.get("custom_headers") or "",
                 1 if data.get("enabled", True) else 0,
+                data.get("max_tokens") or 0,
+                data.get("temperature") or 0,
+                data.get("top_p") or 1.0,
+                data.get("system_prompt") or "",
                 vm_id,
             ),
         )

@@ -381,6 +381,26 @@
                             </div>
                         </div>
                         <div class="form-row">
+                            <div class="form-group">
+                                <label for="vm-max-tokens">Max Tokens (default)</label>
+                                <input type="number" id="vm-max-tokens" name="max_tokens" value="2048" min="1" max="128000">
+                            </div>
+                            <div class="form-group">
+                                <label for="vm-temperature">Temperature (default)</label>
+                                <input type="number" id="vm-temperature" name="temperature" value="0.7" min="0" max="2" step="0.1">
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="vm-top-p">Top P (default)</label>
+                                <input type="number" id="vm-top-p" name="top_p" value="1.0" min="0" max="1" step="0.1">
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label for="vm-system-prompt">System Prompt</label>
+                            <textarea id="vm-system-prompt" name="system_prompt" placeholder="Optional system prompt to prepend to all requests" style="width:100%;min-height:60px;padding:8px;border:1px solid #ddd;border-radius:4px;"></textarea>
+                        </div>
+                        <div class="form-row">
                             <div class="form-group" style="width:100%;">
                                 <label>Custom Headers</label>
                                 <div id="custom-headers-list"></div>
@@ -811,6 +831,10 @@
         document.getElementById('vm-desc').value = data ? (data.description || '') : '';
         document.getElementById('vm-cost-in').value = data ? (data.cost_per_1k_tokens_in || 0) : '0';
         document.getElementById('vm-cost-out').value = data ? (data.cost_per_1k_tokens_out || 0) : '0';
+        document.getElementById('vm-max-tokens').value = data ? (data.max_tokens || 2048) : '2048';
+        document.getElementById('vm-temperature').value = data ? (data.temperature || 0.7) : '0.7';
+        document.getElementById('vm-top-p').value = data ? (data.top_p || 1.0) : '1.0';
+        document.getElementById('vm-system-prompt').value = data ? (data.system_prompt || '') : '';
         document.getElementById('vm-disable-streaming').checked = data ? (data.disable_streaming === 1) : false;
         document.getElementById('vm-force-non-streaming').checked = data ? (data.force_non_streaming === 1) : false;
         document.getElementById('vm-enabled').checked = data ? data.enabled : true;
@@ -952,6 +976,10 @@
             description: form.description.value,
             cost_per_1k_tokens_in: parseFloat(form.cost_per_1k_tokens_in.value) || 0,
             cost_per_1k_tokens_out: parseFloat(form.cost_per_1k_tokens_out.value) || 0,
+            max_tokens: parseInt(form.max_tokens.value) || 0,
+            temperature: parseFloat(form.temperature.value) || 0,
+            top_p: parseFloat(form.top_p.value) || 1.0,
+            system_prompt: form.system_prompt.value || '',
             custom_headers: getCustomHeadersFromForm(),
             disable_streaming: form.disable_streaming.checked ? 1 : 0,
             force_non_streaming: form.force_non_streaming.checked ? 1 : 0,

@@ -2,6 +2,25 @@
 
 All notable changes to the Serverless Proxy will be documented in this file.
 
+## [2.3.0] - 2026-04-01
+
+### Added
+
+- **Virtual Model Defaults** - New configurable defaults per virtual model:
+  - `max_tokens` - Default max tokens (fallback when client doesn't specify)
+  - `temperature` - Default temperature
+  - `top_p` - Default top_p
+  - `system_prompt` - System prompt prepended to all requests
+
+### Fixed
+
+- **MiniMax Reasoning Stripping** - Fixed issue where MiniMax models leak thinking into responses:
+  - MiniMax sends reasoning content separately from actual response
+  - When tool calls are present, thinking is now stripped from response
+  - Works for both streaming and non-streaming responses
+  - Streaming: Clears text_content when tool calls detected
+  - Non-streaming: Doesn't use reasoning_content as fallback when tool_calls present
+
 ## [2.2.1] - 2026-03-29
 
 ### Fixed
