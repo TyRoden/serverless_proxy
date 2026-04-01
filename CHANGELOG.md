@@ -11,6 +11,11 @@ All notable changes to the Serverless Proxy will be documented in this file.
   - `temperature` - Default temperature
   - `top_p` - Default top_p
   - `system_prompt` - System prompt prepended to all requests
+- **Show Reasoning Toggle** - New `show_reasoning` option for virtual models:
+  - Controls whether chain-of-thought/reasoning content is included in responses
+  - Useful for models like MiniMax M2.5 that output thinking separately
+  - Toggle available in dashboard edit form
+  - Database column: `show_reasoning` (1=enabled, 0=disabled)
 
 ### Fixed
 

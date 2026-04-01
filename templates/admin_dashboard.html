@@ -418,6 +418,11 @@
                             <small style="display:block;margin-left:24px;color:#666;">Disables streaming for clients entirely</small>
                         </div>
                         <div class="checkbox-row">
+                            <input type="checkbox" id="vm-show-reasoning" name="show_reasoning" checked>
+                            <label for="vm-show-reasoning">Show Reasoning</label>
+                            <small style="display:block;margin-left:24px;color:#666;">Include chain-of-thought (disable to hide thinking from MiniMax)</small>
+                        </div>
+                        <div class="checkbox-row">
                             <input type="checkbox" id="vm-enabled" name="enabled" checked>
                             <label for="vm-enabled">Enabled</label>
                         </div>
@@ -837,6 +842,7 @@
         document.getElementById('vm-system-prompt').value = data ? (data.system_prompt || '') : '';
         document.getElementById('vm-disable-streaming').checked = data ? (data.disable_streaming === 1) : false;
         document.getElementById('vm-force-non-streaming').checked = data ? (data.force_non_streaming === 1) : false;
+        document.getElementById('vm-show-reasoning').checked = data ? (data.show_reasoning !== 0) : true;
         document.getElementById('vm-enabled').checked = data ? data.enabled : true;
         document.getElementById('vm-model-list').classList.add('hidden');
         document.getElementById('vm-fetch-status').innerHTML = '';
@@ -983,6 +989,7 @@
             custom_headers: getCustomHeadersFromForm(),
             disable_streaming: form.disable_streaming.checked ? 1 : 0,
             force_non_streaming: form.force_non_streaming.checked ? 1 : 0,
+            show_reasoning: form.show_reasoning.checked ? 1 : 0,
             enabled: form.enabled.checked
         };
         

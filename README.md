@@ -81,6 +81,7 @@ Map virtual model names to actual backend models:
 - **Virtual Name**: What clients will request (e.g., `gpt-4`, `prod-llama`)
 - **Endpoint**: Which backend to route to
 - **Actual Model**: The model name on the backend (e.g., `gpt-4o`, `llama3:70b`)
+- **Show Reasoning**: Toggle chain-of-thought display (for models like MiniMax that output thinking separately)
 
 ## API Endpoints
 

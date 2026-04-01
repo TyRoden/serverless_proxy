@@ -237,6 +237,16 @@ def init_database():
                 pass
 
         try:
+            cursor.execute("SELECT show_reasoning FROM virtual_models LIMIT 1")
+        except:
+            try:
+                cursor.execute(
+                    "ALTER TABLE virtual_models ADD COLUMN show_reasoning INTEGER DEFAULT 1"
+                )
+            except:
+                pass
+
+        try:
             cursor.execute("SELECT cost_in FROM request_usage LIMIT 1")
         except:
             try:
@@ -984,6 +994,7 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
             self.disable_streaming = vm.get("disable_streaming", 0) == 1
             self.virtual_model_name = vm.get("name")
             self.custom_headers = vm.get("custom_headers", "")
+            self.show_reasoning = vm.get("show_reasoning", 1) == 1
 
         async def chat_completion(
             self,
@@ -1867,6 +1878,7 @@ async def chat_completions(request: Request):
         # Parse existing SSE data instead of making another request
         stream_data = result["_stream_data"]
         full_content = ""
+        full_reasoning = ""
         usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         stream_tool_calls = []
         has_tool_calls = False
@@ -1885,11 +1897,12 @@ async def chat_completions(request: Request):
                             stream_tool_calls.extend(tc)
                             has_tool_calls = True
                         # Skip ALL content when tool calls were detected (MiniMax puts thinking in content)
+                        # Now properly handles both content and reasoning_content concurrently
                         if not has_tool_calls:
                             if delta.get("content"):
                                 full_content += delta["content"]
-                            elif delta.get("reasoning_content"):
-                                full_content += delta["reasoning_content"]
+                            if delta.get("reasoning_content"):
+                                full_reasoning += delta["reasoning_content"]
                         finish_reason = chunk["choices"][0].get("finish_reason")
                     if "usage" in chunk and chunk["usage"]:
                         usage = chunk["usage"]
@@ -1902,6 +1915,19 @@ async def chat_completions(request: Request):
         # If we have tool calls, clear text_content to avoid leaking thinking
         if extracted_tc:
             text_content = None
+
+        # Handle reasoning content based on show_reasoning setting
+        show_reasoning = True
+        vm_config = get_virtual_model(model)
+        if vm_config:
+            show_reasoning = vm_config.get("show_reasoning", 1) == 1
+
+        # Append reasoning to content if show_reasoning is enabled
+        if show_reasoning and full_reasoning:
+            if text_content:
+                text_content = text_content + "\n\n" + full_reasoning
+            else:
+                text_content = full_reasoning
 
         # Generate proper SSE with extracted tool calls
         job_id = f"chat-{int(time_module.time())}"
@@ -1926,6 +1952,7 @@ async def chat_completions(request: Request):
 
     # Extract content from response
     content = ""
+    reasoning_content = ""
     tool_calls_data = []
     usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
@@ -1935,10 +1962,23 @@ async def chat_completions(request: Request):
         content = message.get("content", "") or ""
         reasoning_content = message.get("reasoning_content", "") or ""
         tool_calls_data = message.get("tool_calls", []) or []
-        # Only use reasoning_content as fallback if NO tool calls (otherwise it leaks thinking)
-        if not content and reasoning_content and not tool_calls_data:
-            content = reasoning_content
         usage = result.get("usage", usage)
+
+    # Handle reasoning content based on show_reasoning setting
+    show_reasoning = True
+    vm_config = get_virtual_model(model)
+    if vm_config:
+        show_reasoning = vm_config.get("show_reasoning", 1) == 1
+
+    # Append reasoning to content if show_reasoning is enabled
+    if show_reasoning and reasoning_content:
+        if content:
+            content = content + "\n\n" + reasoning_content
+        else:
+            content = reasoning_content
+    elif not show_reasoning and reasoning_content and not content:
+        # If reasoning is hidden but content is empty, use reasoning as fallback
+        content = reasoning_content
 
     # Extract system_fingerprint if present (OA-4)
     system_fingerprint = result.get("system_fingerprint")
@@ -3275,6 +3315,7 @@ def update_virtual_model(vm_id):
                 cost_per_1k_tokens_in = ?, cost_per_1k_tokens_out = ?, 
                 disable_streaming = ?, force_non_streaming = ?, custom_headers = ?,
                 enabled = ?, max_tokens = ?, temperature = ?, top_p = ?, system_prompt = ?,
+                show_reasoning = ?,
                 updated_at = strftime('%s', 'now')
             WHERE id = ?
         """,
@@ -3293,7 +3334,50 @@ def update_virtual_model(vm_id):
                 data.get("temperature") or 0,
                 data.get("top_p") or 1.0,
                 data.get("system_prompt") or "",
+                1 if data.get("show_reasoning", True) else 0,
                 vm_id,
+            ),
+        )
+        conn.commit()
+
+    return flask_jsonify({"status": "ok"})
+
+
+@flask_app.route("/virtual-models", methods=["POST"])
+def create_virtual_model():
+    """Create new virtual model."""
+    auth = validate_session()
+    if not auth.get("valid"):
+        return flask_jsonify({"error": "Unauthorized"}), 401
+
+    data = flask_request.get_json()
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO virtual_models (
+                name, endpoint_id, actual_model, description,
+                cost_per_1k_tokens_in, cost_per_1k_tokens_out,
+                disable_streaming, force_non_streaming, custom_headers,
+                enabled, max_tokens, temperature, top_p, system_prompt, show_reasoning
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+            (
+                data.get("name"),
+                int(data.get("endpoint_id")),
+                data.get("actual_model"),
+                data.get("description"),
+                data.get("cost_per_1k_tokens_in") or 0,
+                data.get("cost_per_1k_tokens_out") or 0,
+                1 if data.get("disable_streaming") else 0,
+                1 if data.get("force_non_streaming") else 0,
+                data.get("custom_headers") or "",
+                1 if data.get("enabled", True) else 0,
+                data.get("max_tokens") or 0,
+                data.get("temperature") or 0,
+                data.get("top_p") or 1.0,
+                data.get("system_prompt") or "",
+                1 if data.get("show_reasoning", True) else 0,
             ),
         )
         conn.commit()
