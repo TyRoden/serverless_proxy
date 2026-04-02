@@ -1925,7 +1925,7 @@ async def chat_completions(request: Request):
         # Append reasoning to content if show_reasoning is enabled
         if show_reasoning and full_reasoning:
             if text_content:
-                text_content = text_content + "\n\n" + full_reasoning
+                text_content = full_reasoning + "\n\n" + text_content
             else:
                 text_content = full_reasoning
 
@@ -1973,7 +1973,7 @@ async def chat_completions(request: Request):
     # Append reasoning to content if show_reasoning is enabled
     if show_reasoning and reasoning_content:
         if content:
-            content = content + "\n\n" + reasoning_content
+            content = reasoning_content + "\n\n" + content
         else:
             content = reasoning_content
     elif not show_reasoning and reasoning_content and not content:
