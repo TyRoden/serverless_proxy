@@ -1896,13 +1896,14 @@ async def chat_completions(request: Request):
                         if tc:
                             stream_tool_calls.extend(tc)
                             has_tool_calls = True
-                        # Skip ALL content when tool calls were detected (MiniMax puts thinking in content)
-                        # Now properly handles both content and reasoning_content concurrently
+                        # Handle content and reasoning separately
+                        # When tool calls are present, content is skipped to avoid leaking thinking
+                        # But reasoning_content should still be captured
                         if not has_tool_calls:
                             if delta.get("content"):
                                 full_content += delta["content"]
-                            if delta.get("reasoning_content"):
-                                full_reasoning += delta["reasoning_content"]
+                        if delta.get("reasoning_content"):
+                            full_reasoning += delta["reasoning_content"]
                         finish_reason = chunk["choices"][0].get("finish_reason")
                     if "usage" in chunk and chunk["usage"]:
                         usage = chunk["usage"]
@@ -1912,9 +1913,11 @@ async def chat_completions(request: Request):
         extracted_tc, text_content = process_content(full_content)
         if stream_tool_calls and not extracted_tc:
             extracted_tc = stream_tool_calls
-        # If we have tool calls, clear text_content to avoid leaking thinking
-        if extracted_tc:
-            text_content = None
+
+        print(
+            f"[DEBUG] Parsed stream: content='{full_content[:50]}...' if full_content else '(empty)', reasoning='{full_reasoning[:50]}...' if full_reasoning else '(empty)', tc={len(extracted_tc) if extracted_tc else 0}, finish={finish_reason}",
+            flush=True,
+        )
 
         # Handle reasoning content based on show_reasoning setting
         show_reasoning = True
@@ -1922,8 +1925,12 @@ async def chat_completions(request: Request):
         if vm_config:
             show_reasoning = vm_config.get("show_reasoning", 1) == 1
 
-        # Append reasoning to content if show_reasoning is enabled
-        if show_reasoning and full_reasoning:
+        # When tool calls are present, don't add any content (reasoning or otherwise)
+        # to avoid breaking the tool_calls flow. The client expects finish_reason=tool_calls
+        if extracted_tc:
+            text_content = None
+        elif show_reasoning and full_reasoning:
+            # Only add reasoning when NO tool calls
             if text_content:
                 text_content = full_reasoning + "\n\n" + text_content
             else:
@@ -1971,10 +1978,12 @@ async def chat_completions(request: Request):
         show_reasoning = vm_config.get("show_reasoning", 1) == 1
 
     # Append reasoning to content if show_reasoning is enabled
+    # Only add reasoning when there are NO tool calls (to avoid interfering with tool execution)
     if show_reasoning and reasoning_content:
-        if content:
+        if content and not tool_calls_data:
             content = reasoning_content + "\n\n" + content
-        else:
+        elif not content and not tool_calls_data:
+            # Only use reasoning as fallback when no tool calls
             content = reasoning_content
     elif not show_reasoning and reasoning_content and not content:
         # If reasoning is hidden but content is empty, use reasoning as fallback
