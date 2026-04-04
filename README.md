@@ -43,11 +43,6 @@ Open the `.env` file in a text editor and check these settings:
 AUTH_ENABLED=false
 
 # Optional: If using Ollama locally, it should work out of the box
-# Optional: If using RunPod or another provider, add your API key and endpoint below
-# RUNPOD_API_KEY=your_api_key_here
-# RUNPOD_ENDPOINT_ID=your_endpoint_id_here
-# MODEL_NAME=model-name-on-your-backend
-# ENDPOINT_TYPE=ollama  (or: openai, runpod, together, vllm)
 ```
 
 ### Step 3: Start the Proxy
@@ -134,17 +129,6 @@ docker restart serverless-proxy
 | `TIMEOUT` | Request timeout (seconds) | `300` |
 | `AUTH_ENABLED` | Enable admin authentication | `true` |
 | `AIMENU_URL` | Auth service URL | `http://localhost:5000` |
-
-### Direct Mode Configuration (Optional)
-
-If you want to use the proxy without configuring endpoints in the UI, set these:
-
-| Variable | Description |
-|----------|-------------|
-| `RUNPOD_API_KEY` | Your RunPod API key |
-| `RUNPOD_ENDPOINT_ID` | Your RunPod endpoint ID |
-| `MODEL_NAME` | Model name on the backend |
-| `ENDPOINT_TYPE` | Backend type: `ollama`, `openai`, `runpod`, `together`, `vllm` |
 
 ### Authentication
 

@@ -49,10 +49,6 @@ curl -X POST http://localhost:8002/v1/chat/completions \
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `RUNPOD_API_KEY` | RunPod API key (Bearer token) | (your API key) |
-| `RUNPOD_ENDPOINT_ID` | RunPod serverless endpoint ID | (your endpoint ID) |
-| `MODEL_NAME` | Model identifier | `project-system-ai` |
-| `ENDPOINT_TYPE` | Endpoint format: `ollama` or `vllm` | `ollama` |
 | `TIMEOUT` | Request timeout (seconds) | `300` |
 
 ### AI Queue Master Integration
