@@ -249,10 +249,10 @@ AI_QUEUE_PRIORITY=NORMAL
 
 ```bash
 # View container logs
-docker logs runpod-serverless-proxy
+docker logs serverless-proxy
 
 # Restart container
-docker restart runpod-serverless-proxy
+docker restart serverless-proxy
 
 # Check health
 curl http://localhost:8002/health
