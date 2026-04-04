@@ -790,9 +790,7 @@ class RunPodBackend(LLMBackend):
     """RunPod Serverless backend."""
 
     def __init__(self):
-        self.api_key = os.getenv("RUNPOD_API_KEY", "")
-        self.endpoint_id = os.getenv("RUNPOD_ENDPOINT_ID", "")
-        self.endpoint_type = os.getenv("ENDPOINT_TYPE", "ollama").lower()
+        pass
 
     def _build_payload(
         self,
@@ -1244,10 +1242,6 @@ def get_backend(model_name: str = None) -> LLMBackend:
 
 # Initialize backend (uses env vars for default)
 BACKEND = get_backend()
-
-RUNPOD_API_KEY = os.getenv("RUNPOD_API_KEY", "")
-RUNPOD_ENDPOINT_ID = os.getenv("RUNPOD_ENDPOINT_ID", "")
-ENDPOINT_TYPE = os.getenv("ENDPOINT_TYPE", "ollama").lower()  # "ollama" or "vllm"
 
 
 def extract_tool_calls(content):
@@ -1836,7 +1830,7 @@ async def chat_completions(request: Request):
     data = await request.json()
 
     messages = data.get("messages", [])
-    model = data.get("model", os.getenv("MODEL_NAME", "project-system-ai"))
+    model = data.get("model")
     temperature = data.get("temperature", 0.7)
     max_tokens = data.get("max_tokens", 256)
     top_p = data.get("top_p", 1.0)
@@ -2658,7 +2652,7 @@ async def anthropic_messages(request: Request):
     incoming_source = request.headers.get("x-source", "serverless-proxy")
     data = await request.json()
 
-    model = data.get("model", os.getenv("MODEL_NAME", "project-system-ai"))
+    model = data.get("model")
     messages = data.get("messages", [])
     max_tokens = data.get("max_tokens", 1024)
     temperature = data.get("temperature", 0.7)
@@ -2963,10 +2957,7 @@ async def list_models():
     except Exception:
         pass
 
-    # Get default model from env
-    default_model = os.getenv("MODEL_NAME", "project-system-ai")
-
-    # Build response with virtual models + default
+    # Build response with virtual models only
     models = []
 
     # Add virtual models
@@ -2977,17 +2968,6 @@ async def list_models():
                 "object": "model",
                 "created": int(time.time()),
                 "owned_by": vm.get("endpoint_name", "configured"),
-            }
-        )
-
-    # Add default model if not already in list
-    if default_model not in [m["id"] for m in models]:
-        models.append(
-            {
-                "id": default_model,
-                "object": "model",
-                "created": int(time.time()),
-                "owned_by": "runpod",
             }
         )
 
@@ -3007,7 +2987,7 @@ async def completions(request: Request):
     data = await request.json()
 
     prompt = data.get("prompt", "")
-    model = data.get("model", os.getenv("MODEL_NAME", "project-system-ai"))
+    model = data.get("model")
     temperature = data.get("temperature", 0.7)
     max_tokens = data.get("max_tokens", 256)
     top_p = data.get("top_p", 1.0)
