@@ -3093,6 +3093,7 @@ async def embeddings(request: Request):
 def validate_session(flask_cookies=None):
     """Proxy session validation to ai-menu-system. Accepts cookies dict for FastAPI compatibility."""
     # Skip auth if disabled
+    print(f"DEBUG: AUTH_ENABLED = {AUTH_ENABLED}, type = {type(AUTH_ENABLED)}")
     if not AUTH_ENABLED:
         return {"valid": True, "user": "admin"}
 
@@ -3552,6 +3553,21 @@ def save_setting(key, value):
     except Exception as e:
         print(f"Error saving setting {key}: {e}")
         return False
+
+
+@flask_app.route("/session/validate", methods=["GET"])
+def session_validate():
+    """Local session validation - returns valid if auth disabled."""
+    if not AUTH_ENABLED:
+        return flask_jsonify({"valid": True, "user": "admin"})
+
+    # Otherwise check with remote AIMENU
+    try:
+        cookies = flask_request.cookies
+        resp = httpx.get(f"{AIMENU_URL}/session/validate", cookies=cookies, timeout=5)
+        return flask_jsonify(resp.json())
+    except Exception as e:
+        return flask_jsonify({"valid": False})
 
 
 @flask_app.route("/api/admin/settings", methods=["GET"])
