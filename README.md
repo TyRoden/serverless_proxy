@@ -128,11 +128,23 @@ docker restart serverless-proxy
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `DATABASE_PATH` | SQLite database path | `/data/proxy.db` |
+| `API_PORT` | OpenAI-compatible API port | `8002` |
 | `FLASK_PORT` | Admin UI port | `5001` |
+| `DATABASE_PATH` | SQLite database path | `/data/proxy.db` |
 | `TIMEOUT` | Request timeout (seconds) | `300` |
 | `AUTH_ENABLED` | Enable admin authentication | `true` |
 | `AIMENU_URL` | Auth service URL | `http://localhost:5000` |
+
+### Direct Mode Configuration (Optional)
+
+If you want to use the proxy without configuring endpoints in the UI, set these:
+
+| Variable | Description |
+|----------|-------------|
+| `RUNPOD_API_KEY` | Your RunPod API key |
+| `RUNPOD_ENDPOINT_ID` | Your RunPod endpoint ID |
+| `MODEL_NAME` | Model name on the backend |
+| `ENDPOINT_TYPE` | Backend type: `ollama`, `openai`, `runpod`, `together`, `vllm` |
 
 ### Authentication
 
