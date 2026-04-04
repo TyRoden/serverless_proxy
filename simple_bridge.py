@@ -1987,6 +1987,9 @@ async def chat_completions(request: Request):
         # Generate proper SSE with extracted tool calls
         job_id = f"chat-{int(time_module.time())}"
 
+        # Log usage for streaming requests BEFORE returning
+        log_chat_usage(model, None, None, usage, 0)
+
         async def stream_generator():
             async for chunk_data in _generate_sse(
                 job_id=job_id,
@@ -2049,8 +2052,8 @@ async def chat_completions(request: Request):
 
     job_id = result.get("id", f"chat-{int(time_module.time())}")
 
-    # Handle streaming response - use original_stream to match client's request
-    if original_stream:
+    # Handle streaming response - use stream (actual value used) not original_stream
+    if stream:
         return StreamingResponse(
             _generate_sse(
                 job_id=job_id,
