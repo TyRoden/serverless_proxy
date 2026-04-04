@@ -42,7 +42,7 @@ from flask import (
 import secrets
 
 # Flask app for admin routes
-FLASK_PORT = get_flask_port()
+FLASK_PORT = int(os.getenv("FLASK_PORT", 5001))
 flask_app = Flask(__name__, template_folder="templates", static_folder="static")
 flask_app.secret_key = os.getenv("SECRET_KEY", secrets.token_hex(32))
 
