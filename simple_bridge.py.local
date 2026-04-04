@@ -71,30 +71,6 @@ def get_db():
         conn.close()
 
 
-def get_setting(key, default=None):
-    """Get a setting from the database, fallback to default."""
-    try:
-        with get_db() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
-            row = cursor.fetchone()
-            if row:
-                return row["value"]
-    except Exception as e:
-        print(f"Error getting setting {key}: {e}")
-    return default
-
-
-def get_api_port():
-    """Get API port from DB, fallback to env var or default."""
-    return int(get_setting("api_port", os.getenv("API_PORT", "8002")))
-
-
-def get_flask_port():
-    """Get Flask/Admin port from DB, fallback to env var or default."""
-    return int(get_setting("flask_port", os.getenv("FLASK_PORT", "5001")))
-
-
 def init_database():
     """Initialize database tables."""
     with get_db() as conn:
@@ -130,10 +106,6 @@ def init_database():
                 force_non_streaming INTEGER DEFAULT 0,
                 custom_headers TEXT,
                 enabled INTEGER DEFAULT 1,
-                max_tokens INTEGER DEFAULT 0,
-                temperature REAL DEFAULT 0,
-                top_p REAL DEFAULT 1.0,
-                system_prompt TEXT,
                 created_at INTEGER DEFAULT (strftime('%s', 'now')),
                 updated_at INTEGER DEFAULT (strftime('%s', 'now')),
                 FOREIGN KEY (endpoint_id) REFERENCES endpoints(id)
@@ -177,34 +149,6 @@ def init_database():
             )
         """)
 
-        # Settings table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL,
-                updated_at INTEGER DEFAULT (strftime('%s', 'now'))
-            )
-        """)
-
-        # Insert default settings if not exist
-        cursor.execute(
-            "INSERT OR IGNORE INTO settings (key, value) VALUES ('api_port', '8002')"
-        )
-        cursor.execute(
-            "INSERT OR IGNORE INTO settings (key, value) VALUES ('flask_port', '5001')"
-        )
-        cursor.execute(
-            "INSERT OR IGNORE INTO settings (key, value) VALUES ('aimenu_url', 'http://localhost:5000')"
-        )
-        cursor.execute(
-            "INSERT OR IGNORE INTO settings (key, value) VALUES ('use_ai_queue', 'false')"
-        )
-        cursor.execute(
-            "INSERT OR IGNORE INTO settings (key, value) VALUES ('ai_queue_url', 'http://host.docker.internal:8102')"
-        )
-
-        conn.commit()
-
         # Migration: Add new columns if they don't exist
         try:
             cursor.execute("SELECT custom_headers FROM endpoints LIMIT 1")
@@ -247,56 +191,6 @@ def init_database():
                     )
                 except:
                     pass
-
-        try:
-            cursor.execute("SELECT max_tokens FROM virtual_models LIMIT 1")
-        except:
-            try:
-                cursor.execute(
-                    "ALTER TABLE virtual_models ADD COLUMN max_tokens INTEGER DEFAULT 0"
-                )
-            except:
-                pass
-
-        try:
-            cursor.execute("SELECT temperature FROM virtual_models LIMIT 1")
-        except:
-            try:
-                cursor.execute(
-                    "ALTER TABLE virtual_models ADD COLUMN temperature REAL DEFAULT 0"
-                )
-            except:
-                pass
-
-        try:
-            cursor.execute("SELECT top_p FROM virtual_models LIMIT 1")
-        except:
-            try:
-                cursor.execute(
-                    "ALTER TABLE virtual_models ADD COLUMN top_p REAL DEFAULT 1.0"
-                )
-            except:
-                pass
-
-        try:
-            cursor.execute("SELECT system_prompt FROM virtual_models LIMIT 1")
-        except:
-            try:
-                cursor.execute(
-                    "ALTER TABLE virtual_models ADD COLUMN system_prompt TEXT"
-                )
-            except:
-                pass
-
-        try:
-            cursor.execute("SELECT show_reasoning FROM virtual_models LIMIT 1")
-        except:
-            try:
-                cursor.execute(
-                    "ALTER TABLE virtual_models ADD COLUMN show_reasoning INTEGER DEFAULT 1"
-                )
-            except:
-                pass
 
         try:
             cursor.execute("SELECT cost_in FROM request_usage LIMIT 1")
@@ -669,12 +563,7 @@ class AIQueueBackend(LLMBackend):
             payload["tools"] = tools
 
         async with httpx.AsyncClient(timeout=1200.0) as client:
-            print(
-                f"[AIQ_CALL] Model: {model}, Messages: {len(messages)}, Tools: {len(tools) if tools else 0}"
-            )
-            print(
-                f"[AIQ_CALL] Payload: model={payload.get('model')}, stream={payload.get('stream')}"
-            )
+            print(f"[HTTX_CALL] Sending to {self.url}, headers: {headers}")
             response = await client.post(
                 f"{self.url}/v1/chat/completions",
                 headers=headers,
@@ -705,20 +594,6 @@ class AIQueueBackend(LLMBackend):
                 )
 
             result = response.json()
-
-            # Debug: log response details
-            choices = result.get("choices", [])
-            if choices:
-                first_choice = choices[0]
-                msg = first_choice.get("message", {})
-                content = msg.get("content", "")
-                tc = msg.get("tool_calls", [])
-                finish = first_choice.get("finish_reason")
-                print(
-                    f"[AIQ_RESP] Content length: {len(content) if content else 0}, Tool calls: {len(tc)}, Finish: {finish}"
-                )
-            else:
-                print(f"[AIQ_RESP] No choices in response: {result.keys()}")
 
             if result.get("error"):
                 error_info = result.get("error")
@@ -1046,7 +921,6 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
             self.disable_streaming = vm.get("disable_streaming", 0) == 1
             self.virtual_model_name = vm.get("name")
             self.custom_headers = vm.get("custom_headers", "")
-            self.show_reasoning = vm.get("show_reasoning", 1) == 1
 
         async def chat_completion(
             self,
@@ -1100,31 +974,16 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
                 ]:
                     payload[k] = v
 
-            # For RunPod serverless, use /runsync endpoint which waits for completion
-            if self.endpoint_type == "runpod":
-                # Extract endpoint ID from URL (e.g., https://api.runpod.ai/v2/endpoint_id/run)
-                endpoint_id = (
-                    self.url.split("/")[-2]
-                    if self.url.endswith("/run")
-                    else self.url.split("/")[-1]
-                )
-                endpoint = f"https://api.runpod.ai/v2/{endpoint_id}/runsync"
-                payload = {"input": payload}
-            elif self.endpoint_type == "openai":
+            if self.endpoint_type == "openai":
                 endpoint = f"{self.url}/v1/chat/completions"
             elif self.endpoint_type == "together":
                 endpoint = f"{self.url}/v1/chat/completions"
             elif self.endpoint_type == "deepinfra":
                 endpoint = f"{self.url}/v1/openai/chat/completions"
-            elif self.endpoint_type == "queue":
-                endpoint = f"{self.url}/v1/chat/completions"
             else:
                 endpoint = f"{self.url}/v1/chat/completions"
 
             timeout = 1200.0 if stream else 300.0
-            print(
-                f"[VM_BACKEND] Calling {endpoint}, model={payload.get('model')}, stream={stream}"
-            )
 
             async with httpx.AsyncClient(timeout=timeout) as client:
                 try:
@@ -1160,23 +1019,6 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
                         # For streaming, return the raw text (SSE format)
                         return {"_stream_data": response.text}, None, 200
                     result = response.json()
-                    # Debug: log response details
-                    choices = result.get("choices", [])
-                    if choices:
-                        first_choice = choices[0]
-                        msg = first_choice.get("message", {})
-                        content = msg.get("content") or ""
-                        tc = msg.get("tool_calls") or []
-                        finish = first_choice.get("finish_reason")
-                        print(
-                            f"[VM_BACKEND_RESP] Content: '{content[:100]}', Tool calls: {len(tc)}, Finish: {finish}"
-                        )
-                        if tc:
-                            print(f"[VM_BACKEND_RESP] Tool calls raw: {tc[:500]}")
-                    else:
-                        print(
-                            f"[VM_BACKEND_RESP] No choices in response: {result.keys()}"
-                        )
                 except Exception as e:
                     return (
                         None,
@@ -1841,31 +1683,16 @@ async def chat_completions(request: Request):
     stream = data.get("stream", False)
     tools = data.get("tools", [])
 
-    # Get virtual model settings first
-    vm = get_virtual_model(model)
-    if vm:
-        # Use default max_tokens from virtual model if not specified by client
-        if vm.get("max_tokens") and "max_tokens" not in data:
-            max_tokens = vm.get("max_tokens")
-        # Use default temperature from virtual model if not specified
-        if vm.get("temperature") and "temperature" not in data:
-            temperature = vm.get("temperature")
-        # Use default top_p from virtual model if not specified
-        if vm.get("top_p") and "top_p" not in data:
-            top_p = vm.get("top_p")
-        # Prepend system prompt if set
-        if vm.get("system_prompt"):
-            system_msg = {"role": "system", "content": vm.get("system_prompt")}
-            messages = [system_msg] + messages
-        # Check if we should force non-streaming for this model
-        if vm.get("force_non_streaming", 0) == 1:
-            stream = False
-
     # Get the actual model name from virtual models if applicable
     virtual_model = model
     backend = get_backend(model)
     if hasattr(backend, "virtual_model_name"):
         virtual_model = backend.virtual_model_name
+
+    # Check if we should force non-streaming for this model
+    vm = get_virtual_model(model)
+    if vm and vm.get("force_non_streaming", 0) == 1:
+        stream = False
 
     # Additional OpenAI parameters
     extra_params = {
@@ -1884,26 +1711,6 @@ async def chat_completions(request: Request):
 
     # Get incoming X-Source to forward
     incoming_source = request.headers.get("x-source", "serverless-proxy")
-
-    # Preserve original stream request from client (before any modifications)
-    original_stream = stream
-
-    # Compat mode: if client asks for stream but doesn't accept SSE, force non-streaming
-    # BUT still track original request to return proper response format to client
-    accept_header = request.headers.get("accept", "")
-    user_agent = request.headers.get("user-agent", "")
-    wants_sse = "text/event-stream" in accept_header.lower()
-    # Also accept */* as valid - it means client accepts anything
-    accepts_all = accept_header.strip() == "*/*"
-    ua_lower = user_agent.lower()
-    is_openai_js = "openai/js" in ua_lower or "openclaw" in ua_lower
-    is_opencode = "opencode" in ua_lower or "ai-sdk" in ua_lower
-    if stream and (is_openai_js or is_opencode) and not wants_sse and not accepts_all:
-        print(
-            f"[COMPAT] Forcing non-streaming: accept={accept_header} user-agent={user_agent}",
-            flush=True,
-        )
-        stream = False
 
     # Call backend (handles both AI Queue and RunPod)
     backend_result, error, status_code = await backend.chat_completion(
@@ -1930,11 +1737,7 @@ async def chat_completions(request: Request):
         # Parse existing SSE data instead of making another request
         stream_data = result["_stream_data"]
         full_content = ""
-        full_reasoning = ""
         usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-        stream_tool_calls = []
-        has_tool_calls = False
-        finish_reason = None
 
         for line in stream_data.split("\n"):
             if line.strip() and line.startswith("data: "):
@@ -1944,49 +1747,17 @@ async def chat_completions(request: Request):
                     chunk = json.loads(line[6:])
                     if "choices" in chunk and chunk["choices"]:
                         delta = chunk["choices"][0].get("delta", {})
+                        if delta.get("content"):
+                            full_content += delta["content"]
                         tc = delta.get("tool_calls")
                         if tc:
-                            stream_tool_calls.extend(tc)
-                            has_tool_calls = True
-                        # Handle content and reasoning separately
-                        # When tool calls are present, content is skipped to avoid leaking thinking
-                        # But reasoning_content should still be captured
-                        if not has_tool_calls:
-                            if delta.get("content"):
-                                full_content += delta["content"]
-                        if delta.get("reasoning_content"):
-                            full_reasoning += delta["reasoning_content"]
-                        finish_reason = chunk["choices"][0].get("finish_reason")
+                            pass
                     if "usage" in chunk and chunk["usage"]:
                         usage = chunk["usage"]
                 except:
                     pass
 
         extracted_tc, text_content = process_content(full_content)
-        if stream_tool_calls and not extracted_tc:
-            extracted_tc = stream_tool_calls
-
-        print(
-            f"[DEBUG] Parsed stream: content='{full_content[:50]}...' if full_content else '(empty)', reasoning='{full_reasoning[:50]}...' if full_reasoning else '(empty)', tc={len(extracted_tc) if extracted_tc else 0}, finish={finish_reason}",
-            flush=True,
-        )
-
-        # Handle reasoning content based on show_reasoning setting
-        show_reasoning = True
-        vm_config = get_virtual_model(model)
-        if vm_config:
-            show_reasoning = vm_config.get("show_reasoning", 1) == 1
-
-        # When tool calls are present, don't add any content (reasoning or otherwise)
-        # to avoid breaking the tool_calls flow. The client expects finish_reason=tool_calls
-        if extracted_tc:
-            text_content = None
-        elif show_reasoning and full_reasoning:
-            # Only add reasoning when NO tool calls
-            if text_content:
-                text_content = full_reasoning + "\n\n" + text_content
-            else:
-                text_content = full_reasoning
 
         # Generate proper SSE with extracted tool calls
         job_id = f"chat-{int(time_module.time())}"
@@ -2011,35 +1782,14 @@ async def chat_completions(request: Request):
 
     # Extract content from response
     content = ""
-    reasoning_content = ""
     tool_calls_data = []
     usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
     if "choices" in result and result["choices"]:
         choice = result["choices"][0]
-        message = choice.get("message", {})
-        content = message.get("content", "") or ""
-        reasoning_content = message.get("reasoning_content", "") or ""
-        tool_calls_data = message.get("tool_calls", []) or []
+        content = choice.get("message", {}).get("content", "") or ""
+        tool_calls_data = choice.get("message", {}).get("tool_calls", []) or []
         usage = result.get("usage", usage)
-
-    # Handle reasoning content based on show_reasoning setting
-    show_reasoning = True
-    vm_config = get_virtual_model(model)
-    if vm_config:
-        show_reasoning = vm_config.get("show_reasoning", 1) == 1
-
-    # Append reasoning to content if show_reasoning is enabled
-    # Only add reasoning when there are NO tool calls (to avoid interfering with tool execution)
-    if show_reasoning and reasoning_content:
-        if content and not tool_calls_data:
-            content = reasoning_content + "\n\n" + content
-        elif not content and not tool_calls_data:
-            # Only use reasoning as fallback when no tool calls
-            content = reasoning_content
-    elif not show_reasoning and reasoning_content and not content:
-        # If reasoning is hidden but content is empty, use reasoning as fallback
-        content = reasoning_content
 
     # Extract system_fingerprint if present (OA-4)
     system_fingerprint = result.get("system_fingerprint")
@@ -2053,8 +1803,8 @@ async def chat_completions(request: Request):
 
     job_id = result.get("id", f"chat-{int(time_module.time())}")
 
-    # Handle streaming response - use original_stream to match client's request
-    if original_stream:
+    # Handle streaming response
+    if stream:
         return StreamingResponse(
             _generate_sse(
                 job_id=job_id,
@@ -2760,8 +2510,6 @@ async def anthropic_messages(request: Request):
         if hasattr(backend, "endpoint_type"):
             if backend.endpoint_type == "deepinfra":
                 endpoint = f"{endpoint}/v1/openai/chat/completions"
-            elif backend.endpoint_type == "queue":
-                endpoint = f"{endpoint}/v1/chat/completions"
             else:
                 endpoint = f"{endpoint}/v1/chat/completions"
         else:
@@ -3093,7 +2841,6 @@ async def embeddings(request: Request):
 def validate_session(flask_cookies=None):
     """Proxy session validation to ai-menu-system. Accepts cookies dict for FastAPI compatibility."""
     # Skip auth if disabled
-    print(f"DEBUG: AUTH_ENABLED = {AUTH_ENABLED}, type = {type(AUTH_ENABLED)}")
     if not AUTH_ENABLED:
         return {"valid": True, "user": "admin"}
 
@@ -3164,8 +2911,6 @@ def admin_index():
         user=auth.get("username"),
         endpoints=endpoints,
         virtual_models=virtual_models,
-        auth_enabled=AUTH_ENABLED,
-        use_ai_queue=get_setting("use_ai_queue", "false") == "true",
     )
 
 
@@ -3193,8 +2938,6 @@ def proxy_dashboard():
         user=auth.get("username"),
         endpoints=endpoints,
         virtual_models=virtual_models,
-        auth_enabled=AUTH_ENABLED,
-        use_ai_queue=get_setting("use_ai_queue", "false") == "true",
     )
 
 
@@ -3364,6 +3107,64 @@ def fetch_endpoint_models(endpoint_id):
         return flask_jsonify({"error": str(e)}), 500
 
 
+@flask_app.route("/virtual-models", methods=["GET", "POST"])
+def admin_virtual_models():
+    """Manage virtual models."""
+    auth = validate_session()
+    if not auth.get("valid"):
+        return redirect(f"{get_menu_login_url()}/login?redirect=/virtual-models")
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM endpoints WHERE enabled = 1 ORDER BY name")
+        endpoints = [dict(row) for row in cursor.fetchall()]
+
+        if flask_request.method == "POST":
+            if flask_request.is_json:
+                data = flask_request.get_json()
+            else:
+                data = flask_request.form
+
+            cursor.execute(
+                """
+                INSERT INTO virtual_models (name, endpoint_id, actual_model, description, cost_per_1k_tokens_in, cost_per_1k_tokens_out, disable_streaming, force_non_streaming, custom_headers, enabled)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+                (
+                    data.get("name"),
+                    int(data.get("endpoint_id")),
+                    data.get("actual_model"),
+                    data.get("description"),
+                    data.get("cost_per_1k_tokens_in") or 0,
+                    data.get("cost_per_1k_tokens_out") or 0,
+                    1 if data.get("disable_streaming") else 0,
+                    1 if data.get("force_non_streaming") else 0,
+                    data.get("custom_headers") or "",
+                    1 if data.get("enabled", True) else 0,
+                ),
+            )
+            conn.commit()
+
+            if flask_request.is_json:
+                return flask_jsonify({"status": "ok"})
+            return redirect("/virtual-models")
+
+        cursor.execute("""
+            SELECT vm.*, e.name as endpoint_name, e.url as endpoint_url
+            FROM virtual_models vm
+            LEFT JOIN endpoints e ON vm.endpoint_id = e.id
+            ORDER BY vm.name
+        """)
+        virtual_models = [dict(row) for row in cursor.fetchall()]
+
+    return render_template(
+        "admin_virtual_models.html",
+        user=auth.get("username"),
+        endpoints=endpoints,
+        virtual_models=virtual_models,
+    )
+
+
 @flask_app.route("/virtual-models/<int:vm_id>", methods=["PUT"])
 def update_virtual_model(vm_id):
     """Update virtual model."""
@@ -3380,9 +3181,7 @@ def update_virtual_model(vm_id):
             SET name = ?, endpoint_id = ?, actual_model = ?, description = ?, 
                 cost_per_1k_tokens_in = ?, cost_per_1k_tokens_out = ?, 
                 disable_streaming = ?, force_non_streaming = ?, custom_headers = ?,
-                enabled = ?, max_tokens = ?, temperature = ?, top_p = ?, system_prompt = ?,
-                show_reasoning = ?,
-                updated_at = strftime('%s', 'now')
+                enabled = ?, updated_at = strftime('%s', 'now')
             WHERE id = ?
         """,
             (
@@ -3396,54 +3195,7 @@ def update_virtual_model(vm_id):
                 1 if data.get("force_non_streaming") else 0,
                 data.get("custom_headers") or "",
                 1 if data.get("enabled", True) else 0,
-                data.get("max_tokens") or 0,
-                data.get("temperature") or 0,
-                data.get("top_p") or 1.0,
-                data.get("system_prompt") or "",
-                1 if data.get("show_reasoning", True) else 0,
                 vm_id,
-            ),
-        )
-        conn.commit()
-
-    return flask_jsonify({"status": "ok"})
-
-
-@flask_app.route("/virtual-models", methods=["POST"])
-def create_virtual_model():
-    """Create new virtual model."""
-    auth = validate_session()
-    if not auth.get("valid"):
-        return flask_jsonify({"error": "Unauthorized"}), 401
-
-    data = flask_request.get_json()
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            INSERT INTO virtual_models (
-                name, endpoint_id, actual_model, description,
-                cost_per_1k_tokens_in, cost_per_1k_tokens_out,
-                disable_streaming, force_non_streaming, custom_headers,
-                enabled, max_tokens, temperature, top_p, system_prompt, show_reasoning
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-            (
-                data.get("name"),
-                int(data.get("endpoint_id")),
-                data.get("actual_model"),
-                data.get("description"),
-                data.get("cost_per_1k_tokens_in") or 0,
-                data.get("cost_per_1k_tokens_out") or 0,
-                1 if data.get("disable_streaming") else 0,
-                1 if data.get("force_non_streaming") else 0,
-                data.get("custom_headers") or "",
-                1 if data.get("enabled", True) else 0,
-                data.get("max_tokens") or 0,
-                data.get("temperature") or 0,
-                data.get("top_p") or 1.0,
-                data.get("system_prompt") or "",
-                1 if data.get("show_reasoning", True) else 0,
             ),
         )
         conn.commit()
@@ -3539,169 +3291,16 @@ def api_admin_virtual_models():
     return flask_jsonify(vms)
 
 
-def save_setting(key, value):
-    """Save a setting to the database."""
-    try:
-        with get_db() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, strftime('%s', 'now'))",
-                (key, value),
-            )
-            conn.commit()
-        return True
-    except Exception as e:
-        print(f"Error saving setting {key}: {e}")
-        return False
-
-
-@flask_app.route("/session/validate", methods=["GET"])
-def session_validate():
-    """Local session validation - returns valid if auth disabled."""
-    if not AUTH_ENABLED:
-        return flask_jsonify(
-            {
-                "valid": True,
-                "user": "admin",
-                "auth_enabled": False,
-                "use_ai_queue": get_setting("use_ai_queue", "false") == "true",
-            }
-        )
-
-    # Otherwise check with remote AIMENU
-    try:
-        cookies = flask_request.cookies
-        resp = httpx.get(
-            f"{AIMENU_URL}/session/validate", cookies=dict(cookies), timeout=5
-        )
-        result = resp.json()
-        print(f"DEBUG: AIMENU response = {result}")
-        result["auth_enabled"] = True
-        result["use_ai_queue"] = get_setting("use_ai_queue", "false") == "true"
-        return flask_jsonify(result)
-    except Exception as e:
-        return flask_jsonify({"valid": False})
-
-
-@flask_app.route("/api/admin/settings", methods=["GET"])
-def api_admin_settings_get():
-    """API: Get all settings."""
-    auth = validate_session()
-    if not auth.get("valid"):
-        return flask_jsonify({"error": "Unauthorized"}), 401
-
-    settings = {}
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT key, value FROM settings")
-        for row in cursor.fetchall():
-            settings[row["key"]] = row["value"]
-
-    return flask_jsonify(settings)
-
-
-ENV_KEY_MAP = {
-    "api_port": "API_PORT",
-    "flask_port": "FLASK_PORT",
-    "aimenu_url": "AIMENU_URL",
-    "use_ai_queue": "USE_AI_QUEUE",
-    "ai_queue_url": "AI_QUEUE_URL",
-}
-
-
-def update_env_file(key, value):
-    """Update a setting in the .env file."""
-    env_key = ENV_KEY_MAP.get(key)
-    if not env_key:
-        return False
-
-    env_path = "/app/.env"
-    if not os.path.exists(env_path):
-        env_path = ".env"
-
-    try:
-        lines = []
-        if os.path.exists(env_path):
-            with open(env_path, "r") as f:
-                lines = f.readlines()
-
-        found = False
-        new_lines = []
-        for line in lines:
-            if line.strip().startswith(f"{env_key}="):
-                new_lines.append(f"{env_key}={value}\n")
-                found = True
-            else:
-                new_lines.append(line)
-
-        if not found:
-            new_lines.append(f"{env_key}={value}\n")
-
-        with open(env_path, "w") as f:
-            f.writelines(new_lines)
-
-        return True
-    except Exception as e:
-        print(f"Error updating .env file: {e}")
-        return False
-
-
-@flask_app.route("/api/admin/settings", methods=["POST"])
-def api_admin_settings_post():
-    """API: Update settings."""
-    auth = validate_session()
-    if not auth.get("valid"):
-        return flask_jsonify({"error": "Unauthorized"}), 401
-
-    data = flask_request.json
-    if not data:
-        return flask_jsonify({"error": "No data provided"}), 400
-
-    for key, value in data.items():
-        save_setting(key, value)
-        update_env_file(key, value)
-
-    port_changed = "api_port" in data or "flask_port" in data
-
-    if port_changed:
-        restart_message = "Port changed. Attempting to restart..."
-        try:
-            import subprocess
-
-            result = subprocess.run(
-                ["docker", "restart", "serverless-proxy"],
-                capture_output=True,
-                timeout=10,
-            )
-            if result.returncode == 0:
-                restart_message = "Settings saved. Server restarting..."
-            else:
-                restart_message = "Settings saved. Please restart the container manually: docker restart serverless-proxy"
-        except Exception as e:
-            restart_message = f"Settings saved. Please restart manually: docker restart serverless-proxy"
-    else:
-        restart_message = "Settings saved successfully."
-
-    return flask_jsonify(
-        {
-            "success": True,
-            "message": restart_message,
-        }
-    )
-
-
 if __name__ == "__main__":
     import uvicorn
     import threading
 
     # Run Flask in background thread
     def run_flask():
-        flask_app.run(
-            host="0.0.0.0", port=get_flask_port(), debug=False, use_reloader=False
-        )
+        flask_app.run(host="0.0.0.0", port=FLASK_PORT, debug=False, use_reloader=False)
 
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
 
     # Run FastAPI
-    uvicorn.run(app, host="0.0.0.0", port=get_api_port())
+    uvicorn.run(app, host="0.0.0.0", port=8002)

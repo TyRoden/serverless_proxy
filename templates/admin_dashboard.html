@@ -203,12 +203,6 @@
         <nav class="nav">
             <a href="#" onclick="console.log('Dashboard clicked'); event.preventDefault(); showTab('dashboard');">Dashboard</a>
             <a href="#" onclick="console.log('Usage clicked'); event.preventDefault(); showTab('usage');">Usage & Cost</a>
-            {% if auth_enabled %}
-            <a href="/menu">Menu</a>
-            {% if use_ai_queue %}
-            <a href="/queue-dashboard">AI Queue</a>
-            {% endif %}
-            {% endif %}
             <a href="#" onclick="console.log('Settings clicked'); event.preventDefault(); showTab('settings');">Settings</a>
         </nav>
         

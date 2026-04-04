@@ -1,0 +1,57 @@
+version: '3'
+
+vars:
+  PROJECT_NAME: serverless-proxy
+  PORT: 8002
+
+tasks:
+  default:
+    desc: List available tasks
+    cmds:
+      - task --list
+
+  docker:up:
+    desc: Start the proxy in Docker
+    cmds:
+      - docker compose up -d --build
+
+  docker:stop:
+    desc: Stop the proxy
+    cmds:
+      - docker compose down
+
+  docker:restart:
+    desc: Restart the proxy
+    cmds:
+      - docker compose restart
+
+  docker:logs:
+    desc: View proxy logs
+    cmds:
+      - docker logs -f {{.PROJECT_NAME}}
+
+  docker:status:
+    desc: Check if proxy is running
+    cmds:
+      - docker ps | grep {{.PROJECT_NAME}}
+
+  test:models:
+    desc: Test /v1/models endpoint
+    cmds:
+      - curl -s http://localhost:{{.PORT}}/v1/models | jq .
+
+  test:chat:
+    desc: Test chat completions (non-streaming)
+    cmds:
+      - |
+        curl -s -X POST http://localhost:{{.PORT}}/v1/chat/completions \
+          -H "Content-Type: application/json" \
+          -d '{"model": "project-system-ai", "messages": [{"role": "user", "content": "Hello!"}]}' | jq .
+
+  test:stream:
+    desc: Test chat completions (streaming)
+    cmds:
+      - |
+        curl -s -X POST http://localhost:{{.PORT}}/v1/chat/completions \
+          -H "Content-Type: application/json" \
+          -d '{"model": "project-system-ai", "messages": [{"role": "user", "content": "Hi"}], "stream": true}'
