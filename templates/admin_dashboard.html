@@ -203,8 +203,13 @@
         <nav class="nav">
             <a href="#" onclick="console.log('Dashboard clicked'); event.preventDefault(); showTab('dashboard');">Dashboard</a>
             <a href="#" onclick="console.log('Usage clicked'); event.preventDefault(); showTab('usage');">Usage & Cost</a>
+            {% if auth_enabled %}
             <a href="/menu">Menu</a>
+            {% if use_ai_queue %}
             <a href="/queue-dashboard">AI Queue</a>
+            {% endif %}
+            {% endif %}
+            <a href="#" onclick="console.log('Settings clicked'); event.preventDefault(); showTab('settings');">Settings</a>
         </nav>
         
         <!-- Dashboard Tab Content -->
@@ -279,6 +284,43 @@
         <div class="card">
             <h2>Daily Breakdown</h2>
             <div id="daily-breakdown" style="margin-top:16px;"></div>
+        </div>
+    </div>
+
+    <!-- Settings Tab Content -->
+    <div id="settings-section" class="hidden">
+        <div class="card">
+            <h2>Server Settings</h2>
+            <p style="color:var(--text-secondary);margin-bottom:16px;font-size:14px;">
+                Configure server ports and AI Queue integration. Port changes require a container restart.
+            </p>
+            <div class="form-group">
+                <label for="api-port">API Port</label>
+                <input type="number" id="api-port" value="8002" min="1" max="65535">
+                <small>OpenAI-compatible API port</small>
+            </div>
+            <div class="form-group">
+                <label for="flask-port">Admin Port</label>
+                <input type="number" id="flask-port" value="5001" min="1" max="65535">
+                <small>Admin dashboard port</small>
+            </div>
+            <div class="form-group">
+                <label for="aimenu-url">AI Menu URL</label>
+                <input type="text" id="aimenu-url" value="http://localhost:5000" placeholder="http://localhost:5000">
+                <small>URL for AI Menu authentication service</small>
+            </div>
+            <div class="form-group">
+                <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                    <input type="checkbox" id="use-ai-queue" onchange="toggleAiQueueUrl()">
+                    <span>Enable AI Queue Integration</span>
+                </label>
+            </div>
+            <div class="form-group" id="ai-queue-url-group" style="display:none;">
+                <label for="ai-queue-url">AI Queue URL</label>
+                <input type="text" id="ai-queue-url" value="http://host.docker.internal:8102" placeholder="http://host.docker.internal:8102">
+                <small>AI Queue Master endpoint</small>
+            </div>
+            <button class="btn btn-primary" onclick="saveSettings()">Save Settings</button>
         </div>
     </div>
 
@@ -457,10 +499,17 @@
         if (tabName === 'usage') {
             document.getElementById('dashboard-section').classList.add('hidden');
             document.getElementById('usage-section').classList.remove('hidden');
+            document.getElementById('settings-section').classList.add('hidden');
             loadUsage();
+        } else if (tabName === 'settings') {
+            document.getElementById('dashboard-section').classList.add('hidden');
+            document.getElementById('usage-section').classList.add('hidden');
+            document.getElementById('settings-section').classList.remove('hidden');
+            loadSettings();
         } else {
             document.getElementById('dashboard-section').classList.remove('hidden');
             document.getElementById('usage-section').classList.add('hidden');
+            document.getElementById('settings-section').classList.add('hidden');
             loadEndpoints();
             loadVirtualModels();
         }
@@ -1052,6 +1101,52 @@
             .catch(err => {
                 document.getElementById('virtual-models-list').innerHTML = '<p style="color:var(--accent-red);">Error loading: ' + err.message + '</p>';
             });
+    }
+
+    // Settings tab
+    function loadSettings() {
+        fetch('/api/admin/settings', { credentials: 'same-origin' })
+            .then(resp => resp.json())
+            .then(data => {
+                document.getElementById('api-port').value = data.api_port || '8002';
+                document.getElementById('flask-port').value = data.flask_port || '5001';
+                document.getElementById('aimenu-url').value = data.aimenu_url || 'http://localhost:5000';
+                document.getElementById('use-ai-queue').checked = data.use_ai_queue === 'true';
+                document.getElementById('ai-queue-url').value = data.ai_queue_url || 'http://host.docker.internal:8102';
+                toggleAiQueueUrl();
+            })
+            .catch(err => console.error('Error loading settings:', err));
+    }
+
+    function toggleAiQueueUrl() {
+        const useQueue = document.getElementById('use-ai-queue').checked;
+        document.getElementById('ai-queue-url-group').style.display = useQueue ? 'block' : 'none';
+    }
+
+    function saveSettings() {
+        const settings = {
+            api_port: document.getElementById('api-port').value,
+            flask_port: document.getElementById('flask-port').value,
+            aimenu_url: document.getElementById('aimenu-url').value,
+            use_ai_queue: document.getElementById('use-ai-queue').checked ? 'true' : 'false',
+            ai_queue_url: document.getElementById('ai-queue-url').value,
+        };
+
+        fetch('/api/admin/settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(settings),
+            credentials: 'same-origin'
+        })
+        .then(resp => resp.json())
+        .then(data => {
+            if (data.success) {
+                alert(data.message || 'Settings saved!');
+            } else {
+                alert('Error: ' + (data.error || 'Unknown error'));
+            }
+        })
+        .catch(err => alert('Error saving settings: ' + err.message));
     }
     </script>
 </body>

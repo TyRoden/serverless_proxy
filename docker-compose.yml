@@ -1,5 +1,5 @@
 services:
-  runpod-proxy:
+  serverless-proxy:
     build: .
     container_name: serverless-proxy
     ports:
@@ -15,6 +15,7 @@ services:
       - ai-queue-master_default
     volumes:
       - ./data:/data
+      - ./.env:/app/.env:rw
 
 networks:
   default:

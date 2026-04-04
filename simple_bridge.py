@@ -42,7 +42,7 @@ from flask import (
 import secrets
 
 # Flask app for admin routes
-FLASK_PORT = int(os.getenv("FLASK_PORT", 5001))
+FLASK_PORT = get_flask_port()
 flask_app = Flask(__name__, template_folder="templates", static_folder="static")
 flask_app.secret_key = os.getenv("SECRET_KEY", secrets.token_hex(32))
 
@@ -69,6 +69,30 @@ def get_db():
         yield conn
     finally:
         conn.close()
+
+
+def get_setting(key, default=None):
+    """Get a setting from the database, fallback to default."""
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
+            row = cursor.fetchone()
+            if row:
+                return row["value"]
+    except Exception as e:
+        print(f"Error getting setting {key}: {e}")
+    return default
+
+
+def get_api_port():
+    """Get API port from DB, fallback to env var or default."""
+    return int(get_setting("api_port", os.getenv("API_PORT", "8002")))
+
+
+def get_flask_port():
+    """Get Flask/Admin port from DB, fallback to env var or default."""
+    return int(get_setting("flask_port", os.getenv("FLASK_PORT", "5001")))
 
 
 def init_database():
@@ -152,6 +176,34 @@ def init_database():
                 FOREIGN KEY (endpoint_id) REFERENCES endpoints(id)
             )
         """)
+
+        # Settings table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+            )
+        """)
+
+        # Insert default settings if not exist
+        cursor.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('api_port', '8002')"
+        )
+        cursor.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('flask_port', '5001')"
+        )
+        cursor.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('aimenu_url', 'http://localhost:5000')"
+        )
+        cursor.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('use_ai_queue', 'false')"
+        )
+        cursor.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('ai_queue_url', 'http://host.docker.internal:8102')"
+        )
+
+        conn.commit()
 
         # Migration: Add new columns if they don't exist
         try:
@@ -3111,6 +3163,8 @@ def admin_index():
         user=auth.get("username"),
         endpoints=endpoints,
         virtual_models=virtual_models,
+        auth_enabled=AUTH_ENABLED,
+        use_ai_queue=get_setting("use_ai_queue", "false") == "true",
     )
 
 
@@ -3138,6 +3192,8 @@ def proxy_dashboard():
         user=auth.get("username"),
         endpoints=endpoints,
         virtual_models=virtual_models,
+        auth_enabled=AUTH_ENABLED,
+        use_ai_queue=get_setting("use_ai_queue", "false") == "true",
     )
 
 
@@ -3482,16 +3538,141 @@ def api_admin_virtual_models():
     return flask_jsonify(vms)
 
 
+def save_setting(key, value):
+    """Save a setting to the database."""
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, strftime('%s', 'now'))",
+                (key, value),
+            )
+            conn.commit()
+        return True
+    except Exception as e:
+        print(f"Error saving setting {key}: {e}")
+        return False
+
+
+@flask_app.route("/api/admin/settings", methods=["GET"])
+def api_admin_settings_get():
+    """API: Get all settings."""
+    auth = validate_session()
+    if not auth.get("valid"):
+        return flask_jsonify({"error": "Unauthorized"}), 401
+
+    settings = {}
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT key, value FROM settings")
+        for row in cursor.fetchall():
+            settings[row["key"]] = row["value"]
+
+    return flask_jsonify(settings)
+
+
+ENV_KEY_MAP = {
+    "api_port": "API_PORT",
+    "flask_port": "FLASK_PORT",
+    "aimenu_url": "AIMENU_URL",
+    "use_ai_queue": "USE_AI_QUEUE",
+    "ai_queue_url": "AI_QUEUE_URL",
+}
+
+
+def update_env_file(key, value):
+    """Update a setting in the .env file."""
+    env_key = ENV_KEY_MAP.get(key)
+    if not env_key:
+        return False
+
+    env_path = "/app/.env"
+    if not os.path.exists(env_path):
+        env_path = ".env"
+
+    try:
+        lines = []
+        if os.path.exists(env_path):
+            with open(env_path, "r") as f:
+                lines = f.readlines()
+
+        found = False
+        new_lines = []
+        for line in lines:
+            if line.strip().startswith(f"{env_key}="):
+                new_lines.append(f"{env_key}={value}\n")
+                found = True
+            else:
+                new_lines.append(line)
+
+        if not found:
+            new_lines.append(f"{env_key}={value}\n")
+
+        with open(env_path, "w") as f:
+            f.writelines(new_lines)
+
+        return True
+    except Exception as e:
+        print(f"Error updating .env file: {e}")
+        return False
+
+
+@flask_app.route("/api/admin/settings", methods=["POST"])
+def api_admin_settings_post():
+    """API: Update settings."""
+    auth = validate_session()
+    if not auth.get("valid"):
+        return flask_jsonify({"error": "Unauthorized"}), 401
+
+    data = flask_request.json
+    if not data:
+        return flask_jsonify({"error": "No data provided"}), 400
+
+    for key, value in data.items():
+        save_setting(key, value)
+        update_env_file(key, value)
+
+    port_changed = "api_port" in data or "flask_port" in data
+
+    if port_changed:
+        restart_message = "Port changed. Attempting to restart..."
+        try:
+            import subprocess
+
+            result = subprocess.run(
+                ["docker", "restart", "serverless-proxy"],
+                capture_output=True,
+                timeout=10,
+            )
+            if result.returncode == 0:
+                restart_message = "Settings saved. Server restarting..."
+            else:
+                restart_message = "Settings saved. Please restart the container manually: docker restart serverless-proxy"
+        except Exception as e:
+            restart_message = f"Settings saved. Please restart manually: docker restart serverless-proxy"
+    else:
+        restart_message = "Settings saved successfully."
+
+    return flask_jsonify(
+        {
+            "success": True,
+            "message": restart_message,
+        }
+    )
+
+
 if __name__ == "__main__":
     import uvicorn
     import threading
 
     # Run Flask in background thread
     def run_flask():
-        flask_app.run(host="0.0.0.0", port=FLASK_PORT, debug=False, use_reloader=False)
+        flask_app.run(
+            host="0.0.0.0", port=get_flask_port(), debug=False, use_reloader=False
+        )
 
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
 
     # Run FastAPI
-    uvicorn.run(app, host="0.0.0.0", port=8002)
+    uvicorn.run(app, host="0.0.0.0", port=get_api_port())
