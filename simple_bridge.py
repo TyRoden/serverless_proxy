@@ -1231,8 +1231,10 @@ def get_backend(model_name: str = None) -> LLMBackend:
         if vm:
             return create_backend_from_virtual_model(vm)
 
-    # Fallback to env var configuration
-    use_queue = os.getenv("USE_AI_QUEUE", "false").lower() == "true"
+    # Check database for use_ai_queue setting, fallback to env var
+    use_queue = (
+        get_setting("use_ai_queue", os.getenv("USE_AI_QUEUE", "false")) == "true"
+    )
 
     if use_queue:
         return AIQueueBackend()
@@ -2111,34 +2113,82 @@ async def chat_completions(request: Request):
             }
         )
 
-    # Log usage
-    if not stream:
-        response_time_ms = int((time_module.time() - start_time) * 1000)
-        endpoint_name = None
-        endpoint_id = None
-        try:
-            with get_db() as conn:
-                cursor = conn.cursor()
+    # Log usage for both streaming and non-streaming
+    response_time_ms = int((time_module.time() - start_time) * 1000)
+    endpoint_name = None
+    endpoint_id = None
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT name, id FROM virtual_models WHERE name = ?
+            """,
+                (virtual_model,),
+            )
+            row = cursor.fetchone()
+            if row:
+                endpoint_name = row[0] if row[0] else virtual_model
                 cursor.execute(
                     """
-                    SELECT name, id FROM virtual_models WHERE name = ?
+                    SELECT endpoint_id FROM virtual_models WHERE name = ?
                 """,
                     (virtual_model,),
                 )
-                row = cursor.fetchone()
-                if row:
-                    endpoint_name = row[0] if row[0] else virtual_model
-                    cursor.execute(
-                        """
-                        SELECT endpoint_id FROM virtual_models WHERE name = ?
-                    """,
-                        (virtual_model,),
-                    )
-                    endpoint_id = cursor.fetchone()[0]
-        except:
-            pass
-        log_chat_usage(
-            virtual_model, endpoint_name, endpoint_id, usage, response_time_ms
+                endpoint_id = cursor.fetchone()[0]
+    except:
+        pass
+    log_chat_usage(virtual_model, endpoint_name, endpoint_id, usage, response_time_ms)
+
+    # Build and return response
+    response_content = {
+        "id": job_id,
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [],
+        "usage": usage,
+    }
+
+    # Add system_fingerprint if available (OA-4)
+    if system_fingerprint:
+        response_content["system_fingerprint"] = system_fingerprint
+
+    # Determine finish_reason: "tool_calls" only if tool calls present AND no text content
+    finish_reason = "tool_calls" if (tool_calls_data and not text_content) else "stop"
+
+    if tool_calls_data:
+        response_content["choices"].append(
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": text_content,
+                    "tool_calls": [
+                        {
+                            "id": tc["id"],
+                            "type": "function",
+                            "function": {
+                                "name": tc["function"]["name"],
+                                "arguments": tc["function"]["arguments"],
+                            },
+                        }
+                        for tc in tool_calls_data
+                    ],
+                },
+                "finish_reason": finish_reason,
+            }
+        )
+    elif text_content is not None:
+        response_content["choices"].append(
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": text_content,
+                },
+                "finish_reason": finish_reason,
+            }
         )
 
     return JSONResponse(content=response_content)
@@ -2250,10 +2300,15 @@ async def _generate_sse(
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
-    backend_healthy = await BACKEND.health_check()
+    # Check database for use_ai_queue setting
+    use_queue = (
+        get_setting("use_ai_queue", os.getenv("USE_AI_QUEUE", "false")) == "true"
+    )
+    backend = AIQueueBackend() if use_queue else RunPodBackend()
+    backend_healthy = await backend.health_check()
     return {
         "status": "healthy" if backend_healthy else "unhealthy",
-        "backend": type(BACKEND).__name__,
+        "backend": type(backend).__name__,
         "timestamp": int(time.time()),
     }
 
