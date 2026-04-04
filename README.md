@@ -15,15 +15,111 @@ Client (OpenAI format) → Serverless Proxy (port 8002) → Configured Backends
 
 ## Quick Start
 
+This guide walks you through getting the Serverless Proxy up and running in just a few minutes.
+
+### Prerequisites
+
+**Install Docker first** if you don't have it:
+- **Docker Desktop** (Windows/Mac): https://www.docker.com/products/docker-desktop
+- **Docker Engine** (Linux): https://docs.docker.com/engine/install/
+
+### Step 1: Clone and Setup
+
 ```bash
+# Clone the repository
 git clone https://github.com/TyRoden/serverless_proxy.git
 cd serverless_proxy
-cp .env.example .env
-# Edit .env with your configuration
-docker compose up -d --build
 
-# Access admin UI at https://your-domain/proxy-dashboard
-# API available at http://localhost:8002/v1/chat/completions
+# Copy the example environment file
+cp .env.example .env
+```
+
+### Step 2: Configure Your Environment
+
+Open the `.env` file in a text editor and check these settings:
+
+```bash
+# Required: Set AUTH_ENABLED to false for first-time setup (no auth service needed yet)
+AUTH_ENABLED=false
+
+# Optional: If using Ollama locally, it should work out of the box
+# Optional: If using RunPod or another provider, add your API key and endpoint below
+# RUNPOD_API_KEY=your_api_key_here
+# RUNPOD_ENDPOINT_ID=your_endpoint_id_here
+# MODEL_NAME=model-name-on-your-backend
+# ENDPOINT_TYPE=ollama  (or: openai, runpod, together, vllm)
+```
+
+### Step 3: Start the Proxy
+
+```bash
+# Build and start the container
+docker compose up -d --build
+```
+
+### Step 4: Configure in the Admin UI
+
+1. Open your browser and go to: **http://localhost:5001/proxy-dashboard**
+2. You'll see the admin dashboard (no login needed since AUTH_ENABLED=false)
+
+#### Add an Endpoint
+3. Click **+ Add Endpoint** under Endpoints
+4. Fill in:
+   - **Name**: Something like "My Ollama" or "RunPod Production"
+   - **URL**: Your backend URL (e.g., `http://localhost:11434` for local Ollama, or your RunPod endpoint URL)
+   - **API Key**: Your API key if required (leave blank for local Ollama)
+   - **Type**: Select the type (`ollama`, `openai`, `runpod`, etc.)
+   - Click **Save**
+
+#### Add a Virtual Model
+5. Click **+ Add Virtual Model** under Virtual Models
+6. Fill in:
+   - **Name**: What you want to call it (e.g., `gpt-4`, `llama-production`)
+   - **Endpoint**: Select the endpoint you just created
+   - **Actual Model**: The actual model name on the backend (e.g., `gpt-4o`, `llama3:70b`)
+   - Click **Save**
+
+### Step 5: Use the Proxy
+
+Your AI tools can now connect to the proxy:
+
+| Service | URL |
+|---------|-----|
+| API Endpoint | `http://localhost:8002` |
+| Admin UI | `http://localhost:5001/proxy-dashboard` |
+
+**Example - Using with OpenWebUI or any OpenAI-compatible client:**
+
+```
+Base URL: http://localhost:8002/v1
+API Key: any-key-works (or your endpoint's key)
+Model: the-virtual-model-name-you-created
+```
+
+**Example - Test with curl:**
+
+```bash
+curl http://localhost:8002/v1/models
+
+curl -X POST http://localhost:8002/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "your-virtual-model-name",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
+```
+
+### Troubleshooting
+
+```bash
+# Check if the proxy is running
+curl http://localhost:8002/health
+
+# View container logs
+docker logs serverless-proxy
+
+# Restart the container
+docker restart serverless-proxy
 ```
 
 ## Configuration
