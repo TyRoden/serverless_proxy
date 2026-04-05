@@ -259,8 +259,51 @@ AI_QUEUE_PRIORITY=NORMAL
 - **Streaming & non-streaming** — Full SSE streaming support
 - **Job polling** — Automatically polls for queued job completion
 - **Session-based auth** — Uses AI Menu System for admin authentication
+- **Claude Code / OpenCode support** — Compatible with AI coding assistants
 
-## Troubleshooting
+## Supporting AI Coding Assistants (Claude Code, OpenCode, Cursor, etc.)
+
+AI coding assistants require specific configurations to work properly. The proxy includes special handling to ensure compatibility:
+
+### Proxy Adjustments for AI Coding Assistants
+
+- **Tool call normalization** — Automatically fixes malformed tool calls from models
+- **System prompt preservation** — Maintains context across code generation sessions
+- **Streaming optimization** — Real-time tool execution for interactive coding
+- **Response format conversion** — Ensures OpenAI-compatible format for tool results
+- **Error handling** — Graceful fallbacks when models produce unexpected output
+
+### Model Requirements
+
+Use models with strong tool-calling capabilities. Recommended:
+- **Qwen series** (e.g., Qwen3-80B, Qwen3-Coder) - Excellent tool calling
+- **Claude 3.5+** - Native tool support via Anthropic API
+- **DeepSeek-V3** - Good tool calling performance
+
+### Endpoint Configuration
+
+For best results with coding assistants:
+1. Use **OpenAI-compatible** or **DeepInfra** endpoint types
+2. Enable **streaming** for real-time tool execution
+3. Configure adequate **max_tokens** (8192-128000 for code generation)
+
+### Virtual Model Setup
+
+When creating virtual models for coding assistants:
+- Set appropriate `max_tokens` to allow long code outputs
+- Use models that support tool calls (check provider docs)
+- For Anthropic models, ensure endpoint type is set to `anthropic`
+
+### Troubleshooting
+
+**Tools not executing:**
+- Check model supports tool calls (not all models do)
+- Verify streaming is enabled
+- Check response format in logs
+
+**Code execution errors:**
+- Verify model output is valid JSON for tool calls
+- Check custom headers if required by your setup
 
 ```bash
 # View container logs
