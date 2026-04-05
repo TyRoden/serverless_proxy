@@ -272,6 +272,7 @@ AI coding assistants require specific configurations to work properly. The proxy
 - **Streaming optimization** — Real-time tool execution for interactive coding
 - **Response format conversion** — Ensures OpenAI-compatible format for tool results
 - **Error handling** — Graceful fallbacks when models produce unexpected output
+- **Claude Code compatibility** — Claude Code works best with OpenAI-compatible endpoints through the proxy, even when using non-OpenAI models
 
 ### Model Requirements
 
