@@ -100,8 +100,8 @@ def init_database():
                 endpoint_id INTEGER NOT NULL,
                 actual_model TEXT NOT NULL,
                 description TEXT,
-                cost_per_1k_tokens_in REAL DEFAULT 0,
-                cost_per_1k_tokens_out REAL DEFAULT 0,
+                cost_per_1m_tokens_in REAL DEFAULT 0,
+                cost_per_1m_tokens_out REAL DEFAULT 0,
                 disable_streaming INTEGER DEFAULT 0,
                 force_non_streaming INTEGER DEFAULT 0,
                 custom_headers TEXT,
@@ -159,32 +159,42 @@ def init_database():
                 pass
 
         try:
-            cursor.execute("SELECT cost_per_1k_tokens_in FROM virtual_models LIMIT 1")
+            cursor.execute("SELECT cost_per_1m_tokens_in FROM virtual_models LIMIT 1")
         except:
-            try:
-                cursor.execute(
-                    "ALTER TABLE virtual_models ADD COLUMN cost_per_1k_tokens_in REAL DEFAULT 0"
-                )
-            except:
-                pass
-            try:
-                cursor.execute(
-                    "ALTER TABLE virtual_models ADD COLUMN cost_per_1k_tokens_out REAL DEFAULT 0"
-                )
-            except:
-                pass
-                try:
-                    cursor.execute(
-                        "ALTER TABLE virtual_models ADD COLUMN disable_streaming INTEGER DEFAULT 0"
-                    )
-                except:
-                    pass
-                try:
-                    cursor.execute(
-                        "ALTER TABLE virtual_models ADD COLUMN force_non_streaming INTEGER DEFAULT 0"
-                    )
-                except:
-                    pass
+            cursor.execute(
+                "ALTER TABLE virtual_models ADD COLUMN cost_per_1m_tokens_in REAL DEFAULT 0"
+            )
+            cursor.execute(
+                "ALTER TABLE virtual_models ADD COLUMN cost_per_1m_tokens_out REAL DEFAULT 0"
+            )
+
+        try:
+            cursor.execute(
+                "SELECT cost_per_1k_tokens_in FROM virtual_models WHERE cost_per_1k_tokens_in > 0 LIMIT 1"
+            )
+            if cursor.fetchone():
+                cursor.execute("""
+                    UPDATE virtual_models 
+                    SET cost_per_1m_tokens_in = COALESCE(cost_per_1k_tokens_in, 0),
+                        cost_per_1m_tokens_out = COALESCE(cost_per_1k_tokens_out, 0)
+                    WHERE cost_per_1k_tokens_in > 0 OR cost_per_1k_tokens_out > 0
+                """)
+                conn.commit()
+        except:
+            pass
+
+        try:
+            cursor.execute(
+                "ALTER TABLE virtual_models ADD COLUMN disable_streaming INTEGER DEFAULT 0"
+            )
+        except:
+            pass
+        try:
+            cursor.execute(
+                "ALTER TABLE virtual_models ADD COLUMN force_non_streaming INTEGER DEFAULT 0"
+            )
+        except:
+            pass
                 try:
                     cursor.execute(
                         "ALTER TABLE virtual_models ADD COLUMN custom_headers TEXT"
@@ -255,7 +265,7 @@ def get_virtual_model_cost(virtual_model_name):
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT cost_per_1k_tokens_in, cost_per_1k_tokens_out FROM virtual_models WHERE name = ?",
+            "SELECT cost_per_1m_tokens_in, cost_per_1m_tokens_out FROM virtual_models WHERE name = ?",
             (virtual_model_name,),
         )
         result = cursor.fetchone()
@@ -2262,15 +2272,15 @@ async def update_virtual_model_cost(vm_id: int, request: Request):
 
     try:
         data = await request.json()
-        cost_in = data.get("cost_per_1k_tokens_in", 0)
-        cost_out = data.get("cost_per_1k_tokens_out", 0)
+        cost_in = data.get("cost_per_1m_tokens_in", 0)
+        cost_out = data.get("cost_per_1m_tokens_out", 0)
 
         with get_db() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
                 UPDATE virtual_models
-                SET cost_per_1k_tokens_in = ?, cost_per_1k_tokens_out = ?, updated_at = strftime('%s', 'now')
+                SET cost_per_1m_tokens_in = ?, cost_per_1m_tokens_out = ?, updated_at = strftime('%s', 'now')
                 WHERE id = ?
             """,
                 (cost_in, cost_out, vm_id),
@@ -3127,7 +3137,7 @@ def admin_virtual_models():
 
             cursor.execute(
                 """
-                INSERT INTO virtual_models (name, endpoint_id, actual_model, description, cost_per_1k_tokens_in, cost_per_1k_tokens_out, disable_streaming, force_non_streaming, custom_headers, enabled)
+                INSERT INTO virtual_models (name, endpoint_id, actual_model, description, cost_per_1m_tokens_in, cost_per_1m_tokens_out, disable_streaming, force_non_streaming, custom_headers, enabled)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
                 (
@@ -3135,8 +3145,8 @@ def admin_virtual_models():
                     int(data.get("endpoint_id")),
                     data.get("actual_model"),
                     data.get("description"),
-                    data.get("cost_per_1k_tokens_in") or 0,
-                    data.get("cost_per_1k_tokens_out") or 0,
+                    data.get("cost_per_1m_tokens_in") or 0,
+                    data.get("cost_per_1m_tokens_out") or 0,
                     1 if data.get("disable_streaming") else 0,
                     1 if data.get("force_non_streaming") else 0,
                     data.get("custom_headers") or "",
@@ -3179,7 +3189,7 @@ def update_virtual_model(vm_id):
             """
             UPDATE virtual_models 
             SET name = ?, endpoint_id = ?, actual_model = ?, description = ?, 
-                cost_per_1k_tokens_in = ?, cost_per_1k_tokens_out = ?, 
+                cost_per_1m_tokens_in = ?, cost_per_1m_tokens_out = ?, 
                 disable_streaming = ?, force_non_streaming = ?, custom_headers = ?,
                 enabled = ?, updated_at = strftime('%s', 'now')
             WHERE id = ?
@@ -3189,8 +3199,8 @@ def update_virtual_model(vm_id):
                 int(data.get("endpoint_id")),
                 data.get("actual_model"),
                 data.get("description"),
-                data.get("cost_per_1k_tokens_in") or 0,
-                data.get("cost_per_1k_tokens_out") or 0,
+                data.get("cost_per_1m_tokens_in") or 0,
+                data.get("cost_per_1m_tokens_out") or 0,
                 1 if data.get("disable_streaming") else 0,
                 1 if data.get("force_non_streaming") else 0,
                 data.get("custom_headers") or "",

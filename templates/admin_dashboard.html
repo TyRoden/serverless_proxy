@@ -350,6 +350,9 @@
                                     <option value="vllm">vLLM</option>
                                     <option value="together">Together AI</option>
                                     <option value="runpod">RunPod Serverless</option>
+                                    <option value="anthropic">Anthropic</option>
+                                    <option value="deepinfra">DeepInfra</option>
+                                    <option value="queue">Queue Based</option>
                                 </select>
                             </div>
                             <div class="form-group">
@@ -407,19 +410,31 @@
                         <div class="form-row">
                             <div class="form-group">
                                 <label for="vm-cost-in">Cost per 1M Input Tokens ($)</label>
-                                <input type="number" id="vm-cost-in" name="cost_per_1k_tokens_in" value="0" step="0.0001" min="0">
+                                <input type="number" id="vm-cost-in" name="cost_per_1m_tokens_in" value="0" step="0.0001" min="0">
                                 <small>Price per 1M tokens you send (prompt)</small>
                             </div>
                             <div class="form-group">
                                 <label for="vm-cost-out">Cost per 1M Output Tokens ($)</label>
-                                <input type="number" id="vm-cost-out" name="cost_per_1k_tokens_out" value="0" step="0.0001" min="0">
+                                <input type="number" id="vm-cost-out" name="cost_per_1m_tokens_out" value="0" step="0.0001" min="0">
                                 <small>Price per 1M tokens you receive (completion)</small>
                             </div>
                         </div>
                         <div class="form-row">
                             <div class="form-group">
+                                <label for="vm-cost-in-cached">Cost per 1M Cached Input Tokens ($)</label>
+                                <input type="number" id="vm-cost-in-cached" name="cost_per_1m_tokens_in_cached" value="0" step="0.0001" min="0">
+                                <small>Price per 1M cached tokens (lower rate)</small>
+                            </div>
+                            <div class="form-group">
+                                <label for="vm-cost-out-cached">Cost per 1M Cached Output Tokens ($)</label>
+                                <input type="number" id="vm-cost-out-cached" name="cost_per_1m_tokens_out_cached" value="0" step="0.0001" min="0">
+                                <small>Price per 1M cached output tokens</small>
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
                                 <label for="vm-max-tokens">Max Tokens (default)</label>
-                                <input type="number" id="vm-max-tokens" name="max_tokens" value="2048" min="1" max="128000">
+                                <input type="number" id="vm-max-tokens" name="max_tokens" value="2048" min="1" max="1000000">
                             </div>
                             <div class="form-group">
                                 <label for="vm-temperature">Temperature (default)</label>
@@ -589,10 +604,12 @@
                 <div style="color:var(--text-secondary);font-size:12px;text-transform:uppercase;">Total Tokens</div>
                 <div style="font-size:28px;font-weight:bold;color:var(--accent-green);margin-top:8px;">${formatNumber(summary.total_tokens)}</div>
                 <div style="font-size:12px;margin-top:4px;">In: ${formatNumber(summary.total_prompt_tokens)} | Out: ${formatNumber(summary.total_completion_tokens)}</div>
+                <div style="font-size:11px;margin-top:4px;color:var(--text-secondary);">Cached: ${formatNumber(summary.total_cached_input_tokens || 0)}</div>
             </div>
             <div class="card" style="margin-top:0;padding:16px;">
                 <div style="color:var(--text-secondary);font-size:12px;text-transform:uppercase;">Total Cost</div>
                 <div style="font-size:28px;font-weight:bold;color:var(--accent-yellow);margin-top:8px;">$${summary.total_cost.toFixed(4)}</div>
+                <div style="font-size:11px;margin-top:4px;color:var(--text-secondary);">Cached: $${(summary.total_cached_cost || 0).toFixed(4)}</div>
             </div>
             <div class="card" style="margin-top:0;padding:16px;">
                 <div style="color:var(--text-secondary);font-size:12px;text-transform:uppercase;">Avg Response</div>
@@ -612,14 +629,17 @@
             <tr>
                 <td><strong>${day.date}</strong></td>
                 <td>${formatNumber(day.prompt_tokens)}</td>
+                <td>${formatNumber(day.cached_input_tokens || 0)}</td>
                 <td>${formatNumber(day.completion_tokens)}</td>
+                <td>$${day.cost_estimate?.toFixed(4) || '0.0000'}</td>
+                <td>$${(day.cached_cost_estimate || 0).toFixed(4)}</td>
                 <td>${formatNumber(day.requests)}</td>
             </tr>
         `).join('');
         
         document.getElementById('daily-breakdown').innerHTML = `
             <table>
-                <thead><tr><th>Date</th><th>Prompt Tokens</th><th>Completion Tokens</th><th>Requests</th></tr></thead>
+                <thead><tr><th>Date</th><th>Prompt Tokens</th><th>Cached</th><th>Completion</th><th>Cost</th><th>Cached Cost</th><th>Requests</th></tr></thead>
                 <tbody>${rows}</tbody>
             </table>
         `;
@@ -877,8 +897,10 @@
         document.getElementById('vm-name').value = data ? data.name : '';
         document.getElementById('vm-model').value = data ? data.actual_model : '';
         document.getElementById('vm-desc').value = data ? (data.description || '') : '';
-        document.getElementById('vm-cost-in').value = data ? (data.cost_per_1k_tokens_in || 0) : '0';
-        document.getElementById('vm-cost-out').value = data ? (data.cost_per_1k_tokens_out || 0) : '0';
+        document.getElementById('vm-cost-in').value = data ? (data.cost_per_1m_tokens_in || 0) : '0';
+        document.getElementById('vm-cost-out').value = data ? (data.cost_per_1m_tokens_out || 0) : '0';
+        document.getElementById('vm-cost-in-cached').value = data ? (data.cost_per_1m_tokens_in_cached || 0) : '0';
+        document.getElementById('vm-cost-out-cached').value = data ? (data.cost_per_1m_tokens_out_cached || 0) : '0';
         document.getElementById('vm-max-tokens').value = data ? (data.max_tokens || 2048) : '2048';
         document.getElementById('vm-temperature').value = data ? (data.temperature || 0.7) : '0.7';
         document.getElementById('vm-top-p').value = data ? (data.top_p || 1.0) : '1.0';
@@ -1023,8 +1045,10 @@
             endpoint_id: parseInt(form.endpoint_id.value),
             actual_model: form.actual_model.value,
             description: form.description.value,
-            cost_per_1k_tokens_in: parseFloat(form.cost_per_1k_tokens_in.value) || 0,
-            cost_per_1k_tokens_out: parseFloat(form.cost_per_1k_tokens_out.value) || 0,
+            cost_per_1m_tokens_in: parseFloat(form.cost_per_1m_tokens_in.value) || 0,
+            cost_per_1m_tokens_out: parseFloat(form.cost_per_1m_tokens_out.value) || 0,
+            cost_per_1m_tokens_in_cached: parseFloat(form.cost_per_1m_tokens_in_cached.value) || 0,
+            cost_per_1m_tokens_out_cached: parseFloat(form.cost_per_1m_tokens_out_cached.value) || 0,
             max_tokens: parseInt(form.max_tokens.value) || 0,
             temperature: parseFloat(form.temperature.value) || 0,
             top_p: parseFloat(form.top_p.value) || 1.0,
@@ -1073,14 +1097,15 @@
             .then(data => {
                 const html = data.length ? `
                     <table>
-                        <thead><tr><th>Virtual Name</th><th>Endpoint</th><th>Actual Model</th><th>Cost In/Out ($/1K)</th><th>Actions</th></tr></thead>
+                        <thead><tr><th>Virtual Name</th><th>Endpoint</th><th>Actual Model</th><th>Cost In/Out ($/1M)</th><th>Cost Cached ($/1M)</th><th>Actions</th></tr></thead>
                         <tbody>
                             ${data.map(vm => `
                                 <tr>
                                     <td><strong>${vm.name}</strong></td>
                                     <td>${vm.endpoint_name || 'N/A'}</td>
                                     <td><code>${vm.actual_model}</code></td>
-                                    <td>${(vm.cost_per_1k_tokens_in || 0)} / ${(vm.cost_per_1k_tokens_out || 0)}</td>
+                                    <td>${(vm.cost_per_1m_tokens_in || 0)} / ${(vm.cost_per_1m_tokens_out || 0)}</td>
+                                    <td>${(vm.cost_per_1m_tokens_in_cached || 0)} / ${(vm.cost_per_1m_tokens_out_cached || 0)}</td>
                                     <td class="actions">
                                         <button class="btn btn-secondary btn-sm" onclick="editVM(${vm.id})">Edit</button>
                                         <button class="btn btn-danger btn-sm" onclick="deleteVirtualModel(${vm.id})">Delete</button>

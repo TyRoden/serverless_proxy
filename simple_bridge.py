@@ -124,8 +124,10 @@ def init_database():
                 endpoint_id INTEGER NOT NULL,
                 actual_model TEXT NOT NULL,
                 description TEXT,
-                cost_per_1k_tokens_in REAL DEFAULT 0,
-                cost_per_1k_tokens_out REAL DEFAULT 0,
+                cost_per_1m_tokens_in REAL DEFAULT 0,
+                cost_per_1m_tokens_out REAL DEFAULT 0,
+                cost_per_1m_tokens_in_cached REAL DEFAULT 0,
+                cost_per_1m_tokens_out_cached REAL DEFAULT 0,
                 disable_streaming INTEGER DEFAULT 0,
                 force_non_streaming INTEGER DEFAULT 0,
                 custom_headers TEXT,
@@ -151,9 +153,12 @@ def init_database():
                 prompt_tokens INTEGER DEFAULT 0,
                 completion_tokens INTEGER DEFAULT 0,
                 total_tokens INTEGER DEFAULT 0,
+                cached_input_tokens INTEGER DEFAULT 0,
+                cache_creation_tokens INTEGER DEFAULT 0,
                 cost_estimate REAL DEFAULT 0,
                 cost_in REAL DEFAULT 0,
                 cost_out REAL DEFAULT 0,
+                cached_cost_estimate REAL DEFAULT 0,
                 response_time_ms INTEGER DEFAULT 0,
                 created_at INTEGER DEFAULT (strftime('%s', 'now')),
                 FOREIGN KEY (endpoint_id) REFERENCES endpoints(id)
@@ -215,38 +220,58 @@ def init_database():
                 pass
 
         try:
-            cursor.execute("SELECT cost_per_1k_tokens_in FROM virtual_models LIMIT 1")
+            cursor.execute("SELECT cost_per_1m_tokens_in FROM virtual_models LIMIT 1")
+        except:
+            cursor.execute(
+                "ALTER TABLE virtual_models ADD COLUMN cost_per_1m_tokens_in REAL DEFAULT 0"
+            )
+            cursor.execute(
+                "ALTER TABLE virtual_models ADD COLUMN cost_per_1m_tokens_out REAL DEFAULT 0"
+            )
+
+        try:
+            cursor.execute(
+                "SELECT cost_per_1k_tokens_in FROM virtual_models WHERE cost_per_1k_tokens_in > 0 LIMIT 1"
+            )
+            if cursor.fetchone():
+                cursor.execute("""
+                    UPDATE virtual_models 
+                    SET cost_per_1m_tokens_in = COALESCE(cost_per_1k_tokens_in, 0),
+                        cost_per_1m_tokens_out = COALESCE(cost_per_1k_tokens_out, 0)
+                    WHERE cost_per_1k_tokens_in > 0 OR cost_per_1k_tokens_out > 0
+                """)
+                conn.commit()
+        except:
+            pass
+
+        try:
+            cursor.execute(
+                "SELECT cost_per_1m_tokens_in_cached FROM virtual_models LIMIT 1"
+            )
         except:
             try:
                 cursor.execute(
-                    "ALTER TABLE virtual_models ADD COLUMN cost_per_1k_tokens_in REAL DEFAULT 0"
+                    "ALTER TABLE virtual_models ADD COLUMN cost_per_1m_tokens_in_cached REAL DEFAULT 0"
                 )
             except:
                 pass
             try:
                 cursor.execute(
-                    "ALTER TABLE virtual_models ADD COLUMN cost_per_1k_tokens_out REAL DEFAULT 0"
+                    "ALTER TABLE virtual_models ADD COLUMN cost_per_1m_tokens_out_cached REAL DEFAULT 0"
                 )
             except:
                 pass
-                try:
-                    cursor.execute(
-                        "ALTER TABLE virtual_models ADD COLUMN disable_streaming INTEGER DEFAULT 0"
-                    )
-                except:
-                    pass
-                try:
-                    cursor.execute(
-                        "ALTER TABLE virtual_models ADD COLUMN force_non_streaming INTEGER DEFAULT 0"
-                    )
-                except:
-                    pass
-                try:
-                    cursor.execute(
-                        "ALTER TABLE virtual_models ADD COLUMN custom_headers TEXT"
-                    )
-                except:
-                    pass
+
+        try:
+            cursor.execute(
+                "ALTER TABLE virtual_models ADD COLUMN force_non_streaming INTEGER DEFAULT 0"
+            )
+        except:
+            pass
+        try:
+            cursor.execute("ALTER TABLE virtual_models ADD COLUMN custom_headers TEXT")
+        except:
+            pass
 
         try:
             cursor.execute("SELECT max_tokens FROM virtual_models LIMIT 1")
@@ -315,6 +340,28 @@ def init_database():
                 pass
 
         try:
+            cursor.execute("SELECT cached_input_tokens FROM request_usage LIMIT 1")
+        except:
+            try:
+                cursor.execute(
+                    "ALTER TABLE request_usage ADD COLUMN cached_input_tokens INTEGER DEFAULT 0"
+                )
+            except:
+                pass
+            try:
+                cursor.execute(
+                    "ALTER TABLE request_usage ADD COLUMN cache_creation_tokens INTEGER DEFAULT 0"
+                )
+            except:
+                pass
+            try:
+                cursor.execute(
+                    "ALTER TABLE request_usage ADD COLUMN cached_cost_estimate REAL DEFAULT 0"
+                )
+            except:
+                pass
+
+        try:
             cursor.execute("SELECT cost_in FROM embedding_usage LIMIT 1")
         except:
             try:
@@ -357,11 +404,29 @@ init_database()
 
 
 def get_virtual_model_cost(virtual_model_name):
-    """Get cost_per_1k_tokens for a virtual model (both in and out)."""
+    """Get cost_per_1m_tokens for a virtual model (both in and out)."""
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT cost_per_1k_tokens_in, cost_per_1k_tokens_out FROM virtual_models WHERE name = ?",
+            "SELECT cost_per_1m_tokens_in, cost_per_1m_tokens_out FROM virtual_models WHERE name = ?",
+            (virtual_model_name,),
+        )
+        result = cursor.fetchone()
+        if result:
+            in_cost = float(result[0]) if result[0] is not None else 0.0
+            out_cost = (
+                float(result[1]) if result[1] is not None else in_cost
+            )  # default to in_cost if not set
+            return in_cost, out_cost
+        return 0.0, 0.0
+
+
+def get_virtual_model_cost_cached(virtual_model_name):
+    """Get cost_per_1m_tokens_cached for a virtual model (both in and out)."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT cost_per_1m_tokens_in_cached, cost_per_1m_tokens_out_cached FROM virtual_models WHERE name = ?",
             (virtual_model_name,),
         )
         result = cursor.fetchone()
@@ -383,10 +448,39 @@ def log_chat_usage(virtual_model, endpoint_name, endpoint_id, usage, response_ti
             prompt_tokens + completion_tokens
         )
 
+        # Extract cached token information
+        # OpenAI/DeepInfra format: usage.prompt_tokens_details.cached_tokens
+        # Anthropic format: usage.cache_read_input_tokens, usage.cache_creation_input_tokens
+        cached_input_tokens = 0
+        cache_creation_tokens = 0
+
+        prompt_tokens_details = usage.get("prompt_tokens_details", {})
+        if prompt_tokens_details:
+            cached_input_tokens = prompt_tokens_details.get("cached_tokens", 0) or 0
+
+        # Anthropic format
+        if usage.get("cache_read_input_tokens"):
+            cached_input_tokens = usage.get("cache_read_input_tokens", 0) or 0
+        if usage.get("cache_creation_input_tokens"):
+            cache_creation_tokens = usage.get("cache_creation_input_tokens", 0) or 0
+
+        # Get pricing for regular and cached tokens
         cost_in, cost_out = get_virtual_model_cost(virtual_model)
-        cost_estimate = (prompt_tokens / 1000000 * cost_in) + (
+        cost_in_cached, cost_out_cached = get_virtual_model_cost_cached(virtual_model)
+
+        # Calculate regular cost (non-cached input tokens)
+        non_cached_input = max(
+            0, prompt_tokens - cached_input_tokens - cache_creation_tokens
+        )
+        cost_estimate = (non_cached_input / 1000000 * cost_in) + (
             completion_tokens / 1000000 * cost_out
         )
+
+        # Calculate cached cost
+        cached_cost = (cached_input_tokens / 1000000 * cost_in_cached) + (
+            cache_creation_tokens / 1000000 * cost_in_cached
+        )
+        cached_cost_estimate = cached_cost
 
         with get_db() as conn:
             cursor = conn.cursor()
@@ -395,8 +489,9 @@ def log_chat_usage(virtual_model, endpoint_name, endpoint_id, usage, response_ti
                 INSERT INTO request_usage 
                 (virtual_model, endpoint_name, endpoint_id, request_type, 
                  prompt_tokens, completion_tokens, total_tokens, 
-                 cost_estimate, cost_in, cost_out, response_time_ms)
-                VALUES (?, ?, ?, 'chat', ?, ?, ?, ?, ?, ?, ?)
+                 cached_input_tokens, cache_creation_tokens,
+                 cost_estimate, cost_in, cost_out, cached_cost_estimate, response_time_ms)
+                VALUES (?, ?, ?, 'chat', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
                 (
                     virtual_model,
@@ -405,9 +500,12 @@ def log_chat_usage(virtual_model, endpoint_name, endpoint_id, usage, response_ti
                     prompt_tokens,
                     completion_tokens,
                     total_tokens,
+                    cached_input_tokens,
+                    cache_creation_tokens,
                     cost_estimate,
                     prompt_tokens / 1000000 * cost_in,
                     completion_tokens / 1000000 * cost_out,
+                    cached_cost_estimate,
                     response_time_ms,
                 ),
             )
@@ -428,35 +526,68 @@ def log_completion_usage(
             prompt_tokens + completion_tokens
         )
 
+        # Extract cached token information
+        cached_input_tokens = 0
+        cache_creation_tokens = 0
+
+        prompt_tokens_details = usage.get("prompt_tokens_details", {})
+        if prompt_tokens_details:
+            cached_input_tokens = prompt_tokens_details.get("cached_tokens", 0) or 0
+
+        if usage.get("cache_read_input_tokens"):
+            cached_input_tokens = usage.get("cache_read_input_tokens", 0) or 0
+        if usage.get("cache_creation_input_tokens"):
+            cache_creation_tokens = usage.get("cache_creation_input_tokens", 0) or 0
+
+        # Get pricing for regular and cached tokens
         cost_in, cost_out = get_virtual_model_cost(virtual_model)
-        cost_estimate = (prompt_tokens / 1000000 * cost_in) + (
+        cost_in_cached, cost_out_cached = get_virtual_model_cost_cached(virtual_model)
+
+        # Calculate regular cost (non-cached input tokens)
+        non_cached_input = max(
+            0, prompt_tokens - cached_input_tokens - cache_creation_tokens
+        )
+        cost_estimate = (non_cached_input / 1000000 * cost_in) + (
             completion_tokens / 1000000 * cost_out
         )
 
-        with get_db() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                INSERT INTO request_usage 
-                (virtual_model, endpoint_name, endpoint_id, request_type, 
-                 prompt_tokens, completion_tokens, total_tokens, 
-                 cost_estimate, cost_in, cost_out, response_time_ms)
-                VALUES (?, ?, ?, 'completion', ?, ?, ?, ?, ?, ?, ?)
-            """,
-                (
-                    virtual_model,
-                    endpoint_name,
-                    endpoint_id,
-                    prompt_tokens,
-                    completion_tokens,
-                    total_tokens,
-                    cost_estimate,
-                    prompt_tokens / 1000000 * cost_in,
-                    completion_tokens / 1000000 * cost_out,
-                    response_time_ms,
-                ),
-            )
-            conn.commit()
+        # Calculate cached cost
+        cached_cost = (cached_input_tokens / 1000000 * cost_in_cached) + (
+            cache_creation_tokens / 1000000 * cost_in_cached
+        )
+        cached_cost_estimate = cached_cost
+
+        try:
+            with get_db() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    INSERT INTO request_usage 
+                    (virtual_model, endpoint_name, endpoint_id, request_type, 
+                     prompt_tokens, completion_tokens, total_tokens, 
+                     cached_input_tokens, cache_creation_tokens,
+                     cost_estimate, cost_in, cost_out, cached_cost_estimate, response_time_ms)
+                    VALUES (?, ?, ?, 'completion', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                    (
+                        virtual_model,
+                        endpoint_name,
+                        endpoint_id,
+                        prompt_tokens,
+                        completion_tokens,
+                        total_tokens,
+                        cached_input_tokens,
+                        cache_creation_tokens,
+                        cost_estimate,
+                        prompt_tokens / 1000000 * cost_in,
+                        completion_tokens / 1000000 * cost_out,
+                        cached_cost_estimate,
+                        response_time_ms,
+                    ),
+                )
+                conn.commit()
+        except Exception as e:
+            print(f"Error logging completion usage: {e}")
     except Exception as e:
         print(f"Error logging completion usage: {e}")
 
@@ -1087,8 +1218,42 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
                 "top_p": top_p,
                 "stream": stream,
             }
-            if tools:
-                payload["tools"] = tools
+
+            # Anthropic-specific payload transformation
+            if self.endpoint_type == "anthropic":
+                # Extract system prompt from messages if present
+                system_prompt = ""
+                filtered_messages = []
+                for msg in messages:
+                    if msg.get("role") == "system":
+                        system_prompt = msg.get("content", "")
+                    else:
+                        # Anthropic requires content to be string or array of content blocks
+                        content = msg.get("content", "")
+                        if isinstance(content, str):
+                            filtered_messages.append(
+                                {"role": msg.get("role"), "content": content}
+                            )
+                        else:
+                            # Pass through as-is for complex content
+                            filtered_messages.append(msg)
+
+                # Rebuild payload for Anthropic format
+                payload = {
+                    "model": self.model,
+                    "messages": filtered_messages,
+                    "max_tokens": max_tokens,
+                }
+                if system_prompt:
+                    payload["system"] = system_prompt
+                if temperature is not None:
+                    payload["temperature"] = temperature
+                if top_p is not None:
+                    payload["top_p"] = top_p
+                if stream:
+                    payload["stream"] = stream
+                if tools:
+                    payload["tools"] = tools
 
             for k, v in kwargs.items():
                 if v is not None and k not in [
@@ -1114,6 +1279,8 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
                 endpoint = f"{self.url}/v1/chat/completions"
             elif self.endpoint_type == "deepinfra":
                 endpoint = f"{self.url}/v1/openai/chat/completions"
+            elif self.endpoint_type == "anthropic":
+                endpoint = f"{self.url}/v1/messages"
             elif self.endpoint_type == "queue":
                 endpoint = f"{self.url}/v1/chat/completions"
             else:
@@ -1988,7 +2155,8 @@ async def chat_completions(request: Request):
         job_id = f"chat-{int(time_module.time())}"
 
         # Log usage for streaming requests BEFORE returning
-        log_chat_usage(model, None, None, usage, 0)
+        response_time_ms = int((time_module.time() - start_time) * 1000)
+        log_chat_usage(model, None, None, usage, response_time_ms)
 
         async def stream_generator():
             async for chunk_data in _generate_sse(
@@ -2344,6 +2512,9 @@ async def get_usage_summary(request: Request):
                     SUM(completion_tokens) as total_completion_tokens,
                     SUM(total_tokens) as total_tokens,
                     SUM(cost_estimate) as total_cost,
+                    SUM(cached_input_tokens) as total_cached_input_tokens,
+                    SUM(cache_creation_tokens) as total_cache_creation_tokens,
+                    SUM(cached_cost_estimate) as total_cached_cost,
                     COUNT(*) as request_count,
                     AVG(response_time_ms) as avg_response_time_ms
                 FROM request_usage
@@ -2365,6 +2536,10 @@ async def get_usage_summary(request: Request):
                     strftime('%Y-%m-%d', datetime(created_at, 'unixepoch')) as date,
                     SUM(prompt_tokens) as prompt_tokens,
                     SUM(completion_tokens) as completion_tokens,
+                    SUM(cached_input_tokens) as cached_input_tokens,
+                    SUM(cache_creation_tokens) as cache_creation_tokens,
+                    SUM(cached_cost_estimate) as cached_cost_estimate,
+                    SUM(cost_estimate) as cost_estimate,
                     COUNT(*) as requests
                 FROM request_usage
                 WHERE created_at >= ? AND created_at <= ?
@@ -2384,7 +2559,11 @@ async def get_usage_summary(request: Request):
                         "date": row[0],
                         "prompt_tokens": row[1] or 0,
                         "completion_tokens": row[2] or 0,
-                        "requests": row[3] or 0,
+                        "cached_input_tokens": row[3] or 0,
+                        "cache_creation_tokens": row[4] or 0,
+                        "cached_cost_estimate": round(row[5] or 0, 4),
+                        "cost_estimate": round(row[6] or 0, 4),
+                        "requests": row[7] or 0,
                     }
                 )
 
@@ -2395,8 +2574,11 @@ async def get_usage_summary(request: Request):
                         "total_completion_tokens": summary[1] or 0,
                         "total_tokens": summary[2] or 0,
                         "total_cost": round(summary[3] or 0, 4),
-                        "request_count": summary[4] or 0,
-                        "avg_response_time_ms": round(summary[5] or 0, 2),
+                        "total_cached_input_tokens": summary[4] or 0,
+                        "total_cache_creation_tokens": summary[5] or 0,
+                        "total_cached_cost": round(summary[6] or 0, 4),
+                        "request_count": summary[7] or 0,
+                        "avg_response_time_ms": round(summary[8] or 0, 2),
                     },
                     "daily_breakdown": daily_breakdown,
                 }
@@ -2432,6 +2614,9 @@ async def get_usage_by_model(request: Request):
                     SUM(completion_tokens) as completion_tokens,
                     SUM(total_tokens) as total_tokens,
                     SUM(cost_estimate) as cost_estimate,
+                    SUM(cached_input_tokens) as cached_input_tokens,
+                    SUM(cache_creation_tokens) as cache_creation_tokens,
+                    SUM(cached_cost_estimate) as cached_cost_estimate,
                     COUNT(*) as request_count
                 FROM request_usage
                 WHERE created_at >= ? AND created_at <= ?
@@ -2564,15 +2749,15 @@ async def update_virtual_model_cost(vm_id: int, request: Request):
 
     try:
         data = await request.json()
-        cost_in = data.get("cost_per_1k_tokens_in", 0)
-        cost_out = data.get("cost_per_1k_tokens_out", 0)
+        cost_in = data.get("cost_per_1m_tokens_in", 0)
+        cost_out = data.get("cost_per_1m_tokens_out", 0)
 
         with get_db() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
                 UPDATE virtual_models
-                SET cost_per_1k_tokens_in = ?, cost_per_1k_tokens_out = ?, updated_at = strftime('%s', 'now')
+                SET cost_per_1m_tokens_in = ?, cost_per_1m_tokens_out = ?, updated_at = strftime('%s', 'now')
                 WHERE id = ?
             """,
                 (cost_in, cost_out, vm_id),
@@ -3238,50 +3423,8 @@ def proxy_dashboard():
 
 @flask_app.route("/endpoints", methods=["GET", "POST"])
 def admin_endpoints():
-    """Manage endpoints."""
-    auth = validate_session()
-    if not auth.get("valid"):
-        return redirect(f"{get_menu_login_url()}/login?redirect=/endpoints")
-
-    if flask_request.method == "POST":
-        if flask_request.is_json:
-            data = flask_request.get_json()
-        else:
-            data = flask_request.form.to_dict()
-
-        if not data:
-            data = flask_request.get_json(force=True)
-
-        with get_db() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                INSERT INTO endpoints (name, url, api_key, endpoint_type, priority, enabled)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """,
-                (
-                    data.get("name"),
-                    data.get("url"),
-                    data.get("api_key"),
-                    data.get("endpoint_type", "openai"),
-                    int(data.get("priority", 0)),
-                    1 if data.get("enabled", True) else 0,
-                ),
-            )
-            conn.commit()
-
-        if flask_request.is_json or flask_request.content_type == "application/json":
-            return flask_jsonify({"status": "ok"})
-        return redirect("/endpoints")
-
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM endpoints ORDER BY name")
-        endpoints = [dict(row) for row in cursor.fetchall()]
-
-    return render_template(
-        "admin_endpoints.html", user=auth.get("username"), endpoints=endpoints
-    )
+    """Redirect to main dashboard - endpoints are managed via modal."""
+    return redirect("/admin")
 
 
 @flask_app.route("/endpoints/<int:endpoint_id>", methods=["PUT"])
@@ -3416,7 +3559,8 @@ def update_virtual_model(vm_id):
             """
             UPDATE virtual_models 
             SET name = ?, endpoint_id = ?, actual_model = ?, description = ?, 
-                cost_per_1k_tokens_in = ?, cost_per_1k_tokens_out = ?, 
+                cost_per_1m_tokens_in = ?, cost_per_1m_tokens_out = ?,
+                cost_per_1m_tokens_in_cached = ?, cost_per_1m_tokens_out_cached = ?,
                 disable_streaming = ?, force_non_streaming = ?, custom_headers = ?,
                 enabled = ?, max_tokens = ?, temperature = ?, top_p = ?, system_prompt = ?,
                 show_reasoning = ?,
@@ -3428,8 +3572,10 @@ def update_virtual_model(vm_id):
                 int(data.get("endpoint_id")),
                 data.get("actual_model"),
                 data.get("description"),
-                data.get("cost_per_1k_tokens_in") or 0,
-                data.get("cost_per_1k_tokens_out") or 0,
+                data.get("cost_per_1m_tokens_in") or 0,
+                data.get("cost_per_1m_tokens_out") or 0,
+                data.get("cost_per_1m_tokens_in_cached") or 0,
+                data.get("cost_per_1m_tokens_out_cached") or 0,
                 1 if data.get("disable_streaming") else 0,
                 1 if data.get("force_non_streaming") else 0,
                 data.get("custom_headers") or "",
@@ -3461,18 +3607,21 @@ def create_virtual_model():
             """
             INSERT INTO virtual_models (
                 name, endpoint_id, actual_model, description,
-                cost_per_1k_tokens_in, cost_per_1k_tokens_out,
+                cost_per_1m_tokens_in, cost_per_1m_tokens_out,
+                cost_per_1m_tokens_in_cached, cost_per_1m_tokens_out_cached,
                 disable_streaming, force_non_streaming, custom_headers,
                 enabled, max_tokens, temperature, top_p, system_prompt, show_reasoning
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
             (
                 data.get("name"),
                 int(data.get("endpoint_id")),
                 data.get("actual_model"),
                 data.get("description"),
-                data.get("cost_per_1k_tokens_in") or 0,
-                data.get("cost_per_1k_tokens_out") or 0,
+                data.get("cost_per_1m_tokens_in") or 0,
+                data.get("cost_per_1m_tokens_out") or 0,
+                data.get("cost_per_1m_tokens_in_cached") or 0,
+                data.get("cost_per_1m_tokens_out_cached") or 0,
                 1 if data.get("disable_streaming") else 0,
                 1 if data.get("force_non_streaming") else 0,
                 data.get("custom_headers") or "",

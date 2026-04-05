@@ -2,6 +2,37 @@
 
 All notable changes to the Serverless Proxy will be documented in this file.
 
+## [2.4.0] - 2026-04-05
+
+### Added
+
+- **Cached Token Pricing Support** - New configurable pricing for cached tokens:
+  - `cost_per_1m_tokens_in_cached` - Price per 1M cached input tokens
+  - `cost_per_1m_tokens_out_cached` - Price per 1M cached output tokens
+  - Automatically tracks cached tokens from OpenAI/DeepInfra and Anthropic APIs
+  - Database columns: `cached_input_tokens`, `cache_creation_tokens`, `cached_cost_estimate`
+  - Usage page now displays cached token counts and cached costs in KPI cards and daily breakdown table
+
+- **Anthropic Endpoint Support** - New endpoint type for direct Anthropic API calls:
+  - Added "Anthropic" option to endpoint type dropdown
+  - Backend routing to `/v1/messages` endpoint
+  - Automatic request transformation for Anthropic format (system prompt handling)
+  - Supports both cached and non-cached token pricing
+
+- **Response Time Tracking** - Fixed response time tracking for streaming requests:
+  - Streaming requests now properly record response_time_ms
+  - Average response time displays correctly in Usage page
+
+### Changed
+
+- **Token Pricing Units** - Changed from per-1K to per-1M pricing:
+  - Field names changed from `cost_per_1k_tokens` to `cost_per_1m_tokens`
+  - Dashboard label updated to show "($/1M)"
+  - Migration added to preserve existing cost values
+  - Database columns renamed: `cost_per_1m_tokens_in`, `cost_per_1m_tokens_out`
+
+- **max_tokens Limit** - Increased maximum tokens limit to 1,000,000 for supporting longer context windows
+
 ## [2.3.0] - 2026-04-01
 
 ### Added

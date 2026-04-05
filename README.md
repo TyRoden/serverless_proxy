@@ -162,7 +162,7 @@ Configure backend endpoints with:
 - **Name**: Friendly identifier
 - **URL**: Base URL (e.g., `http://localhost:11434`, `https://api.runpod.ai/v2/xxxx`)
 - **API Key**: Authorization token (if required)
-- **Type**: `openai`, `ollama`, `vllm`, `together`, `runpod`
+- **Type**: `openai`, `ollama`, `vllm`, `together`, `runpod`, `anthropic`, `deepinfra`, `queue`
 - **Priority**: Higher priority endpoints are preferred
 - **Enabled**: Enable/disable endpoint
 
@@ -174,6 +174,23 @@ Map virtual model names to actual backend models:
 - **Endpoint**: Which backend to route to
 - **Actual Model**: The model name on the backend (e.g., `gpt-4o`, `llama3:70b`)
 - **Show Reasoning**: Toggle chain-of-thought display (for models like MiniMax that output thinking separately)
+- **Cost per 1M Input/Output Tokens ($)**: Pricing per 1M tokens (matches provider pricing pages)
+- **Cost per 1M Cached Input/Output Tokens ($)**: Discounted pricing for cached tokens (typically 10-90% of base price)
+
+### Cached Token Pricing
+
+The proxy supports tracking and pricing for cached tokens:
+
+- **How it works**: When you make repeated requests with similar prompts, providers cache the input tokens
+- **Pricing**: Cached tokens are billed at a significantly discounted rate (typically 10-90% cheaper)
+- **Configuration**: Enter your provider's cached token pricing in the virtual model settings
+- **Tracking**: The Usage page displays cached token counts and costs separately
+- **Supported Providers**: OpenAI, DeepInfra, and Anthropic APIs return cached token information
+
+To configure:
+1. Look up your provider's pricing (e.g., DeepInfra pricing page shows "$0.26 / $0.13 cached")
+2. Enter the base price in "Cost per 1M Input Tokens"
+3. Enter the cached price in "Cost per 1M Cached Input Tokens"
 
 ## API Endpoints
 
