@@ -63,7 +63,7 @@ docker compose up -d --build
    - **Name**: Something like "My Ollama" or "RunPod Production"
    - **URL**: Your backend URL (e.g., `http://localhost:11434` for local Ollama, or your RunPod endpoint URL)
    - **API Key**: Your API key if required (leave blank for local Ollama)
-   - **Type**: Select the type (`ollama`, `openai`, `runpod`, etc.)
+   - **Type**: Select the type (`ollama`, `openai`, `runpod`, `anthropic`, `deepinfra`, etc.)
    - Click **Save**
 
 #### Add a Virtual Model
@@ -174,8 +174,10 @@ Map virtual model names to actual backend models:
 - **Endpoint**: Which backend to route to
 - **Actual Model**: The model name on the backend (e.g., `gpt-4o`, `llama3:70b`)
 - **Show Reasoning**: Toggle chain-of-thought display (for models like MiniMax that output thinking separately)
-- **Cost per 1M Input/Output Tokens ($)**: Pricing per 1M tokens (matches provider pricing pages)
-- **Cost per 1M Cached Input/Output Tokens ($)**: Discounted pricing for cached tokens (typically 10-90% of base price)
+- **Cost per 1M Input Tokens ($)**: Price per 1M input tokens you send
+- **Cost per 1M Output Tokens ($)**: Price per 1M output tokens you receive
+- **Cost per 1M Cached Input Tokens ($)**: Discounted price per 1M cached input tokens (see provider pricing)
+- **Cost per 1M Cached Output Tokens ($)**: Discounted price per 1M cached output tokens
 
 ### Cached Token Pricing
 
