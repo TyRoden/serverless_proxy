@@ -194,6 +194,27 @@ To configure:
 2. Enter the base price in "Cost per 1M Input Tokens"
 3. Enter the cached price in "Cost per 1M Cached Input Tokens"
 
+### Cost Tracking & Usage Monitoring
+
+The proxy provides comprehensive cost tracking per model:
+
+- **Per-model pricing**: Configure input/output/cached token rates for each virtual model
+- **Usage dashboard**: View token counts, costs, and response times in the admin UI
+- **Daily breakdown**: Track usage patterns over time
+- **Cost estimation**: Automatic calculation based on configured rates
+
+Configure pricing per virtual model:
+- **Input tokens**: Tokens sent in requests (prompt)
+- **Output tokens**: Tokens received in responses (completion)
+- **Cached tokens**: Discounted rate for cached input tokens (when providers support caching)
+
+The Usage page shows:
+- Total requests and token counts
+- Input vs Output token breakdown
+- Cached token counts and costs
+- Average response times
+- Cost per model and daily trends
+
 ## API Endpoints
 
 ### OpenAI-Compatible API (port 8002)
