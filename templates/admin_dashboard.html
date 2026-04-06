@@ -204,6 +204,7 @@
             <a href="#" onclick="console.log('Dashboard clicked'); event.preventDefault(); showTab('dashboard');">Dashboard</a>
             <a href="#" onclick="console.log('Usage clicked'); event.preventDefault(); showTab('usage');">Usage & Cost</a>
             <a href="#" onclick="console.log('Settings clicked'); event.preventDefault(); showTab('settings');">Settings</a>
+            <a href="#" onclick="console.log('Patterns clicked'); event.preventDefault(); showTab('patterns');">Patterns</a>
         </nav>
         
         <!-- Dashboard Tab Content -->
@@ -315,6 +316,20 @@
                 <small>AI Queue Master endpoint</small>
             </div>
             <button class="btn btn-primary" onclick="saveSettings()">Save Settings</button>
+        </div>
+    </div>
+
+    <!-- Patterns Tab Content -->
+    <div id="patterns-section" class="hidden">
+        <div class="card">
+            <h2>Tool Call Patterns</h2>
+            <p style="color:var(--text-secondary);margin-bottom:16px;font-size:14px;">
+                Configure regex patterns to extract tool calls from model responses. Patterns are tried in priority order (higher = first). Use this to handle non-standard tool call formats from different models.
+            </p>
+            <div id="patterns-list" class="loading">Loading...</div>
+            <div style="margin-top: 16px;">
+                <button class="btn btn-primary" onclick="openPatternModal()">+ Add Pattern</button>
+            </div>
         </div>
     </div>
 
@@ -486,6 +501,82 @@
             </div>
         </div>
     </div>
+
+    <!-- Pattern Modal -->
+    <div id="pattern-modal" class="hidden">
+        <div class="modal-overlay" onclick="if(event.target===this)closePatternModal()">
+            <div class="modal-card card" style="max-width:600px;">
+                <h2 id="pattern-modal-title">Add Pattern</h2>
+                <form id="pattern-form" onsubmit="savePattern(event)">
+                    <input type="hidden" name="id" id="pattern-id">
+                    <div class="form-group">
+                        <label for="pattern-name">Pattern Name</label>
+                        <input type="text" id="pattern-name" name="pattern_name" placeholder="my_custom_pattern" required>
+                        <small>Unique name for this pattern</small>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="pattern-type">Pattern Type</label>
+                            <select id="pattern-type" name="pattern_type">
+                                <option value="fence">Fence (code block)</option>
+                                <option value="inline">Inline</option>
+                                <option value="xml">XML</option>
+                                <option value="bracket">Bracket</option>
+                                <option value="action">Action</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="pattern-priority">Priority</label>
+                            <input type="number" id="pattern-priority" name="priority" value="50" min="1" max="100">
+                            <small>Higher = checked first</small>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label for="pattern-regex">Regex Pattern</label>
+                        <input type="text" id="pattern-regex" name="regex_pattern" placeholder="\(.*?)\)" required style="font-family:monospace;">
+                        <small>Regex with capture groups. Use (group) to capture tool name and arguments</small>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="pattern-tool-name">Static Tool Name (optional)</label>
+                            <input type="text" id="pattern-tool-name" name="tool_name" placeholder="e.g., bash">
+                            <small>Use if tool name is always the same</small>
+                        </div>
+                        <div class="form-group">
+                            <label for="pattern-tool-name-group">Tool Name Group</label>
+                            <input type="number" id="pattern-tool-name-group" name="tool_name_group" min="1" max="10" placeholder="1">
+                            <small>Capture group number for tool name</small>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label for="pattern-tool-json-path">Tool Name JSON Path</label>
+                        <input type="text" id="pattern-tool-json-path" name="tool_name_json_path" placeholder="name">
+                        <small>Extract from JSON (e.g., "name" or "arguments.name")</small>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="pattern-tool-mapping">Tool Name Mapping (JSON)</label>
+                            <input type="text" id="pattern-tool-mapping" name="tool_name_mapping" placeholder='{"read_file":"read"}'>
+                            <small>Map tool names to standard names</small>
+                        </div>
+                        <div class="form-group">
+                            <label for="pattern-param-mapping">Parameter Mapping (JSON)</label>
+                            <input type="text" id="pattern-param-mapping" name="parameter_mapping" placeholder='{"file_path":"filePath"}'>
+                            <small>Map parameter names</small>
+                        </div>
+                    </div>
+                    <div class="checkbox-row">
+                        <input type="checkbox" id="pattern-enabled" name="enabled" checked>
+                        <label for="pattern-enabled">Enabled</label>
+                    </div>
+                    <div class="actions" style="margin-top:20px;">
+                        <button type="submit" class="btn btn-primary">Save Pattern</button>
+                        <button type="button" class="btn btn-secondary" onclick="closePatternModal()">Cancel</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
     
     <script>
     // ==========================================
@@ -515,6 +606,12 @@
             document.getElementById('usage-section').classList.add('hidden');
             document.getElementById('settings-section').classList.remove('hidden');
             loadSettings();
+        } else if (tabName === 'patterns') {
+            document.getElementById('dashboard-section').classList.add('hidden');
+            document.getElementById('usage-section').classList.add('hidden');
+            document.getElementById('settings-section').classList.add('hidden');
+            document.getElementById('patterns-section').classList.remove('hidden');
+            loadPatterns();
         } else {
             document.getElementById('dashboard-section').classList.remove('hidden');
             document.getElementById('usage-section').classList.add('hidden');
@@ -1166,6 +1263,180 @@
             }
         })
         .catch(err => alert('Error saving settings: ' + err.message));
+    }
+
+    // ==========================================
+    // Tool Pattern CRUD
+    // ==========================================
+
+    async function fetchPatternsJson(url) {
+        const r = await fetch(url, { credentials: 'same-origin' });
+        const contentType = r.headers.get('content-type') || '';
+        if (!contentType.includes('application/json')) {
+            const body = await r.text();
+            throw new Error('non-json:' + body.slice(0, 120));
+        }
+        const data = await r.json();
+        if (!r.ok) {
+            throw new Error(data.error || ('HTTP ' + r.status));
+        }
+        return data;
+    }
+
+    async function loadPatternsData() {
+        const urls = ['/api/admin/tool-patterns', '/tool-patterns', '/endpoints/patterns'];
+        let lastErr = null;
+        for (const url of urls) {
+            try {
+                return await fetchPatternsJson(url);
+            } catch (e) {
+                lastErr = e;
+            }
+        }
+        throw lastErr || new Error('Unable to load patterns');
+    }
+
+    function loadPatterns() {
+        loadPatternsData()
+            .then(data => {
+                const html = data.length ? `
+                    <table>
+                        <thead><tr><th>Name</th><th>Type</th><th>Regex</th><th>Tool Source</th><th>Priority</th><th>Status</th><th>Actions</th></tr></thead>
+                        <tbody>
+                            ${data.map(p => `
+                                <tr>
+                                    <td><strong>${p.pattern_name}</strong></td>
+                                    <td><span class="badge" style="background:rgba(79,140,255,0.2);color:#4f8cff;">${p.pattern_type}</span></td>
+                                    <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;font-family:monospace;font-size:11px;" title="${p.regex_pattern}">${p.regex_pattern}</td>
+                                    <td style="font-size:12px;">
+                                        ${p.tool_name ? 'Static: ' + p.tool_name : ''}
+                                        ${p.tool_name_group ? 'Group: ' + p.tool_name_group : ''}
+                                        ${p.tool_name_json_path ? 'JSON: ' + p.tool_name_json_path : ''}
+                                        ${!p.tool_name && !p.tool_name_group && !p.tool_name_json_path ? 'Auto-detect' : ''}
+                                    </td>
+                                    <td>${p.priority}</td>
+                                    <td>
+                                        <span class="badge ${p.enabled ? 'badge-enabled' : 'badge-disabled'}">
+                                            ${p.enabled ? 'Enabled' : 'Disabled'}
+                                        </span>
+                                    </td>
+                                    <td class="actions">
+                                        <button class="btn btn-secondary btn-sm" onclick="editPattern(${p.id})">Edit</button>
+                                        <button class="btn btn-danger btn-sm" onclick="deletePattern(${p.id})">Delete</button>
+                                    </td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                ` : '<p class="empty">No patterns configured. Click "Add Pattern" to create one.</p>';
+                document.getElementById('patterns-list').innerHTML = html;
+            })
+            .catch(err => {
+                document.getElementById('patterns-list').innerHTML = '<p style="color:var(--accent-red);">Error loading: ' + err.message + '</p>';
+            });
+    }
+
+    function openPatternModal(data) {
+        document.getElementById('pattern-modal-title').textContent = data ? 'Edit Pattern' : 'Add Pattern';
+        document.getElementById('pattern-id').value = data ? data.id : '';
+        document.getElementById('pattern-name').value = data ? data.pattern_name : '';
+        document.getElementById('pattern-type').value = data ? data.pattern_type : 'fence';
+        document.getElementById('pattern-regex').value = data ? data.regex_pattern : '';
+        document.getElementById('pattern-priority').value = data ? data.priority : 50;
+        document.getElementById('pattern-tool-name').value = data && data.tool_name ? data.tool_name : '';
+        document.getElementById('pattern-tool-name-group').value = data && data.tool_name_group ? data.tool_name_group : '';
+        document.getElementById('pattern-tool-json-path').value = data && data.tool_name_json_path ? data.tool_name_json_path : '';
+        document.getElementById('pattern-tool-mapping').value = data && data.tool_name_mapping ? data.tool_name_mapping : '{}';
+        document.getElementById('pattern-param-mapping').value = data && data.parameter_mapping ? data.parameter_mapping : '{}';
+        document.getElementById('pattern-enabled').checked = data ? data.enabled : true;
+        document.getElementById('pattern-modal').classList.remove('hidden');
+    }
+
+    function closePatternModal() {
+        document.getElementById('pattern-modal').classList.add('hidden');
+        document.getElementById('pattern-form').reset();
+    }
+
+    function savePattern(e) {
+        e.preventDefault();
+        const form = e.target;
+        const id = form.id.value;
+        const data = {
+            pattern_name: form.pattern_name.value,
+            pattern_type: form.pattern_type.value,
+            regex_pattern: form.regex_pattern.value,
+            priority: parseInt(form.priority.value) || 50,
+            tool_name: form.tool_name.value || null,
+            tool_name_group: form.tool_name_group.value ? parseInt(form.tool_name_group.value) : null,
+            tool_name_json_path: form.tool_name_json_path.value || null,
+            tool_name_mapping: form.tool_name_mapping.value || '{}',
+            parameter_mapping: form.parameter_mapping.value || '{}',
+            enabled: form.enabled.checked
+        };
+
+        const method = id ? 'PUT' : 'POST';
+        const urls = id
+            ? ['/api/admin/tool-patterns/' + id, '/tool-patterns/' + id, '/endpoints/patterns/' + id]
+            : ['/api/admin/tool-patterns', '/tool-patterns', '/endpoints/patterns'];
+
+        (async () => {
+            let lastErr = null;
+            for (const url of urls) {
+                try {
+                    const r = await fetch(url, {
+                        method: method,
+                        credentials: 'same-origin',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(data)
+                    });
+                    if (!r.ok) {
+                        lastErr = new Error('HTTP ' + r.status + ' for ' + url);
+                        continue;
+                    }
+                    closePatternModal();
+                    loadPatterns();
+                    return;
+                } catch (e) {
+                    lastErr = e;
+                }
+            }
+            throw lastErr || new Error('Failed to save');
+        })().catch(err => alert('Error saving pattern: ' + err.message));
+    }
+
+    function editPattern(id) {
+        loadPatternsData()
+            .then(data => {
+                const p = data.find(x => x.id === id);
+                if (p) openPatternModal(p);
+            });
+    }
+
+    function deletePattern(id) {
+        if (confirm('Delete this pattern?')) {
+            (async () => {
+                const urls = [
+                    '/api/admin/tool-patterns/' + id,
+                    '/tool-patterns/' + id,
+                    '/endpoints/patterns/' + id,
+                ];
+                let lastErr = null;
+                for (const url of urls) {
+                    try {
+                        const r = await fetch(url, { method: 'DELETE', credentials: 'same-origin' });
+                        if (!r.ok) {
+                            lastErr = new Error('HTTP ' + r.status + ' for ' + url);
+                            continue;
+                        }
+                        loadPatterns();
+                        return;
+                    } catch (e) {
+                        lastErr = e;
+                    }
+                }
+                throw lastErr || new Error('Failed to delete');
+            })().catch(err => alert('Error deleting pattern: ' + err.message));
+        }
     }
     </script>
 </body>

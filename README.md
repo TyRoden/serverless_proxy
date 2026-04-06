@@ -11,6 +11,7 @@ Client (OpenAI format) → Serverless Proxy (port 8002) → Configured Backends
 - **Universal**: Connect to any LLM backend (RunPod, Ollama, OpenAI, Together AI, etc.)
 - **Virtual Models**: Map user-facing model names to actual backend models
 - **Admin UI**: Configure endpoints and virtual models via web interface
+- **Tool-Call Compatibility**: Normalize misformatted model tool calls with DB-driven regex patterns
 - **OpenAI-compatible**: Works with any OpenAI client library
 
 ## Quick Start
@@ -137,6 +138,17 @@ By default, the admin dashboard requires authentication. See [docs/authenticatio
 - How to implement your own auth service
 - Full API specification for the `/session/validate` endpoint
 
+### Tool Pattern Matching (Patterns Tab)
+
+The admin dashboard includes a **Patterns** tab for fixing model-specific tool call formats without editing code.
+
+- Add/update/delete regex-based extraction patterns
+- Control match priority (higher first)
+- Map tool names and parameter keys into schema-compatible names
+- Support malformed or non-standard XML/bracket/inline formats
+
+See [docs/tool_patterns.md](docs/tool_patterns.md) for full details and examples.
+
 ### Docker Ports
 
 | Port | Service |
@@ -152,6 +164,7 @@ Access the admin dashboard at `/proxy-dashboard`. Authentication is handled by t
 
 - **Endpoint Management**: Add, edit, delete backend endpoints
 - **Virtual Model Mapping**: Map virtual model names to actual backend models
+- **Patterns Tab**: Manage tool-call translation patterns in the UI
 - **Model Discovery**: Fetch available models from endpoints
 - **Enable/Disable**: Toggle endpoints and virtual models
 
@@ -241,16 +254,18 @@ curl -X POST http://localhost:8002/v1/chat/completions \
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/admin/endpoints` | GET | List all endpoints |
+| `/api/admin/endpoints` | GET, POST | List/create endpoints |
 | `/endpoints` | GET, POST | Manage endpoints |
 | `/endpoints/<id>` | PUT | Update endpoint |
-| `/endpoints/<id>/delete` | POST | Delete endpoint |
+| `/endpoints/<id>/delete` | GET, DELETE | Delete endpoint |
 | `/endpoints/<id>/test` | POST | Test endpoint connection |
 | `/endpoints/<id>/models` | GET | Fetch available models |
 | `/api/admin/virtual-models` | GET | List virtual models |
-| `/virtual-models` | GET, POST | Manage virtual models |
+| `/virtual-models` | POST | Create virtual model |
 | `/virtual-models/<id>` | PUT | Update virtual model |
-| `/virtual-models/<id>/delete` | POST | Delete virtual model |
+| `/virtual-models/<id>/delete` | GET, DELETE | Delete virtual model |
+| `/api/admin/tool-patterns` | GET, POST | List/create tool patterns |
+| `/api/admin/tool-patterns/<id>` | PUT, DELETE | Update/delete tool pattern |
 
 ## Backend Types
 

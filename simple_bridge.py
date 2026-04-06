@@ -47,7 +47,15 @@ flask_app = Flask(__name__, template_folder="templates", static_folder="static")
 flask_app.secret_key = os.getenv("SECRET_KEY", secrets.token_hex(32))
 
 AIMENU_URL = os.getenv("AIMENU_URL", "http://localhost:5000")
-AUTH_ENABLED = os.getenv("AUTH_ENABLED", "true").lower() == "true"
+
+
+def is_auth_enabled():
+    """Check if auth is enabled - reads from env at call time, not load time."""
+    return os.getenv("AUTH_ENABLED", "true").lower() == "true"
+
+
+# Backwards compatibility
+AUTH_ENABLED = is_auth_enabled()
 
 # Database setup
 DATABASE_PATH = os.getenv("DATABASE_PATH", "/data/proxy.db")
@@ -190,6 +198,149 @@ def init_database():
                 updated_at INTEGER DEFAULT (strftime('%s', 'now'))
             )
         """)
+
+        # Tool patterns table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS tool_patterns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pattern_name TEXT NOT NULL UNIQUE,
+                pattern_type TEXT NOT NULL,
+                regex_pattern TEXT NOT NULL,
+                tool_name TEXT,
+                tool_name_group INTEGER,
+                tool_name_json_path TEXT,
+                tool_name_mapping TEXT,
+                parameter_mapping TEXT,
+                enabled INTEGER DEFAULT 1,
+                priority INTEGER DEFAULT 0,
+                created_at INTEGER DEFAULT (strftime('%s', 'now')),
+                updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+            )
+        """)
+
+        # Auto-seed patterns if table is empty
+        cursor.execute("SELECT COUNT(*) FROM tool_patterns")
+        if cursor.fetchone()[0] == 0:
+            seed_patterns = [
+                (
+                    "fence_json",
+                    "fence",
+                    r"```\s*(\w*)\s*\n?(.*?)```",
+                    None,
+                    None,
+                    "name",
+                    "{}",
+                    "{}",
+                    100,
+                ),
+                (
+                    "inline_json",
+                    "inline",
+                    r"\{.*?\"name\"\s*:\s*\"(\w+)\".*?\"arguments\"\s*:\s*(\{[^}]*\})",
+                    None,
+                    1,
+                    None,
+                    "{}",
+                    "{}",
+                    90,
+                ),
+                (
+                    "tool_use",
+                    "xml",
+                    r'<tool_use\s+code\s+name="(\w+)"\s*>(.*?)</tool_use>',
+                    None,
+                    1,
+                    None,
+                    "{}",
+                    "{}",
+                    80,
+                ),
+                (
+                    "tool_code",
+                    "xml",
+                    r"<tool_code>(.*?)</tool_code>",
+                    None,
+                    None,
+                    "name",
+                    "{}",
+                    "{}",
+                    80,
+                ),
+                (
+                    "tool_call",
+                    "xml",
+                    r"<tool_call>(.*?)</tool_call>",
+                    None,
+                    None,
+                    "name",
+                    "{}",
+                    "{}",
+                    80,
+                ),
+                (
+                    "tool_call_alt",
+                    "bracket",
+                    r"\[TOOL_CALL\]\s*(\{.*?\})\s*\[/TOOL_CALL\]",
+                    None,
+                    None,
+                    "name",
+                    "{}",
+                    "{}",
+                    85,
+                ),
+                (
+                    "tool_call_nested_xml",
+                    "xml",
+                    r"<tool_call>\s*<function=(\w+)>\s*<parameter=(\w+)>\s*(.*?)\s*</parameter>\s*</function>\s*</tool_call>",
+                    None,
+                    1,
+                    None,
+                    "{}",
+                    '{"file_path":"filePath"}',
+                    86,
+                ),
+                (
+                    "tool_call_bare_param",
+                    "xml",
+                    r"<tool_call>\s*(\w+)\s*<parameter=(\w+)>\s*(.*?)\s*</parameter>\s*(?:</function>\s*)?(?:</tool_call>)?",
+                    None,
+                    1,
+                    None,
+                    "{}",
+                    '{"file_path":"filePath","command":"command"}',
+                    87,
+                ),
+                (
+                    "bracket_tool",
+                    "bracket",
+                    r"\[tool\](\w+)\[/tool\]\s*(\{.*?\})",
+                    None,
+                    1,
+                    None,
+                    "{}",
+                    "{}",
+                    70,
+                ),
+                (
+                    "action",
+                    "action",
+                    r"\[([a-zA-Z][^\]]+)\]",
+                    None,
+                    None,
+                    None,
+                    '{"searching":"grep","search":"grep","using task":"task","task":"task","reading":"read","read":"read","listing":"glob","ls":"glob","glob":"glob","writing":"write","write":"write","editing":"edit","edit":"edit","running":"bash","bash":"bash","executing":"bash"}',
+                    '{"action":"action"}',
+                    60,
+                ),
+            ]
+            cursor.executemany(
+                """
+                INSERT INTO tool_patterns 
+                (pattern_name, pattern_type, regex_pattern, tool_name, tool_name_group, tool_name_json_path, tool_name_mapping, parameter_mapping, priority)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+                seed_patterns,
+            )
 
         # Insert default settings if not exist
         cursor.execute(
@@ -389,6 +540,57 @@ def init_database():
         )
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_embedding_usage_created_at ON embedding_usage(created_at)"
+        )
+
+        # Migration: ensure nested tool_call XML pattern exists
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO tool_patterns
+            (pattern_name, pattern_type, regex_pattern, tool_name, tool_name_group, tool_name_json_path, tool_name_mapping, parameter_mapping, priority)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "tool_call_nested_xml",
+                "xml",
+                r"<tool_call>\s*<function=(\w+)>\s*<parameter=(\w+)>\s*(.*?)\s*</parameter>\s*</function>\s*</tool_call>",
+                None,
+                1,
+                None,
+                "{}",
+                '{"file_path":"filePath"}',
+                86,
+            ),
+        )
+
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO tool_patterns
+            (pattern_name, pattern_type, regex_pattern, tool_name, tool_name_group, tool_name_json_path, tool_name_mapping, parameter_mapping, priority)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "tool_call_bare_param",
+                "xml",
+                r"<tool_call>\s*(\w+)\s*<parameter=(\w+)>\s*(.*?)\s*</parameter>\s*(?:</function>\s*)?(?:</tool_call>)?",
+                None,
+                1,
+                None,
+                "{}",
+                '{"file_path":"filePath","command":"command"}',
+                87,
+            ),
+        )
+
+        # Migration: update bare tool_call pattern to allow missing </tool_call>
+        cursor.execute(
+            """
+            UPDATE tool_patterns
+            SET regex_pattern = ?
+            WHERE pattern_name = 'tool_call_bare_param'
+            """,
+            (
+                r"<tool_call>\s*(\w+)\s*<parameter=(\w+)>\s*(.*?)\s*</parameter>\s*(?:</function>\s*)?(?:</tool_call>)?",
+            ),
         )
 
         conn.commit()
@@ -1410,309 +1612,303 @@ def get_backend(model_name: str = None) -> LLMBackend:
 # Initialize backend (uses env vars for default)
 BACKEND = get_backend()
 
+# Global tool patterns cache (loaded from DB)
+TOOL_PATTERNS = []
+
+
+def load_tool_patterns():
+    """Load tool patterns from database into memory cache."""
+    global TOOL_PATTERNS
+
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT id, pattern_name, pattern_type, regex_pattern,
+                       tool_name, tool_name_group, tool_name_json_path,
+                       tool_name_mapping, parameter_mapping, priority
+                FROM tool_patterns 
+                WHERE enabled = 1 
+                ORDER BY priority DESC
+            """)
+
+            TOOL_PATTERNS = []
+            for row in cursor.fetchall():
+                try:
+                    regex = re.compile(row["regex_pattern"], re.DOTALL)
+                    tool_map = (
+                        json.loads(row["tool_name_mapping"])
+                        if row["tool_name_mapping"]
+                        else {}
+                    )
+                    param_map = (
+                        json.loads(row["parameter_mapping"])
+                        if row["parameter_mapping"]
+                        else {}
+                    )
+                    TOOL_PATTERNS.append(
+                        {
+                            "id": row["id"],
+                            "name": row["pattern_name"],
+                            "type": row["pattern_type"],
+                            "regex": regex,
+                            "tool_name": row["tool_name"],
+                            "tool_name_group": row["tool_name_group"],
+                            "tool_name_json_path": row["tool_name_json_path"],
+                            "tool_map": tool_map,
+                            "param_map": param_map,
+                            "priority": row["priority"],
+                        }
+                    )
+                except re.error as e:
+                    print(
+                        f"Warning: Invalid regex in pattern '{row['pattern_name']}': {e}"
+                    )
+
+            print(f"Loaded {len(TOOL_PATTERNS)} tool patterns from database")
+    except Exception as e:
+        print(f"Error loading tool patterns: {e}")
+        TOOL_PATTERNS = []
+
+
+# Load patterns at module startup
+load_tool_patterns()
+
 
 def extract_tool_calls(content):
-    """Extract tool calls from content and return structured tool_calls + remaining text."""
+    """Extract tool calls from content using DB-driven patterns."""
     if not content:
         return [], content
 
-    fence_pattern = re.compile(r"```\s*(\w*)\s*\n?(.*?)```", re.DOTALL)
-    inline_pattern = re.compile(
-        r"(?:^|\s)(?:assistant)?commentary to=([\w_.]+)\s+(?:code|json|tool_call|func)\s*(\{[^}]*\})",
-        re.MULTILINE,
-    )
-    tool_use_pattern = re.compile(
-        r"<tool_use\s+code\s+name=\"(\w+)\"\s*>(.*?)</tool_use>", re.DOTALL
-    )
-    tool_code_pattern = re.compile(r"<tool_code>(.*?)</tool_code>", re.DOTALL)
-    tool_call_pattern = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
-    bracket_tool_pattern = re.compile(
-        r"\[Use the (\w+) tool to ([^\]]+)\]", re.IGNORECASE
-    )
-    # Pattern for [action description] format (e.g., "[searching for files]", "[using Task to do something]")
-    action_pattern = re.compile(r"\[([a-zA-Z][^\]]+)\]", re.IGNORECASE)
-
-    fence_matches = list(fence_pattern.finditer(content))
-    inline_matches = list(inline_pattern.finditer(content))
-    tool_use_matches = list(tool_use_pattern.finditer(content))
-    tool_code_matches = list(tool_code_pattern.finditer(content))
-    tool_call_matches = list(tool_call_pattern.finditer(content))
-    bracket_tool_matches = list(bracket_tool_pattern.finditer(content))
-    action_matches = list(action_pattern.finditer(content))
-
-    all_ranges = []
-    for m in fence_matches:
-        all_ranges.append(("fence", m.start(), m.end(), m))
-    for m in inline_matches:
-        all_ranges.append(("inline", m.start(), m.end(), m))
-    for m in tool_use_matches:
-        all_ranges.append(("tool_use", m.start(), m.end(), m))
-    for m in tool_code_matches:
-        all_ranges.append(("tool_code", m.start(), m.end(), m))
-    for m in tool_call_matches:
-        all_ranges.append(("tool_call", m.start(), m.end(), m))
-    for m in bracket_tool_matches:
-        all_ranges.append(("bracket_tool", m.start(), m.end(), m))
-    for m in action_matches:
-        all_ranges.append(("action", m.start(), m.end(), m))
-    all_ranges.sort(key=lambda x: x[1])
-
-    if not all_ranges:
+    if not TOOL_PATTERNS:
         return [], content
 
+    all_matches = []
+
+    # Try each pattern in priority order
+    for pattern in TOOL_PATTERNS:
+        try:
+            for m in pattern["regex"].finditer(content):
+                tool_name = None
+                raw_args = None
+
+                # Determine tool name via one of three modes:
+                if pattern["tool_name"]:  # Static
+                    tool_name = pattern["tool_name"]
+                elif pattern["tool_name_group"]:  # Dynamic from capture group
+                    tool_name = m.group(pattern["tool_name_group"])
+                elif pattern["tool_name_json_path"]:  # JSON extract
+                    try:
+                        inner = (m.group(1) or m.group(2) or "").strip()
+                        if inner.startswith("{"):
+                            obj = json.loads(inner)
+                            # Simple path like "name" or "arguments.name"
+                            path = pattern["tool_name_json_path"]
+                            if "." in path:
+                                parts = path.split(".")
+                                val = obj
+                                for p in parts:
+                                    val = val.get(p, {})
+                                tool_name = val
+                            else:
+                                tool_name = obj.get(path)
+                    except:
+                        pass
+                else:
+                    # Default: try to parse as JSON to get "name"
+                    # Check group(2) first (the content), then group(1) (lang specifier)
+                    try:
+                        groups = m.groups()
+                        # Use the largest group (last non-None)
+                        inner = None
+                        for g in reversed(groups):
+                            if g:
+                                inner = g.strip()
+                                break
+                        if inner and inner.startswith("{"):
+                            obj = json.loads(inner)
+                            tool_name = obj.get("name")
+                    except:
+                        pass
+
+                # Apply tool_name_mapping (e.g., read_file → read)
+                if tool_name:
+                    tool_name = pattern["tool_map"].get(tool_name, tool_name)
+
+                # For action patterns, detect tool from raw_args BEFORE the skip check
+                raw_args = ""
+                if pattern["type"] in ("fence", "inline", "xml", "bracket", "action"):
+                    if pattern["type"] == "fence":
+                        raw_args = m.group(2) if m.lastindex >= 2 else ""
+                    elif pattern["type"] == "inline":
+                        raw_args = m.group(2) if m.lastindex >= 2 else ""
+                    elif pattern["type"] == "xml":
+                        groups = m.groups()
+                        raw_args = groups[-1] if groups else ""
+                    elif pattern["type"] == "bracket":
+                        raw_args = m.group(2) if m.lastindex >= 2 else ""
+                    elif pattern["type"] == "action":
+                        raw_args = m.group(1) if m.lastindex >= 1 else ""
+                        # Detect tool from action content
+                        if raw_args:
+                            action_text = raw_args.lower()
+                            action_map = {
+                                "searching": "grep",
+                                "search": "grep",
+                                "using task": "task",
+                                "task": "task",
+                                "reading": "read",
+                                "read": "read",
+                                "listing": "glob",
+                                "ls": "glob",
+                                "glob": "glob",
+                                "writing": "write",
+                                "write": "write",
+                                "editing": "edit",
+                                "edit": "edit",
+                                "running": "bash",
+                                "bash": "bash",
+                                "executing": "bash",
+                            }
+                            for key, t in action_map.items():
+                                if key in action_text:
+                                    tool_name = t
+                                    break
+
+                # Skip invalid tool names
+                if not tool_name or tool_name == "tool_call":
+                    continue
+
+                # Parse arguments based on content
+                args_dict = {}
+
+                if raw_args:
+                    # Try to parse as JSON first
+                    if raw_args.startswith("{"):
+                        try:
+                            parsed = json.loads(raw_args)
+                            if "arguments" in parsed:
+                                parsed = parsed["arguments"]
+                            # Apply parameter mapping
+                            for k, v in parsed.items():
+                                mapped_key = pattern["param_map"].get(k, k)
+                                args_dict[mapped_key] = v
+                        except:
+                            # Not valid JSON, treat as raw text
+                            if "/" in raw_args or "\\" in raw_args:
+                                args_dict = {"filePath": raw_args.strip()}
+                            else:
+                                args_dict = {"value": raw_args.strip()}
+                    else:
+                        # Non-JSON content - check pattern type
+                        if pattern["type"] == "bracket":
+                            # Extract path from text
+                            import re as re_module
+
+                            path_match = re_module.search(
+                                r"(?:in\s+)?(/[^\s]+)", raw_args
+                            )
+                            if path_match:
+                                args_dict = {"filePath": path_match.group(1)}
+                            else:
+                                # Try keyword detection
+                                for prefix in [
+                                    "list files in ",
+                                    "search for ",
+                                    "read ",
+                                    "write ",
+                                    "edit ",
+                                ]:
+                                    if raw_args.lower().startswith(prefix):
+                                        raw_args = raw_args[len(prefix) :]
+                                        break
+                                if "/" in raw_args or "\\" in raw_args:
+                                    args_dict = {"filePath": raw_args.strip()}
+                                else:
+                                    args_dict = {"query": raw_args.strip()}
+                        elif pattern["type"] == "action":
+                            pass  # Already handled above
+                        else:
+                            # Default: treat as value
+                            if pattern["param_map"]:
+                                for k, v in pattern["param_map"].items():
+                                    args_dict[v] = raw_args.strip()
+                            else:
+                                args_dict = {"value": raw_args.strip()}
+
+                # Tool-specific argument normalization
+                if tool_name == "bash":
+                    # Some model formats send command text in filePath/value/query.
+                    if "command" not in args_dict:
+                        cmd = None
+                        for key in ("filePath", "file_path", "value", "query", "path"):
+                            if key in args_dict and isinstance(args_dict[key], str):
+                                cmd = args_dict[key]
+                                break
+                        if not cmd and isinstance(raw_args, str) and raw_args.strip():
+                            cmd = raw_args.strip()
+                        if cmd:
+                            args_dict["command"] = cmd
+                    # Bash tool schema requires a description field.
+                    if "description" not in args_dict:
+                        args_dict["description"] = "Run bash command"
+                    # Keep bash args schema-compatible (avoid unrelated keys).
+                    args_dict = {
+                        "command": args_dict.get("command", ""),
+                        "description": args_dict.get("description", "Run bash command"),
+                    }
+
+                args_str = json.dumps(args_dict, ensure_ascii=False)
+
+                all_matches.append(
+                    {
+                        "start": m.start(),
+                        "end": m.end(),
+                        "tool_name": tool_name,
+                        "args_str": args_str,
+                    }
+                )
+        except Exception as e:
+            print(f"Error processing pattern {pattern.get('name', 'unknown')}: {e}")
+            continue
+
+    # Sort by position
+    all_matches.sort(key=lambda x: x["start"])
+
+    # Remove overlapping matches (first one wins)
+    filtered = []
+    last_end = -1
+    for match in all_matches:
+        if match["start"] >= last_end:
+            filtered.append(match)
+            last_end = match["end"]
+
+    # Build tool_calls list
     tool_calls = []
     parts = []
     last_end = 0
 
-    for match_type, start, end, match in all_ranges:
+    for match in filtered:
+        start = match["start"]
+        end = match["end"]
+
         if start > last_end:
             parts.append(content[last_end:start])
 
-        if match_type == "fence":
-            lang = match.group(1).strip()
-            inner = match.group(2).strip()
-
-            if not inner:
-                continue
-
-            is_json_content = inner.startswith("{")
-
-            if lang == "tool_call" or is_json_content:
-                json_objs = parse_json_objects(inner)
-                for obj in json_objs:
-                    name = obj.get("name")
-                    args = obj.get("arguments")
-                    if name and args:
-                        if isinstance(args, str):
-                            try:
-                                args = json.loads(
-                                    args.replace("\r\n", "\n").replace("\r", "\n")
-                                )
-                            except (json.JSONDecodeError, ValueError):
-                                args_fixed = args.replace("\n", "\\n").replace(
-                                    "\r", "\\r"
-                                )
-                                try:
-                                    args = json.loads(args_fixed)
-                                except (json.JSONDecodeError, ValueError):
-                                    pass
-                        args_str = json.dumps(args, ensure_ascii=False)
-                        tool_calls.append(
-                            {
-                                "id": f"call_{int(time.time() * 1000)}_{len(tool_calls)}",
-                                "type": "function",
-                                "function": {"name": name, "arguments": args_str},
-                            }
-                        )
-            else:
-                full_call = inner
-                if lang:
-                    full_call = (lang + " " + inner).strip()
-                bare = _parse_bare_call(full_call)
-                if bare:
-                    tool_calls.append(
-                        {
-                            "id": f"call_{int(time.time() * 1000)}_{len(tool_calls)}",
-                            "type": "function",
-                            "function": {"name": bare[0], "arguments": bare[1]},
-                        }
-                    )
-                else:
-                    # Try to parse "lang tool_name argument" format (e.g., "bash read /etc/hostname")
-                    # The model outputs code fences like ```bash\nread /etc/hostname\n```
-                    # which becomes "bash read /etc/hostname" after stripping
-                    call_parts = full_call.strip().split(None, 1)
-                    if len(call_parts) == 2:
-                        # call_parts[0] = "bash read", call_parts[1] = rest
-                        # Actually split only once, so if full_call = "bash read /etc/hostname"
-                        # call_parts = ["bash", "read /etc/hostname"]
-                        second_parts = call_parts[1].strip().split(None, 1)
-                        if len(second_parts) >= 1:
-                            tool_name = second_parts[0]
-                            args_str = second_parts[1] if len(second_parts) == 2 else ""
-                            if tool_name in KNOWN_TOOL_NAMES:
-                                # Wrap in a JSON object
-                                try:
-                                    args_json = (
-                                        json.dumps({"command": args_str})
-                                        if tool_name == "bash"
-                                        else json.dumps({"filePath": args_str})
-                                    )
-                                except:
-                                    args_json = json.dumps({"value": args_str})
-                                tool_calls.append(
-                                    {
-                                        "id": f"call_{int(time.time() * 1000)}_{len(tool_calls)}",
-                                        "type": "function",
-                                        "function": {
-                                            "name": tool_name,
-                                            "arguments": args_json,
-                                        },
-                                    }
-                                )
-        elif match_type == "tool_use":
-            tool_name = match.group(1)
-            args_inner = match.group(2).strip()
-            try:
-                args_obj = json.loads(args_inner)
-                actual_args = args_obj.get("arguments", {})
-                args_str = json.dumps(actual_args, ensure_ascii=False)
-            except (json.JSONDecodeError, ValueError, AttributeError):
-                args_str = _fix_json_newlines(args_inner)
-            tool_calls.append(
-                {
-                    "id": f"call_{int(time.time() * 1000)}_{len(tool_calls)}",
-                    "type": "function",
-                    "function": {"name": tool_name, "arguments": args_str},
-                }
-            )
-        elif match_type == "tool_code":
-            inner = match.group(1).strip()
-            json_objs = parse_json_objects(inner)
-            for obj in json_objs:
-                name = obj.get("name")
-                args = obj.get("arguments")
-                if name and args:
-                    if isinstance(args, str):
-                        try:
-                            args = json.loads(
-                                args.replace("\r\n", "\n").replace("\r", "\n")
-                            )
-                        except (json.JSONDecodeError, ValueError):
-                            args_fixed = args.replace("\n", "\\n").replace("\r", "\\r")
-                            try:
-                                args = json.loads(args_fixed)
-                            except (json.JSONDecodeError, ValueError):
-                                pass
-                    args_str = json.dumps(args, ensure_ascii=False)
-                    tool_calls.append(
-                        {
-                            "id": f"call_{int(time.time() * 1000)}_{len(tool_calls)}",
-                            "type": "function",
-                            "function": {"name": name, "arguments": args_str},
-                        }
-                    )
-        elif match_type == "tool_call":
-            inner = match.group(1).strip()
-            json_objs = parse_json_objects(inner)
-            for obj in json_objs:
-                name = obj.get("name")
-                args = obj.get("arguments")
-                if name and args:
-                    if isinstance(args, str):
-                        try:
-                            args = json.loads(
-                                args.replace("\r\n", "\n").replace("\r", "\n")
-                            )
-                        except (json.JSONDecodeError, ValueError):
-                            args_fixed = args.replace("\n", "\\n").replace("\r", "\\r")
-                            try:
-                                args = json.loads(args_fixed)
-                            except (json.JSONDecodeError, ValueError):
-                                pass
-                    args_str = json.dumps(args, ensure_ascii=False)
-                    tool_calls.append(
-                        {
-                            "id": f"call_{int(time.time() * 1000)}_{len(tool_calls)}",
-                            "type": "function",
-                            "function": {"name": name, "arguments": args_str},
-                        }
-                    )
-        elif match_type == "bracket_tool":
-            tool_name = match.group(1).strip().lower()
-            args_text = match.group(2).strip()
-            tool_map = {
-                "ls": "glob",
-                "glob": "glob",
-                "read_file": "read",
-                "read": "read",
-                "grep": "grep",
-                "write_file": "write",
-                "write": "write",
-                "edit_file": "edit",
-                "edit": "edit",
-                "bash": "bash",
-                "search": "grep",
+        tool_calls.append(
+            {
+                "id": f"call_{int(time.time() * 1000)}_{len(tool_calls)}",
+                "type": "function",
+                "function": {
+                    "name": match["tool_name"],
+                    "arguments": match["args_str"],
+                },
             }
-            mapped_name = tool_map.get(tool_name, tool_name)
-            # Extract path - look for patterns like "/path" or "in /path"
-            import re as re_module
-
-            path_match = re_module.search(r"(?:in\s+)?(/[^\s]+)", args_text)
-            if path_match:
-                args_text = path_match.group(1)
-            else:
-                # Remove common prefixes
-                for prefix in [
-                    "list files in ",
-                    "search for ",
-                    "read ",
-                    "write ",
-                    "edit ",
-                ]:
-                    if args_text.lower().startswith(prefix):
-                        args_text = args_text[len(prefix) :]
-                        break
-            if "/" in args_text or "\\" in args_text:
-                args_dict = {"filePath": args_text}
-            else:
-                args_dict = {"query": args_text}
-            args_str = json.dumps(args_dict, ensure_ascii=False)
-            tool_calls.append(
-                {
-                    "id": f"call_{int(time.time() * 1000)}_{len(tool_calls)}",
-                    "type": "function",
-                    "function": {"name": mapped_name, "arguments": args_str},
-                }
-            )
-        elif match_type == "action":
-            action_text = match.group(1).strip()
-            # Try to identify tool from action text
-            tool_map = {
-                "searching": "grep",
-                "search": "grep",
-                "using task": "task",
-                "task": "task",
-                "reading": "read",
-                "read": "read",
-                "listing": "glob",
-                "ls": "glob",
-                "glob": "glob",
-                "writing": "write",
-                "write": "write",
-                "editing": "edit",
-                "edit": "edit",
-                "running": "bash",
-                "bash": "bash",
-                "executing": "bash",
-            }
-            detected_tool = None
-            for key, tool in tool_map.items():
-                if key in action_text.lower():
-                    detected_tool = tool
-                    break
-            if detected_tool:
-                args_dict = {"action": action_text}
-                args_str = json.dumps(args_dict, ensure_ascii=False)
-                tool_calls.append(
-                    {
-                        "id": f"call_{int(time.time() * 1000)}_{len(tool_calls)}",
-                        "type": "function",
-                        "function": {"name": detected_tool, "arguments": args_str},
-                    }
-                )
-        else:
-            tool_name = match.group(1)
-            args_str = match.group(2)
-            tool_calls.append(
-                {
-                    "id": f"call_{int(time.time() * 1000)}_{len(tool_calls)}",
-                    "type": "function",
-                    "function": {"name": tool_name, "arguments": args_str},
-                }
-            )
+        )
 
         last_end = end
+
+    # Continue with existing cleanup code...
 
     if last_end < len(content):
         remaining = content[last_end:].strip()
@@ -1919,6 +2115,18 @@ def _parse_bare_call(text):
 
 def process_content(content):
     """Process model output, removing chain-of-thought and extracting tool calls."""
+
+    def _normalize_markdown_layout(text):
+        """Heuristic fix for one-line markdown responses from some models."""
+        if not text:
+            return text
+        # Add structure breaks before markdown blocks that were flattened into one line
+        text = re.sub(r"\s+(?=##\s)", "\n\n", text)
+        text = re.sub(r"\s+(?=###\s)", "\n\n", text)
+        text = re.sub(r"\s+(?=-\s)", "\n", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
+
     if not content:
         return None, None
 
@@ -1958,6 +2166,7 @@ def process_content(content):
         cleaned = re.sub(
             r"\n\s*_Thinking:.*$", "", cleaned, flags=re.IGNORECASE | re.MULTILINE
         )
+        cleaned = _normalize_markdown_layout(cleaned)
         return tool_calls, cleaned if cleaned else None
 
     if "final:" in content:
@@ -1984,6 +2193,7 @@ def process_content(content):
         r"\n\s*_Thinking:.*$", "", content, flags=re.IGNORECASE | re.MULTILINE
     )
 
+    content = _normalize_markdown_layout(content)
     return None, content
 
 
@@ -3316,8 +3526,10 @@ async def embeddings(request: Request):
 def validate_session(flask_cookies=None):
     """Proxy session validation to ai-menu-system. Accepts cookies dict for FastAPI compatibility."""
     # Skip auth if disabled
-    print(f"DEBUG: AUTH_ENABLED = {AUTH_ENABLED}, type = {type(AUTH_ENABLED)}")
-    if not AUTH_ENABLED:
+    print(
+        f"DEBUG: AUTH_ENABLED = {is_auth_enabled()}, type = {type(is_auth_enabled())}"
+    )
+    if not is_auth_enabled():
         return {"valid": True, "user": "admin"}
 
     try:
@@ -3341,7 +3553,7 @@ def validate_session(flask_cookies=None):
 def validate_session_fastapi(request: Request):
     """FastAPI version of session validation."""
     # Skip auth if disabled
-    if not AUTH_ENABLED:
+    if not is_auth_enabled():
         return {"valid": True, "user": "admin"}
 
     try:
@@ -3387,7 +3599,7 @@ def admin_index():
         user=auth.get("username"),
         endpoints=endpoints,
         virtual_models=virtual_models,
-        auth_enabled=AUTH_ENABLED,
+        auth_enabled=is_auth_enabled(),
         use_ai_queue=get_setting("use_ai_queue", "false") == "true",
     )
 
@@ -3416,14 +3628,49 @@ def proxy_dashboard():
         user=auth.get("username"),
         endpoints=endpoints,
         virtual_models=virtual_models,
-        auth_enabled=AUTH_ENABLED,
+        auth_enabled=is_auth_enabled(),
         use_ai_queue=get_setting("use_ai_queue", "false") == "true",
     )
 
 
 @flask_app.route("/endpoints", methods=["GET", "POST"])
 def admin_endpoints():
-    """Redirect to main dashboard - endpoints are managed via modal."""
+    """Create endpoint or redirect to admin."""
+    # Handle POST to create new endpoint
+    if flask_request.method == "POST":
+        auth = validate_session()
+        if not auth.get("valid"):
+            return flask_jsonify({"error": "Unauthorized"}), 401
+
+        data = flask_request.get_json()
+        if not data:
+            return flask_jsonify({"error": "No data provided"}), 400
+
+        try:
+            with get_db() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    INSERT INTO endpoints (name, url, api_key, endpoint_type, priority, enabled)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                    (
+                        data.get("name"),
+                        data.get("url"),
+                        data.get("api_key", ""),
+                        data.get("endpoint_type", "openai"),
+                        int(data.get("priority", 0)),
+                        1 if data.get("enabled", True) else 0,
+                    ),
+                )
+                conn.commit()
+                new_id = cursor.lastrowid
+
+            return flask_jsonify({"id": new_id, "status": "ok"})
+        except Exception as e:
+            return flask_jsonify({"error": str(e)}), 400
+
+    # GET redirects to admin
     return redirect("/admin")
 
 
@@ -3459,7 +3706,7 @@ def update_endpoint(endpoint_id):
     return flask_jsonify({"status": "ok"})
 
 
-@flask_app.route("/endpoints/<int:endpoint_id>/delete")
+@flask_app.route("/endpoints/<int:endpoint_id>/delete", methods=["GET", "DELETE"])
 def delete_endpoint(endpoint_id):
     """Delete endpoint."""
     auth = validate_session()
@@ -3611,7 +3858,7 @@ def create_virtual_model():
                 cost_per_1m_tokens_in_cached, cost_per_1m_tokens_out_cached,
                 disable_streaming, force_non_streaming, custom_headers,
                 enabled, max_tokens, temperature, top_p, system_prompt, show_reasoning
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
             (
                 data.get("name"),
@@ -3638,7 +3885,7 @@ def create_virtual_model():
     return flask_jsonify({"status": "ok"})
 
 
-@flask_app.route("/virtual-models/<int:vm_id>/delete")
+@flask_app.route("/virtual-models/<int:vm_id>/delete", methods=["GET", "DELETE"])
 def delete_virtual_model(vm_id):
     """Delete virtual model."""
     auth = validate_session()
@@ -3706,6 +3953,101 @@ def api_admin_endpoints():
     return flask_jsonify(endpoints)
 
 
+@flask_app.route("/api/admin/endpoints", methods=["POST"])
+def api_admin_endpoints_create():
+    """API: Create new endpoint."""
+    auth = validate_session()
+    if not auth.get("valid"):
+        return flask_jsonify({"error": "Unauthorized"}), 401
+
+    data = flask_request.json
+    if not data:
+        return flask_jsonify({"error": "No data provided"}), 400
+
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO endpoints (name, url, api_key, endpoint_type, priority, enabled)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """,
+                (
+                    data.get("name"),
+                    data.get("url"),
+                    data.get("api_key", ""),
+                    data.get("endpoint_type", "openai"),
+                    int(data.get("priority", 0)),
+                    1 if data.get("enabled", True) else 0,
+                ),
+            )
+            conn.commit()
+            new_id = cursor.lastrowid
+
+        return flask_jsonify({"id": new_id, "status": "ok"})
+    except Exception as e:
+        return flask_jsonify({"error": str(e)}), 400
+
+
+@flask_app.route("/api/admin/endpoints/<int:endpoint_id>", methods=["PUT"])
+def api_admin_endpoints_update(endpoint_id):
+    """API: Update endpoint."""
+    auth = validate_session()
+    if not auth.get("valid"):
+        return flask_jsonify({"error": "Unauthorized"}), 401
+
+    data = flask_request.json
+    if not data:
+        return flask_jsonify({"error": "No data provided"}), 400
+
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE endpoints 
+                SET name = ?, url = ?, api_key = ?, endpoint_type = ?, priority = ?, enabled = ?,
+                    updated_at = strftime('%s', 'now')
+                WHERE id = ?
+            """,
+                (
+                    data.get("name"),
+                    data.get("url"),
+                    data.get("api_key", ""),
+                    data.get("endpoint_type", "openai"),
+                    int(data.get("priority", 0)),
+                    1 if data.get("enabled", True) else 0,
+                    endpoint_id,
+                ),
+            )
+            conn.commit()
+
+        return flask_jsonify({"status": "ok"})
+    except Exception as e:
+        return flask_jsonify({"error": str(e)}), 400
+
+
+@flask_app.route("/api/admin/endpoints/<int:endpoint_id>", methods=["DELETE"])
+def api_admin_endpoints_delete(endpoint_id):
+    """API: Delete endpoint."""
+    auth = validate_session()
+    if not auth.get("valid"):
+        return flask_jsonify({"error": "Unauthorized"}), 401
+
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "DELETE FROM virtual_models WHERE endpoint_id = ?", (endpoint_id,)
+            )
+            cursor.execute("DELETE FROM endpoints WHERE id = ?", (endpoint_id,))
+            conn.commit()
+
+        return flask_jsonify({"status": "ok"})
+    except Exception as e:
+        return flask_jsonify({"error": str(e)}), 400
+
+
 @flask_app.route("/api/admin/virtual-models", methods=["GET"])
 def api_admin_virtual_models():
     """API: List all virtual models."""
@@ -3745,7 +4087,7 @@ def save_setting(key, value):
 @flask_app.route("/session/validate", methods=["GET"])
 def session_validate():
     """Local session validation - returns valid if auth disabled."""
-    if not AUTH_ENABLED:
+    if not is_auth_enabled():
         return flask_jsonify(
             {
                 "valid": True,
@@ -3875,6 +4217,184 @@ def api_admin_settings_post():
             "message": restart_message,
         }
     )
+
+
+# ==========================================
+# Tool Patterns API Endpoints
+# ==========================================
+
+
+@flask_app.route("/api/admin/tool-patterns", methods=["GET"])
+def api_admin_tool_patterns():
+    """API: List all tool patterns."""
+    auth = validate_session()
+    if not auth.get("valid"):
+        return flask_jsonify({"error": "Unauthorized"}), 401
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM tool_patterns ORDER BY priority DESC")
+        patterns = [dict(row) for row in cursor.fetchall()]
+
+    return flask_jsonify(patterns)
+
+
+@flask_app.route("/tool-patterns", methods=["GET"])
+def tool_patterns_list_legacy():
+    """Legacy alias for listing tool patterns."""
+    return api_admin_tool_patterns()
+
+
+@flask_app.route("/endpoints/patterns", methods=["GET"])
+def tool_patterns_list_endpoints_alias():
+    """Endpoints-prefixed alias for environments proxying /endpoints* only."""
+    return api_admin_tool_patterns()
+
+
+@flask_app.route("/api/admin/tool-patterns", methods=["POST"])
+def api_admin_tool_patterns_create():
+    """API: Create a new tool pattern."""
+    auth = validate_session()
+    if not auth.get("valid"):
+        return flask_jsonify({"error": "Unauthorized"}), 401
+
+    data = flask_request.json
+    if not data:
+        return flask_jsonify({"error": "No data provided"}), 400
+
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO tool_patterns 
+                (pattern_name, pattern_type, regex_pattern, tool_name, tool_name_group, 
+                 tool_name_json_path, tool_name_mapping, parameter_mapping, enabled, priority)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+                (
+                    data.get("pattern_name"),
+                    data.get("pattern_type", "fence"),
+                    data.get("regex_pattern", ""),
+                    data.get("tool_name"),
+                    data.get("tool_name_group"),
+                    data.get("tool_name_json_path"),
+                    data.get("tool_name_mapping", "{}"),
+                    data.get("parameter_mapping", "{}"),
+                    1 if data.get("enabled", True) else 0,
+                    int(data.get("priority", 50)),
+                ),
+            )
+            conn.commit()
+            new_id = cursor.lastrowid
+
+        load_tool_patterns()
+
+        return flask_jsonify({"id": new_id, "status": "ok"})
+    except Exception as e:
+        return flask_jsonify({"error": str(e)}), 400
+
+
+@flask_app.route("/tool-patterns", methods=["POST"])
+def tool_patterns_create_legacy():
+    """Legacy alias for creating tool patterns."""
+    return api_admin_tool_patterns_create()
+
+
+@flask_app.route("/endpoints/patterns", methods=["POST"])
+def tool_patterns_create_endpoints_alias():
+    """Endpoints-prefixed alias for environments proxying /endpoints* only."""
+    return api_admin_tool_patterns_create()
+
+
+@flask_app.route("/api/admin/tool-patterns/<int:pattern_id>", methods=["PUT"])
+def api_admin_tool_patterns_update(pattern_id):
+    """API: Update a tool pattern."""
+    auth = validate_session()
+    if not auth.get("valid"):
+        return flask_jsonify({"error": "Unauthorized"}), 401
+
+    data = flask_request.json
+    if not data:
+        return flask_jsonify({"error": "No data provided"}), 400
+
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE tool_patterns 
+                SET pattern_name = ?, pattern_type = ?, regex_pattern = ?, tool_name = ?,
+                    tool_name_group = ?, tool_name_json_path = ?, tool_name_mapping = ?,
+                    parameter_mapping = ?, enabled = ?, priority = ?,
+                    updated_at = strftime('%s', 'now')
+                WHERE id = ?
+            """,
+                (
+                    data.get("pattern_name"),
+                    data.get("pattern_type", "fence"),
+                    data.get("regex_pattern", ""),
+                    data.get("tool_name"),
+                    data.get("tool_name_group"),
+                    data.get("tool_name_json_path"),
+                    data.get("tool_name_mapping", "{}"),
+                    data.get("parameter_mapping", "{}"),
+                    1 if data.get("enabled", True) else 0,
+                    int(data.get("priority", 50)),
+                    pattern_id,
+                ),
+            )
+            conn.commit()
+
+        load_tool_patterns()
+
+        return flask_jsonify({"status": "ok"})
+    except Exception as e:
+        return flask_jsonify({"error": str(e)}), 400
+
+
+@flask_app.route("/tool-patterns/<int:pattern_id>", methods=["PUT"])
+def tool_patterns_update_legacy(pattern_id):
+    """Legacy alias for updating tool patterns."""
+    return api_admin_tool_patterns_update(pattern_id)
+
+
+@flask_app.route("/endpoints/patterns/<int:pattern_id>", methods=["PUT"])
+def tool_patterns_update_endpoints_alias(pattern_id):
+    """Endpoints-prefixed alias for environments proxying /endpoints* only."""
+    return api_admin_tool_patterns_update(pattern_id)
+
+
+@flask_app.route("/api/admin/tool-patterns/<int:pattern_id>", methods=["DELETE"])
+def api_admin_tool_patterns_delete(pattern_id):
+    """API: Delete a tool pattern."""
+    auth = validate_session()
+    if not auth.get("valid"):
+        return flask_jsonify({"error": "Unauthorized"}), 401
+
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM tool_patterns WHERE id = ?", (pattern_id,))
+            conn.commit()
+
+        load_tool_patterns()
+
+        return flask_jsonify({"status": "ok"})
+    except Exception as e:
+        return flask_jsonify({"error": str(e)}), 400
+
+
+@flask_app.route("/tool-patterns/<int:pattern_id>", methods=["DELETE"])
+def tool_patterns_delete_legacy(pattern_id):
+    """Legacy alias for deleting tool patterns."""
+    return api_admin_tool_patterns_delete(pattern_id)
+
+
+@flask_app.route("/endpoints/patterns/<int:pattern_id>", methods=["DELETE"])
+def tool_patterns_delete_endpoints_alias(pattern_id):
+    """Endpoints-prefixed alias for environments proxying /endpoints* only."""
+    return api_admin_tool_patterns_delete(pattern_id)
 
 
 if __name__ == "__main__":
