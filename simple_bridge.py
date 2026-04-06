@@ -1140,7 +1140,7 @@ class RunPodBackend(LLMBackend):
     """RunPod Serverless backend."""
 
     def __init__(self):
-        pass
+        self.endpoint_type = "runpod"
 
     def _build_payload(
         self,
@@ -1447,6 +1447,23 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
                 "stream": stream,
             }
 
+            # Debug: log message structure for vision requests
+            if messages:
+                first_user = None
+                for msg in messages:
+                    if msg.get("role") == "user":
+                        first_user = msg
+                        break
+                if first_user:
+                    content = first_user.get("content", "")
+                    if isinstance(content, list):
+                        for c in content:
+                            if isinstance(c, dict) and c.get("type") == "image_url":
+                                debug_log(
+                                    "info",
+                                    f"[VM_PAYLOAD] request_id={request_id} has_vision=True model={self.model} endpoint_type={self.endpoint_type}",
+                                )
+
             # Anthropic-specific payload transformation
             if self.endpoint_type == "anthropic":
                 # Extract system prompt from messages if present
@@ -1549,6 +1566,10 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
                         endpoint, headers=headers, json=payload
                     )
                 except Exception as e:
+                    debug_log(
+                        "error",
+                        f"[VM_BACKEND_ERR] request_id={request_id} error={str(e)}",
+                    )
                     return (
                         None,
                         {
@@ -1655,7 +1676,15 @@ def get_backend(model_name: str = None) -> LLMBackend:
     if model_name:
         vm = get_virtual_model(model_name)
         if vm:
+            debug_log(
+                "info",
+                f"[BACKEND] Using virtual model backend: {model_name} -> {vm.get('endpoint_type')}",
+            )
             return create_backend_from_virtual_model(vm)
+        else:
+            debug_log(
+                "warn", f"[BACKEND] Model not found in virtual_models: {model_name}"
+            )
 
     # Check database for use_ai_queue setting, fallback to env var
     use_queue = (
@@ -2270,6 +2299,7 @@ async def chat_completions(request: Request):
     data = await request.json()
 
     messages = data.get("messages", [])
+
     model = data.get("model")
     temperature = data.get("temperature", 0.7)
     max_tokens = data.get("max_tokens", 256)
@@ -2484,7 +2514,24 @@ async def chat_completions(request: Request):
                     f"Stream parse error: line={stats['total_lines']}, error={str(e)[:60]}",
                 )
 
-        extracted_tc, text_content = process_content(full_content)
+        # Skip all content processing for vision requests - prevents corrupting image data
+        has_vision = any(
+            isinstance(c, dict) and c.get("type") == "image_url"
+            for msg in messages
+            if isinstance(msg, dict)
+            for c in (msg.get("content") or [])
+        )
+
+        if has_vision:
+            debug_log(
+                "info",
+                f"[BYPASS_PROCESS] request_id={request_id} skipping process_content for vision request",
+            )
+            text_content = full_content
+            extracted_tc = stream_tool_calls if stream_tool_calls else []
+        else:
+            extracted_tc, text_content = process_content(full_content)
+
         if stream_tool_calls and not extracted_tc:
             extracted_tc = stream_tool_calls
 
@@ -2650,12 +2697,28 @@ async def chat_completions(request: Request):
     # Extract system_fingerprint if present (OA-4)
     system_fingerprint = result.get("system_fingerprint")
 
-    # Process content to extract tool calls
-    extracted_tc, text_content = process_content(content)
-    if extracted_tc:
-        tool_calls_data = extracted_tc
-    elif not tool_calls_data:
-        text_content = text_content or content
+    # Skip all content processing for vision requests - prevents corrupting image data
+    has_vision = any(
+        isinstance(c, dict) and c.get("type") == "image_url"
+        for msg in messages
+        if isinstance(msg, dict)
+        for c in (msg.get("content") or [])
+    )
+
+    if has_vision:
+        debug_log(
+            "info",
+            f"[BYPASS_PROCESS] request_id={request_id} skipping process_content for vision request (non-stream)",
+        )
+        text_content = content
+        extracted_tc = []
+    else:
+        # Process content to extract tool calls
+        extracted_tc, text_content = process_content(content)
+        if extracted_tc:
+            tool_calls_data = extracted_tc
+        elif not tool_calls_data:
+            text_content = text_content or content
 
     job_id = result.get("id", f"chat-{int(time_module.time())}")
 
@@ -3373,8 +3436,9 @@ async def anthropic_messages(request: Request):
                     {"role": "assistant", "content": str(content) if content else ""}
                 )
         elif role == "user":
-            # Handle tool_result in content
+            # Handle tool_result and image_url in content
             if isinstance(content, list):
+                user_content_blocks = []
                 for block in content:
                     if block.get("type") == "tool_result":
                         converted_messages.append(
@@ -3384,10 +3448,19 @@ async def anthropic_messages(request: Request):
                                 "content": block.get("content", ""),
                             }
                         )
-                    else:
-                        converted_messages.append(
-                            {"role": "user", "content": block.get("text", "")}
+                    elif block.get("type") == "image_url":
+                        # Preserve image_url blocks - don't strip them
+                        user_content_blocks.append(block)
+                    elif block.get("type") == "text":
+                        user_content_blocks.append(
+                            {"type": "text", "text": block.get("text", "")}
                         )
+
+                # If we have image blocks, send as list
+                if user_content_blocks:
+                    converted_messages.append(
+                        {"role": "user", "content": user_content_blocks}
+                    )
             else:
                 converted_messages.append(
                     {"role": "user", "content": str(content) if content else ""}
