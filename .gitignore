@@ -64,3 +64,4 @@ archive/
 
 # Data (SQLite database, etc)
 data/
+proxy.db
