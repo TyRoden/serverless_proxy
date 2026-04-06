@@ -45,6 +45,8 @@ session-*.md
 # Internal / development docs
 AGENTS.md
 AGENTS-OLD.md
+PROJECT.md
+UPGRADES.md
 docs/session_export_toolcall_playbook.md
 docs/token_tracking_implementation.md
 install-serverless-proxy-backup.sh
