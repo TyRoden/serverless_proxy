@@ -587,35 +587,29 @@
     
     function showTab(tabName) {
         currentTab = tabName;
-        
+
         // Update nav links
         document.querySelectorAll('.nav a').forEach(a => a.classList.remove('active'));
+        const tabIndex = { dashboard: 0, usage: 1, settings: 2, patterns: 3 };
+        document.querySelectorAll('.nav a')[tabIndex[tabName] ?? 0].classList.add('active');
+
+        // Hide all tab sections first
+        document.getElementById('dashboard-section').classList.add('hidden');
+        document.getElementById('usage-section').classList.add('hidden');
+        document.getElementById('settings-section').classList.add('hidden');
+        document.getElementById('patterns-section').classList.add('hidden');
+
         if (tabName === 'usage') {
-            document.querySelectorAll('.nav a')[1].classList.add('active');
-        } else {
-            document.querySelectorAll('.nav a')[0].classList.add('active');
-        }
-        
-        if (tabName === 'usage') {
-            document.getElementById('dashboard-section').classList.add('hidden');
             document.getElementById('usage-section').classList.remove('hidden');
-            document.getElementById('settings-section').classList.add('hidden');
             loadUsage();
         } else if (tabName === 'settings') {
-            document.getElementById('dashboard-section').classList.add('hidden');
-            document.getElementById('usage-section').classList.add('hidden');
             document.getElementById('settings-section').classList.remove('hidden');
             loadSettings();
         } else if (tabName === 'patterns') {
-            document.getElementById('dashboard-section').classList.add('hidden');
-            document.getElementById('usage-section').classList.add('hidden');
-            document.getElementById('settings-section').classList.add('hidden');
             document.getElementById('patterns-section').classList.remove('hidden');
             loadPatterns();
         } else {
             document.getElementById('dashboard-section').classList.remove('hidden');
-            document.getElementById('usage-section').classList.add('hidden');
-            document.getElementById('settings-section').classList.add('hidden');
             loadEndpoints();
             loadVirtualModels();
         }

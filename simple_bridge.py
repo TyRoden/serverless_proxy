@@ -103,6 +103,20 @@ def get_flask_port():
     return int(get_setting("flask_port", os.getenv("FLASK_PORT", "5001")))
 
 
+def is_debug_mode():
+    """Check if debug mode is enabled. Returns 'off', 'basic', or 'full'."""
+    return get_setting("debug_mode", "off")
+
+
+def debug_log(level, msg):
+    """Log message if debug mode is enabled. level: 'info', 'warn', 'error'."""
+    mode = is_debug_mode()
+    if mode == "off":
+        return
+    if level == "error" or level == "warn" or mode == "full":
+        print(f"[DEBUG:{level.upper()}] {msg}", flush=True)
+
+
 def init_database():
     """Initialize database tables."""
     with get_db() as conn:
@@ -357,6 +371,9 @@ def init_database():
         )
         cursor.execute(
             "INSERT OR IGNORE INTO settings (key, value) VALUES ('ai_queue_url', 'http://host.docker.internal:8102')"
+        )
+        cursor.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('debug_mode', 'basic')"
         )
 
         conn.commit()
@@ -1390,6 +1407,9 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
             tools=None,
             **kwargs,
         ):
+            # Extract request_id for correlation
+            request_id = kwargs.pop("_request_id", None)
+
             # Force non-streaming if disabled in model config
             if self.disable_streaming:
                 stream = False
@@ -1401,6 +1421,12 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
             # Add X-Source header for tracking - use incoming from kwargs if available
             incoming_src = kwargs.get("_incoming_source", "serverless-proxy")
             headers["X-Source"] = incoming_src
+
+            # Upstream request logging
+            debug_log(
+                "info",
+                f"[UPSTREAM_REQ] request_id={request_id} backend={self.endpoint_type} url={self.url} model={self.model} stream={stream}",
+            )
 
             # Add custom headers if configured
             if self.custom_headers:
@@ -1457,6 +1483,29 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
                 if tools:
                     payload["tools"] = tools
 
+            # For non-Anthropic backends (OpenAI-compatible), always add tools if provided
+            # This ensures tool_choice works correctly
+            if self.endpoint_type != "anthropic" and tools:
+                payload["tools"] = tools
+
+            # Safety: if tool_choice/parallel_tool_calls but no tools, strip them to avoid upstream validation errors
+            # This can happen when client sends tool_choice but tools get lost in transformation
+            tool_choice = kwargs.get("tool_choice")
+            parallel_tool_calls = kwargs.get("parallel_tool_calls")
+            if (
+                tool_choice is not None or parallel_tool_calls is not None
+            ) and not tools:
+                debug_log(
+                    "warn",
+                    f"[TOOL_SAFETY] Stripping tool_choice/parallel_tool_calls - no tools provided. request_id={request_id}",
+                )
+                # Remove these from kwargs before they're added to payload
+                kwargs = {
+                    k: v
+                    for k, v in kwargs.items()
+                    if k not in ("tool_choice", "parallel_tool_calls")
+                }
+
             for k, v in kwargs.items():
                 if v is not None and k not in [
                     "stop",
@@ -1489,8 +1538,9 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
                 endpoint = f"{self.url}/v1/chat/completions"
 
             timeout = 1200.0 if stream else 300.0
-            print(
-                f"[VM_BACKEND] Calling {endpoint}, model={payload.get('model')}, stream={stream}"
+            debug_log(
+                "info",
+                f"[VM_BACKEND] request_id={request_id} Calling {endpoint}, model={payload.get('model')}, stream={stream}",
             )
 
             async with httpx.AsyncClient(timeout=timeout) as client:
@@ -1525,6 +1575,10 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
                 try:
                     if stream:
                         # For streaming, return the raw text (SSE format)
+                        debug_log(
+                            "info",
+                            f"[VM_BACKEND_RESP] request_id={request_id} status={response.status_code} len={len(response.text)} stream=true",
+                        )
                         return {"_stream_data": response.text}, None, 200
                     result = response.json()
                     # Debug: log response details
@@ -1535,14 +1589,19 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
                         content = msg.get("content") or ""
                         tc = msg.get("tool_calls") or []
                         finish = first_choice.get("finish_reason")
-                        print(
-                            f"[VM_BACKEND_RESP] Content: '{content[:100]}', Tool calls: {len(tc)}, Finish: {finish}"
+                        debug_log(
+                            "info",
+                            f"[VM_BACKEND_RESP] request_id={request_id} status={response.status_code} content_len={len(content)} tc={len(tc)} finish={finish}",
                         )
                         if tc:
-                            print(f"[VM_BACKEND_RESP] Tool calls raw: {tc[:500]}")
+                            debug_log(
+                                "info",
+                                f"[VM_BACKEND_RESP] request_id={request_id} tc_raw={str(tc)[:500]}",
+                            )
                     else:
-                        print(
-                            f"[VM_BACKEND_RESP] No choices in response: {result.keys()}"
+                        debug_log(
+                            "warn",
+                            f"[VM_BACKEND_RESP] request_id={request_id} No choices in response: {result.keys()}",
                         )
                 except Exception as e:
                     return (
@@ -2201,8 +2260,12 @@ def process_content(content):
 async def chat_completions(request: Request):
     """OpenAI-compatible chat completions endpoint."""
     import time as time_module
+    import uuid
 
     start_time = time_module.time()
+
+    # Generate unique request ID for correlation
+    request_id = str(uuid.uuid4())[:8]
 
     data = await request.json()
 
@@ -2213,6 +2276,15 @@ async def chat_completions(request: Request):
     top_p = data.get("top_p", 1.0)
     stream = data.get("stream", False)
     tools = data.get("tools", [])
+
+    # Inbound request logging (basic diagnostics)
+    accept_header = request.headers.get("accept", "")
+    user_agent = request.headers.get("user-agent", "")
+    incoming_source = request.headers.get("x-source", "serverless-proxy")
+    debug_log(
+        "info",
+        f"[REQUEST] request_id={request_id} model={model} stream={stream} tools={len(tools)} ua={user_agent[:40]} x-source={incoming_source}",
+    )
 
     # Get virtual model settings first
     vm = get_virtual_model(model)
@@ -2240,7 +2312,7 @@ async def chat_completions(request: Request):
     if hasattr(backend, "virtual_model_name"):
         virtual_model = backend.virtual_model_name
 
-    # Additional OpenAI parameters
+    # Additional OpenAI parameters (include request_id for correlation)
     extra_params = {
         "stop": data.get("stop"),
         "presence_penalty": data.get("presence_penalty"),
@@ -2250,21 +2322,17 @@ async def chat_completions(request: Request):
         "tool_choice": data.get("tool_choice"),
         "response_format": data.get("response_format"),
         "seed": data.get("seed"),
+        "_request_id": request_id,
     }
     # Only add parallel_tool_calls if tools are present
     if tools and data.get("parallel_tool_calls") is not None:
         extra_params["parallel_tool_calls"] = data.get("parallel_tool_calls")
-
-    # Get incoming X-Source to forward
-    incoming_source = request.headers.get("x-source", "serverless-proxy")
 
     # Preserve original stream request from client (before any modifications)
     original_stream = stream
 
     # Compat mode: if client asks for stream but doesn't accept SSE, force non-streaming
     # BUT still track original request to return proper response format to client
-    accept_header = request.headers.get("accept", "")
-    user_agent = request.headers.get("user-agent", "")
     wants_sse = "text/event-stream" in accept_header.lower()
     # Also accept */* as valid - it means client accepts anything
     accepts_all = accept_header.strip() == "*/*"
@@ -2309,38 +2377,199 @@ async def chat_completions(request: Request):
         has_tool_calls = False
         finish_reason = None
 
+        # Telemetry counters for diagnostics
+        stats = {
+            "total_lines": 0,
+            "data_lines": 0,
+            "json_ok": 0,
+            "json_fail": 0,
+            "first_error": None,
+        }
+
         for line in stream_data.split("\n"):
-            if line.strip() and line.startswith("data: "):
-                if line[6:].strip() == "[DONE]":
-                    continue
-                try:
-                    chunk = json.loads(line[6:])
-                    if "choices" in chunk and chunk["choices"]:
-                        delta = chunk["choices"][0].get("delta", {})
-                        tc = delta.get("tool_calls")
-                        if tc:
-                            stream_tool_calls.extend(tc)
-                            has_tool_calls = True
-                        # Handle content and reasoning separately
-                        # When tool calls are present, content is skipped to avoid leaking thinking
-                        # But reasoning_content should still be captured
-                        if not has_tool_calls:
-                            if delta.get("content"):
-                                full_content += delta["content"]
-                        if delta.get("reasoning_content"):
-                            full_reasoning += delta["reasoning_content"]
-                        finish_reason = chunk["choices"][0].get("finish_reason")
-                    if "usage" in chunk and chunk["usage"]:
-                        usage = chunk["usage"]
-                except:
-                    pass
+            stats["total_lines"] += 1
+            # Accept variations: "data:", "data: ", with possible leading whitespace
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if not (stripped.startswith("data:") or stripped.startswith("data ")):
+                continue  # Skip non-data lines (event:, comments, etc.)
+
+            # Extract data payload - handle both "data:" and "data: " formats
+            payload = stripped
+            if stripped.startswith("data:"):
+                payload = stripped[5:]  # remove "data"
+                if payload.startswith(" "):
+                    payload = payload[1:]  # remove leading space if present
+            if not payload or payload.strip() == "[DONE]":
+                continue
+
+            stats["data_lines"] += 1
+            try:
+                chunk = json.loads(payload)
+                stats["json_ok"] += 1
+                if "choices" in chunk and chunk["choices"]:
+                    delta = chunk["choices"][0].get("delta", {})
+                    tc = delta.get("tool_calls")
+                    if tc:
+                        # Merge streaming tool calls by index - accumulate arguments across chunks
+                        # This handles fragmented arguments from Qwen and other streaming models
+                        for tc_chunk in tc:
+                            tc_index = tc_chunk.get("index", 0)
+                            # Ensure we have a dict for this index
+                            while len(stream_tool_calls) <= tc_index:
+                                stream_tool_calls.append({"index": tc_index})
+
+                            # Merge in name, id, type from first chunk (if present)
+                            if tc_chunk.get("id") and not stream_tool_calls[
+                                tc_index
+                            ].get("id"):
+                                stream_tool_calls[tc_index]["id"] = tc_chunk["id"]
+                            if tc_chunk.get("type") and not stream_tool_calls[
+                                tc_index
+                            ].get("type"):
+                                stream_tool_calls[tc_index]["type"] = tc_chunk["type"]
+
+                            # Merge function data
+                            func = tc_chunk.get("function", {})
+                            if "function" not in stream_tool_calls[tc_index]:
+                                stream_tool_calls[tc_index]["function"] = {}
+
+                            func_target = stream_tool_calls[tc_index]["function"]
+                            if func.get("name") and not func_target.get("name"):
+                                func_target["name"] = func["name"]
+
+                            # Accumulate arguments (they come in fragments across chunks)
+                            arg_fragment = func.get("arguments", "")
+                            if arg_fragment:
+                                current_args = func_target.get("arguments", "")
+                                func_target["arguments"] = current_args + arg_fragment
+
+                            # Also handle direct arguments at top level (some APIs use this)
+                            if tc_chunk.get("arguments") and not func_target.get(
+                                "arguments"
+                            ):
+                                func_target["arguments"] = tc_chunk["arguments"]
+
+                        has_tool_calls = True
+                    # Handle content and reasoning separately
+                    # When tool calls are present, content is skipped to avoid leaking thinking
+                    # But reasoning_content should still be captured
+                    if not has_tool_calls:
+                        if delta.get("content"):
+                            full_content += delta["content"]
+                    if delta.get("reasoning_content"):
+                        full_reasoning += delta["reasoning_content"]
+                    finish_reason = chunk["choices"][0].get("finish_reason")
+                if "usage" in chunk and chunk["usage"]:
+                    usage = chunk["usage"]
+            except json.JSONDecodeError as e:
+                stats["json_fail"] += 1
+                if not stats["first_error"]:
+                    stats["first_error"] = (
+                        f"line={stats['total_lines']} err={str(e)[:40]}"
+                    )
+                debug_log(
+                    "warn",
+                    f"Stream JSON parse error: line={stats['total_lines']}, error={str(e)[:60]}",
+                )
+            except Exception as e:
+                stats["json_fail"] += 1
+                if not stats["first_error"]:
+                    stats["first_error"] = (
+                        f"line={stats['total_lines']} err={str(e)[:40]}"
+                    )
+                debug_log(
+                    "warn",
+                    f"Stream parse error: line={stats['total_lines']}, error={str(e)[:60]}",
+                )
 
         extracted_tc, text_content = process_content(full_content)
         if stream_tool_calls and not extracted_tc:
             extracted_tc = stream_tool_calls
 
+        # Check for upstream error in stream data (e.g., validation errors from DeepInfra)
+        # Error payloads typically look like: {"error": {"message": "..."}} or {"error_type": "...", "error_message": "..."}
+        stream_error = None
+        for line in stream_data.split("\n"):
+            stripped = line.strip()
+            if stripped.startswith("data:") or stripped.startswith("data "):
+                # Extract payload
+                payload = stripped
+                if stripped.startswith("data:"):
+                    payload = stripped[5:]
+                    if payload.startswith(" "):
+                        payload = payload[1:]
+                if payload and payload.strip() != "[DONE]":
+                    try:
+                        data = json.loads(payload)
+                        if "error" in data:
+                            # Found error payload
+                            err = data["error"]
+                            if isinstance(err, dict):
+                                err_msg = err.get("message") or str(err)
+                            else:
+                                err_msg = str(err)
+                            stream_error = err_msg
+                            debug_log(
+                                "warn",
+                                f"UPSTREAM_STREAM_ERROR: request_id={request_id}, error={err_msg[:100]}",
+                            )
+                            break
+                        elif "error_type" in data or "error_message" in data:
+                            # Alternative error format
+                            err_msg = (
+                                data.get("error_message")
+                                or data.get("error_type")
+                                or str(data)
+                            )
+                            stream_error = err_msg
+                            debug_log(
+                                "warn",
+                                f"UPSTREAM_STREAM_ERROR: request_id={request_id}, error={err_msg[:100]}",
+                            )
+                            break
+                    except:
+                        pass
+
+        # If upstream returned an error in stream, return explicit error response
+        if stream_error:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": f"Upstream error: {stream_error}",
+                        "type": "upstream_error",
+                    }
+                },
+            )
+
+        # Check for empty response anomaly
+        content_chars = len(full_content)
+        reasoning_chars = len(full_reasoning)
+        tc_count = len(extracted_tc) if extracted_tc else 0
+
+        if (
+            content_chars == 0
+            and reasoning_chars == 0
+            and tc_count == 0
+            and finish_reason is None
+        ):
+            debug_log(
+                "warn",
+                f"EMPTY_STREAM_DETECTED: request_id={request_id}, raw_preview={stream_data[:200].replace(chr(10), '\\n')}",
+            )
+            # Save raw stream data for triage (only in full debug mode)
+            if is_debug_mode() == "full":
+                debug_log("info", f"RAW_STREAM_FULL: {stream_data[:2000]}")
+
+        debug_log(
+            "info",
+            f"[STREAM_PARSE] request_id={request_id} stats={stats} content_ch={content_chars} reasoning_ch={reasoning_chars} tc={tc_count} finish={finish_reason}",
+        )
+
         print(
-            f"[DEBUG] Parsed stream: content='{full_content[:50]}...' if full_content else '(empty)', reasoning='{full_reasoning[:50]}...' if full_reasoning else '(empty)', tc={len(extracted_tc) if extracted_tc else 0}, finish={finish_reason}",
+            f"[DEBUG] Parsed stream: content='{full_content[:50]}...' if full_content else '(empty)', reasoning='{full_reasoning[:50]}...' if full_reasoning else '(empty)', tc={tc_count}, finish={finish_reason}",
             flush=True,
         )
 

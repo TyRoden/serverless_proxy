@@ -6,7 +6,8 @@ services:
       - "8002:8002"
       - "5001:5001"
     env_file:
-      - .env
+      - path: .env
+        required: true
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
@@ -15,7 +16,6 @@ services:
       - ai-queue-master_default
     volumes:
       - ./data:/data
-      - ./.env:/app/.env:rw
 
 networks:
   default:
