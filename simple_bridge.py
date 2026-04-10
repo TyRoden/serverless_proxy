@@ -760,6 +760,9 @@ def init_database():
         cursor.execute(
             "INSERT OR IGNORE INTO settings (key, value) VALUES ('payload_audit_enabled', 'false')"
         )
+        cursor.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('auth_enabled', 'false')"
+        )
 
         conn.commit()
 
