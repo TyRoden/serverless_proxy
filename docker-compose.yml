@@ -15,8 +15,7 @@ services:
       - default
     volumes:
       - ./data:/data
-    command: >
-      sh -c "uvicorn simple_bridge:app --host 0.0.0.0 --port 8002 --reload & flask run --host 0.0.0.0 --port 5001"
+
 
 networks:
   default:
