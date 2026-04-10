@@ -5002,6 +5002,23 @@ def update_env_file(key, value):
         return False
 
 
+@flask_app.route("/api/admin/usage", methods=["GET"])
+def api_admin_usage_proxy():
+    """Proxy /api/admin/usage requests to FastAPI."""
+    import httpx
+
+    fastapi_url = f"http://127.0.0.1:{get_api_port()}/api/admin/usage"
+    query_string = flask_request.query_string.decode("utf-8")
+    if query_string:
+        fastapi_url += "?" + query_string
+
+    try:
+        response = httpx.get(fastapi_url, timeout=30.0)
+        return flask_jsonify(response.json()), response.status_code
+    except Exception as e:
+        return flask_jsonify({"error": str(e)}), 500
+
+
 @flask_app.route("/api/admin/settings", methods=["POST"])
 def api_admin_settings_post():
     """API: Update settings."""
