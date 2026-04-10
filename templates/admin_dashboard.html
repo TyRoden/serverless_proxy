@@ -157,6 +157,14 @@
         .status-msg { padding: 10px; border-radius: 6px; margin-top: 8px; font-size: 13px; }
         .status-error { background: rgba(239, 68, 68, 0.2); color: var(--accent-red); }
         .status-success { background: rgba(16, 185, 129, 0.2); color: var(--accent-green); }
+        tr.model-breakdown-row td {
+            color: var(--text-secondary);
+            font-size: 13px;
+            background: rgba(255,255,255,0.01);
+        }
+        td.model-name-cell {
+            padding-left: 32px;
+        }
     </style>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
@@ -715,18 +723,41 @@
             document.getElementById('daily-breakdown').innerHTML = '<p class="empty">No data in selected date range</p>';
             return;
         }
+
+        const esc = (v) => String(v || '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
         
-        const rows = dailyData.map(day => `
-            <tr>
-                <td><strong>${day.date}</strong></td>
-                <td>${formatNumber(day.prompt_tokens)}</td>
-                <td>${formatNumber(day.cached_input_tokens || 0)}</td>
-                <td>${formatNumber(day.completion_tokens)}</td>
-                <td>$${day.cost_estimate?.toFixed(4) || '0.0000'}</td>
-                <td>$${(day.cached_cost_estimate || 0).toFixed(4)}</td>
-                <td>${formatNumber(day.requests)}</td>
-            </tr>
-        `).join('');
+        const rows = dailyData.map(day => {
+            const dayRow = `
+                <tr>
+                    <td><strong>${day.date}</strong></td>
+                    <td>${formatNumber(day.prompt_tokens)}</td>
+                    <td>${formatNumber(day.cached_input_tokens || 0)}</td>
+                    <td>${formatNumber(day.completion_tokens)}</td>
+                    <td>$${day.cost_estimate?.toFixed(4) || '0.0000'}</td>
+                    <td>$${(day.cached_cost_estimate || 0).toFixed(4)}</td>
+                    <td>${formatNumber(day.requests)}</td>
+                </tr>
+            `;
+
+            const modelRows = (day.models || []).map(model => `
+                <tr class="model-breakdown-row">
+                    <td class="model-name-cell">↳ ${esc(model.virtual_model)}</td>
+                    <td>${formatNumber(model.prompt_tokens)}</td>
+                    <td>${formatNumber(model.cached_input_tokens || 0)}</td>
+                    <td>${formatNumber(model.completion_tokens)}</td>
+                    <td>$${model.cost_estimate?.toFixed(4) || '0.0000'}</td>
+                    <td>$${(model.cached_cost_estimate || 0).toFixed(4)}</td>
+                    <td>${formatNumber(model.requests)}</td>
+                </tr>
+            `).join('');
+
+            return dayRow + modelRows;
+        }).join('');
         
         document.getElementById('daily-breakdown').innerHTML = `
             <table>

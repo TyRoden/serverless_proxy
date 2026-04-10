@@ -26,7 +26,9 @@ import time
 import json
 import asyncio
 import re
+import hashlib
 import sqlite3
+from pathlib import Path
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 from contextlib import contextmanager
@@ -108,6 +110,14 @@ def is_debug_mode():
     return get_setting("debug_mode", "off")
 
 
+def is_payload_audit_enabled() -> bool:
+    """Check if persisted payload audit snapshots are enabled."""
+    value = get_setting(
+        "payload_audit_enabled", os.getenv("PAYLOAD_AUDIT_ENABLED", "false")
+    )
+    return str(value).lower() in ("1", "true", "yes", "on")
+
+
 def debug_log(level, msg):
     """Log message if debug mode is enabled. level: 'info', 'warn', 'error'."""
     mode = is_debug_mode()
@@ -115,6 +125,378 @@ def debug_log(level, msg):
         return
     if level == "error" or level == "warn" or mode == "full":
         print(f"[DEBUG:{level.upper()}] {msg}", flush=True)
+
+
+def _hash_text(value: str) -> str:
+    """Return short stable hash for payload audit logs."""
+    if not isinstance(value, str):
+        value = str(value)
+    return hashlib.sha256(value.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+
+def _detect_base64_image_mime(base64_data: str) -> str:
+    """Best-effort MIME type detection from base64 image signature."""
+    if not isinstance(base64_data, str):
+        return "image/png"
+    sig = base64_data.strip()[:12]
+    if sig.startswith("iVBOR"):
+        return "image/png"
+    if sig.startswith("/9j/"):
+        return "image/jpeg"
+    if sig.startswith("R0lGOD"):
+        return "image/gif"
+    if sig.startswith("UklGR"):
+        return "image/webp"
+    if sig.startswith("Qk"):
+        return "image/bmp"
+    return "image/png"
+
+
+def _extract_base64_from_data_url(value: str) -> str:
+    """Normalize data payload for stable digesting."""
+    if not isinstance(value, str):
+        return ""
+    value = value.strip()
+    if value.startswith("data:") and "base64," in value:
+        return value.split("base64,", 1)[1].strip()
+    return value
+
+
+PAYLOAD_AUDIT_DIR = os.getenv("PAYLOAD_AUDIT_DIR", "/data/payload_audit")
+
+
+def _summarize_payload_for_storage(messages: Any) -> dict:
+    """Build compact per-block summary for persisted inbound/outbound comparison."""
+    summary = {
+        "messages": len(messages) if isinstance(messages, list) else 0,
+        "blocks": [],
+    }
+    if not isinstance(messages, list):
+        return summary
+
+    marker_re = re.compile(r"Image\s*\(base64\):", re.IGNORECASE)
+
+    for msg_i, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+
+        if isinstance(content, list):
+            for block_i, block in enumerate(content):
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type")
+                if btype == "image_url":
+                    image_url = block.get("image_url", {})
+                    if isinstance(image_url, dict):
+                        url = image_url.get("url", "")
+                    else:
+                        url = image_url if isinstance(image_url, str) else ""
+                    b64 = _extract_base64_from_data_url(url)
+                    summary["blocks"].append(
+                        {
+                            "message_index": msg_i,
+                            "block_index": block_i,
+                            "role": role,
+                            "type": "image_url",
+                            "base64_len": len(b64),
+                            "digest": _hash_text(b64),
+                            "prefix": b64[:32],
+                            "suffix": b64[-32:] if len(b64) > 32 else b64,
+                        }
+                    )
+                elif btype == "text":
+                    text = block.get("text", "")
+                    if marker_re.search(text):
+                        parts = marker_re.split(text, maxsplit=1)
+                        b64 = _extract_base64_from_data_url(
+                            parts[1].strip() if len(parts) > 1 else text
+                        )
+                        b64_clean = re.sub(r"[^A-Za-z0-9+/=]", "", b64)
+                        summary["blocks"].append(
+                            {
+                                "message_index": msg_i,
+                                "block_index": block_i,
+                                "role": role,
+                                "type": "text_base64",
+                                "base64_len": len(b64_clean),
+                                "digest": _hash_text(b64_clean),
+                                "prefix": b64_clean[:32],
+                                "suffix": (
+                                    b64_clean[-32:]
+                                    if len(b64_clean) > 32
+                                    else b64_clean
+                                ),
+                            }
+                        )
+        elif isinstance(content, str):
+            if marker_re.search(content):
+                parts = marker_re.split(content, maxsplit=1)
+                b64 = _extract_base64_from_data_url(
+                    parts[1].strip() if len(parts) > 1 else content
+                )
+                b64_clean = re.sub(r"[^A-Za-z0-9+/=]", "", b64)
+                summary["blocks"].append(
+                    {
+                        "message_index": msg_i,
+                        "block_index": 0,
+                        "role": role,
+                        "type": "text_base64",
+                        "base64_len": len(b64_clean),
+                        "digest": _hash_text(b64_clean),
+                        "prefix": b64_clean[:32],
+                        "suffix": b64_clean[-32:] if len(b64_clean) > 32 else b64_clean,
+                    }
+                )
+
+    return summary
+
+
+def _persist_payload_snapshot(
+    request_id: str,
+    stage: str,
+    model: str,
+    messages: Any,
+    audit_summary: Optional[dict] = None,
+):
+    """Persist payload comparison artifacts to disk for forensic debugging."""
+    if not is_payload_audit_enabled():
+        return
+
+    compact = _summarize_payload_for_storage(messages)
+    has_relevant = (
+        compact.get("blocks")
+        or (audit_summary and audit_summary.get("image_blocks", 0) > 0)
+        or (audit_summary and audit_summary.get("base64_text_blocks", 0) > 0)
+    )
+    if not has_relevant:
+        return
+
+    try:
+        out_dir = Path(PAYLOAD_AUDIT_DIR)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{request_id}_{stage}.json"
+        payload = {
+            "request_id": request_id,
+            "stage": stage,
+            "model": model,
+            "ts": int(time.time()),
+            "audit": audit_summary or {},
+            "compact": compact,
+        }
+        with out_path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        print(
+            f"[PAYLOAD_STORE] request_id={request_id} stage={stage} path={out_path}",
+            flush=True,
+        )
+    except Exception as e:
+        debug_log(
+            "warn",
+            f"[PAYLOAD_STORE_ERR] request_id={request_id} stage={stage} error={e}",
+        )
+
+
+def _normalize_inline_base64_messages(messages: Any) -> tuple[Any, int]:
+    """Convert 'Image (base64): ...' payloads into image_url blocks."""
+    if not isinstance(messages, list):
+        return messages, 0
+
+    marker_re = re.compile(r"Image\s*\(base64\):", re.IGNORECASE)
+
+    def _normalize_text_content(content: str) -> tuple[Any, int]:
+        if not isinstance(content, str) or not marker_re.search(content):
+            return content, 0
+
+        blocks = []
+        last_end = 0
+        local_converted = 0
+        for match in marker_re.finditer(content):
+            prefix = content[last_end : match.start()]
+            if prefix.strip():
+                blocks.append({"type": "text", "text": prefix.strip()})
+
+            next_match = marker_re.search(content, match.end())
+            candidate = (
+                content[match.end() : next_match.start()]
+                if next_match
+                else content[match.end() :]
+            )
+            compact = re.sub(r"\s+", "", candidate)
+            if compact.startswith("data:image/"):
+                image_url = compact
+            else:
+                image_b64 = _extract_base64_from_data_url(compact)
+                image_b64 = re.sub(r"[^A-Za-z0-9+/=]", "", image_b64)
+                if len(image_b64) < 64:
+                    blocks.append(
+                        {
+                            "type": "text",
+                            "text": ("Image (base64):" + candidate).strip(),
+                        }
+                    )
+                    last_end = next_match.start() if next_match else len(content)
+                    continue
+                mime = _detect_base64_image_mime(image_b64)
+                image_url = f"data:{mime};base64,{image_b64}"
+
+            blocks.append({"type": "image_url", "image_url": {"url": image_url}})
+            local_converted += 1
+            last_end = next_match.start() if next_match else len(content)
+
+        suffix = content[last_end:]
+        if suffix.strip():
+            blocks.append({"type": "text", "text": suffix.strip()})
+
+        if local_converted > 0:
+            return blocks, local_converted
+        return content, 0
+
+    converted = 0
+    normalized_messages = []
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            normalized_messages.append(msg)
+            continue
+        if msg.get("role") != "user":
+            normalized_messages.append(msg)
+            continue
+
+        content = msg.get("content")
+
+        if isinstance(content, str):
+            normalized_content, local_converted = _normalize_text_content(content)
+            if local_converted > 0:
+                msg_copy = dict(msg)
+                msg_copy["content"] = normalized_content
+                normalized_messages.append(msg_copy)
+                converted += local_converted
+            else:
+                normalized_messages.append(msg)
+            continue
+
+        if isinstance(content, list):
+            new_blocks = []
+            local_converted = 0
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text_val = block.get("text", "")
+                    normalized_content, block_converted = _normalize_text_content(
+                        text_val
+                    )
+                    if block_converted > 0 and isinstance(normalized_content, list):
+                        new_blocks.extend(normalized_content)
+                        local_converted += block_converted
+                    else:
+                        new_blocks.append(block)
+                else:
+                    new_blocks.append(block)
+
+            if local_converted > 0:
+                msg_copy = dict(msg)
+                msg_copy["content"] = new_blocks
+                normalized_messages.append(msg_copy)
+                converted += local_converted
+            else:
+                normalized_messages.append(msg)
+            continue
+
+        normalized_messages.append(msg)
+
+    return normalized_messages, converted
+
+
+def _audit_message_payload(messages):
+    """Collect payload audit info for image/base64 content."""
+    summary = {
+        "messages": len(messages) if isinstance(messages, list) else 0,
+        "image_blocks": 0,
+        "data_urls": 0,
+        "base64_text_blocks": 0,
+        "digests": [],
+    }
+    if not isinstance(messages, list):
+        return summary
+
+    marker_re = re.compile(r"Image\s*\(base64\):", re.IGNORECASE)
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content", "")
+
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type")
+                if btype == "image_url":
+                    summary["image_blocks"] += 1
+                    image_url = block.get("image_url", {})
+                    if isinstance(image_url, dict):
+                        url = image_url.get("url", "")
+                    else:
+                        url = image_url if isinstance(image_url, str) else ""
+                    if isinstance(url, str) and url.startswith("data:"):
+                        summary["data_urls"] += 1
+                    summary["digests"].append(
+                        _hash_text(_extract_base64_from_data_url(url))
+                    )
+                elif btype == "text":
+                    text = block.get("text", "")
+                    if marker_re.search(text):
+                        summary["base64_text_blocks"] += 1
+                        parts = marker_re.split(text, maxsplit=1)
+                        b64 = parts[1].strip() if len(parts) > 1 else text
+                        summary["digests"].append(
+                            _hash_text(_extract_base64_from_data_url(b64))
+                        )
+        elif isinstance(content, str):
+            if marker_re.search(content):
+                summary["base64_text_blocks"] += 1
+                parts = marker_re.split(content, maxsplit=1)
+                b64 = parts[1].strip() if len(parts) > 1 else content
+                summary["digests"].append(
+                    _hash_text(_extract_base64_from_data_url(b64))
+                )
+
+    return summary
+
+
+def _log_payload_audit(stage: str, request_id: str, summary: dict):
+    """Log concise in/out payload audit when image/base64 content is present."""
+    if not summary:
+        return
+    has_relevant = (
+        summary.get("image_blocks", 0) > 0
+        or summary.get("data_urls", 0) > 0
+        or summary.get("base64_text_blocks", 0) > 0
+    )
+    if not has_relevant:
+        return
+    digests_preview = summary.get("digests", [])[:4]
+    print(
+        f"[PAYLOAD_AUDIT] request_id={request_id} stage={stage} "
+        f"messages={summary.get('messages', 0)} image_blocks={summary.get('image_blocks', 0)} "
+        f"data_urls={summary.get('data_urls', 0)} base64_text={summary.get('base64_text_blocks', 0)} "
+        f"digests={digests_preview}",
+        flush=True,
+    )
+
+
+def _looks_like_data_block(text: str) -> bool:
+    """Detect large data/base64 blocks that should never be regex-normalized."""
+    if not isinstance(text, str):
+        return False
+    if "Image (base64):" in text:
+        return True
+    if "data:image/" in text and "base64," in text:
+        return True
+    if len(text) > 800 and re.search(r"[A-Za-z0-9+/]{600,}={0,2}", text):
+        return True
+    return False
 
 
 def init_database():
@@ -374,6 +756,9 @@ def init_database():
         )
         cursor.execute(
             "INSERT OR IGNORE INTO settings (key, value) VALUES ('debug_mode', 'basic')"
+        )
+        cursor.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('payload_audit_enabled', 'false')"
         )
 
         conn.commit()
@@ -1140,7 +1525,9 @@ class RunPodBackend(LLMBackend):
     """RunPod Serverless backend."""
 
     def __init__(self):
-        self.endpoint_type = "runpod"
+        self.api_key = os.getenv("RUNPOD_API_KEY", "")
+        self.endpoint_id = os.getenv("RUNPOD_ENDPOINT_ID", "")
+        self.endpoint_type = os.getenv("ENDPOINT_TYPE", "ollama").lower()
 
     def _build_payload(
         self,
@@ -1409,6 +1796,7 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
         ):
             # Extract request_id for correlation
             request_id = kwargs.pop("_request_id", None)
+            inbound_audit = kwargs.pop("_inbound_audit", None)
 
             # Force non-streaming if disabled in model config
             if self.disable_streaming:
@@ -1560,6 +1948,24 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
                 f"[VM_BACKEND] request_id={request_id} Calling {endpoint}, model={payload.get('model')}, stream={stream}",
             )
 
+            outbound_audit = _audit_message_payload(payload.get("messages", []))
+            _log_payload_audit("outbound", request_id, outbound_audit)
+            _persist_payload_snapshot(
+                request_id=request_id,
+                stage="outbound",
+                model=str(payload.get("model", "")),
+                messages=payload.get("messages", []),
+                audit_summary=outbound_audit,
+            )
+            if inbound_audit and outbound_audit:
+                in_digests = sorted(inbound_audit.get("digests", []))
+                out_digests = sorted(outbound_audit.get("digests", []))
+                if in_digests != out_digests:
+                    print(
+                        f"[PAYLOAD_AUDIT:WARN] request_id={request_id} digest_mismatch inbound={in_digests[:4]} outbound={out_digests[:4]}",
+                        flush=True,
+                    )
+
             async with httpx.AsyncClient(timeout=timeout) as client:
                 try:
                     response = await client.post(
@@ -1669,32 +2075,37 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
     return VirtualModelBackend()
 
 
-def get_backend(model_name: str = None) -> LLMBackend:
-    """Get the configured backend based on virtual model or environment variables."""
+def get_backend(model_name: str = None) -> Optional[LLMBackend]:
+    """Get backend for a configured virtual model only."""
 
-    # First check if model_name is a virtual model
-    if model_name:
-        vm = get_virtual_model(model_name)
-        if vm:
-            debug_log(
-                "info",
-                f"[BACKEND] Using virtual model backend: {model_name} -> {vm.get('endpoint_type')}",
-            )
-            return create_backend_from_virtual_model(vm)
-        else:
-            debug_log(
-                "warn", f"[BACKEND] Model not found in virtual_models: {model_name}"
-            )
+    # Enforce explicit model routing via virtual_models.
+    if not model_name:
+        return None
 
-    # Check database for use_ai_queue setting, fallback to env var
-    use_queue = (
-        get_setting("use_ai_queue", os.getenv("USE_AI_QUEUE", "false")) == "true"
+    vm = get_virtual_model(model_name)
+    if vm:
+        debug_log(
+            "info",
+            f"[BACKEND] Using virtual model backend: {model_name} -> {vm.get('endpoint_type')}",
+        )
+        return create_backend_from_virtual_model(vm)
+
+    debug_log("warn", f"[BACKEND] Model not found in virtual_models: {model_name}")
+    return None
+
+
+def model_not_found_response(model_name: str) -> JSONResponse:
+    """OpenAI-style model not found error response."""
+    return JSONResponse(
+        status_code=404,
+        content={
+            "error": {
+                "message": f"Model '{model_name}' is not configured. Define it in virtual_models and map it to an enabled endpoint.",
+                "type": "invalid_request_error",
+                "code": "model_not_found",
+            }
+        },
     )
-
-    if use_queue:
-        return AIQueueBackend()
-    else:
-        return RunPodBackend()
 
 
 # Initialize backend (uses env vars for default)
@@ -2218,6 +2629,13 @@ def process_content(content):
     if not content:
         return None, None
 
+    # Never run regex/tool-call normalization over data blocks (base64/image payloads)
+    if _looks_like_data_block(content):
+        debug_log(
+            "warn", "Skipping process_content normalization for data-like payload"
+        )
+        return None, content
+
     tool_calls, remaining = extract_tool_calls(content)
 
     if remaining is not None:
@@ -2298,9 +2716,55 @@ async def chat_completions(request: Request):
 
     data = await request.json()
 
-    messages = data.get("messages", [])
+    inbound_raw_messages = data.get("messages", [])
+    messages = inbound_raw_messages
+    messages, base64_blocks_converted = _normalize_inline_base64_messages(messages)
+    if base64_blocks_converted > 0:
+        print(
+            f"[BASE64_NORMALIZE] request_id={request_id} converted_blocks={base64_blocks_converted}",
+            flush=True,
+        )
+
+    inbound_audit = _audit_message_payload(messages)
+    _log_payload_audit("inbound", request_id, inbound_audit)
+    _persist_payload_snapshot(
+        request_id=request_id,
+        stage="inbound_raw",
+        model=str(data.get("model", "")),
+        messages=inbound_raw_messages,
+        audit_summary=_audit_message_payload(inbound_raw_messages),
+    )
+    _persist_payload_snapshot(
+        request_id=request_id,
+        stage="inbound_normalized",
+        model=str(data.get("model", "")),
+        messages=messages,
+        audit_summary=inbound_audit,
+    )
 
     model = data.get("model")
+    model_l = (model or "").lower()
+    is_vision_model = "-vl" in model_l or "vision" in model_l
+    if (
+        is_vision_model
+        and inbound_audit.get("base64_text_blocks", 0) > 0
+        and inbound_audit.get("image_blocks", 0) == 0
+    ):
+        print(
+            f"[BASE64_NORMALIZE:WARN] request_id={request_id} unparsed_inline_base64 blocks={inbound_audit.get('base64_text_blocks', 0)}",
+            flush=True,
+        )
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "message": "Vision request contains inline base64 text that could not be converted to image blocks. Ensure payload includes 'Image (base64): <full base64>' or send OpenAI image_url content blocks.",
+                    "type": "invalid_request_error",
+                    "code": "invalid_image_payload",
+                }
+            },
+        )
+
     temperature = data.get("temperature", 0.7)
     max_tokens = data.get("max_tokens", 256)
     top_p = data.get("top_p", 1.0)
@@ -2339,6 +2803,8 @@ async def chat_completions(request: Request):
     # Get the actual model name from virtual models if applicable
     virtual_model = model
     backend = get_backend(model)
+    if backend is None:
+        return model_not_found_response(model)
     if hasattr(backend, "virtual_model_name"):
         virtual_model = backend.virtual_model_name
 
@@ -2353,6 +2819,7 @@ async def chat_completions(request: Request):
         "response_format": data.get("response_format"),
         "seed": data.get("seed"),
         "_request_id": request_id,
+        "_inbound_audit": inbound_audit,
     }
     # Only add parallel_tool_calls if tools are present
     if tools and data.get("parallel_tool_calls") is not None:
@@ -3054,6 +3521,49 @@ async def get_usage_summary(request: Request):
 
             daily_query += " GROUP BY date ORDER BY date DESC"
             cursor.execute(daily_query, daily_params)
+
+            daily_model_query = """
+                SELECT
+                    strftime('%Y-%m-%d', datetime(created_at, 'unixepoch')) as date,
+                    virtual_model,
+                    SUM(prompt_tokens) as prompt_tokens,
+                    SUM(completion_tokens) as completion_tokens,
+                    SUM(cached_input_tokens) as cached_input_tokens,
+                    SUM(cache_creation_tokens) as cache_creation_tokens,
+                    SUM(cached_cost_estimate) as cached_cost_estimate,
+                    SUM(cost_estimate) as cost_estimate,
+                    COUNT(*) as requests
+                FROM request_usage
+                WHERE created_at >= ? AND created_at <= ?
+            """
+            daily_model_params = [start_date, end_date]
+
+            if virtual_model:
+                daily_model_query += " AND virtual_model = ?"
+                daily_model_params.append(virtual_model)
+
+            daily_model_query += (
+                " GROUP BY date, virtual_model "
+                "ORDER BY date DESC, cost_estimate DESC, virtual_model ASC"
+            )
+            cursor.execute(daily_model_query, daily_model_params)
+            models_by_date = {}
+            for mrow in cursor.fetchall():
+                date_key = mrow[0]
+                models_by_date.setdefault(date_key, []).append(
+                    {
+                        "virtual_model": mrow[1] or "(unknown)",
+                        "prompt_tokens": mrow[2] or 0,
+                        "completion_tokens": mrow[3] or 0,
+                        "cached_input_tokens": mrow[4] or 0,
+                        "cache_creation_tokens": mrow[5] or 0,
+                        "cached_cost_estimate": round(mrow[6] or 0, 4),
+                        "cost_estimate": round(mrow[7] or 0, 4),
+                        "requests": mrow[8] or 0,
+                    }
+                )
+
+            cursor.execute(daily_query, daily_params)
             daily_breakdown = []
             for row in cursor.fetchall():
                 daily_breakdown.append(
@@ -3066,6 +3576,7 @@ async def get_usage_summary(request: Request):
                         "cached_cost_estimate": round(row[5] or 0, 4),
                         "cost_estimate": round(row[6] or 0, 4),
                         "requests": row[7] or 0,
+                        "models": models_by_date.get(row[0], []),
                     }
                 )
 
@@ -3440,6 +3951,10 @@ async def anthropic_messages(request: Request):
             if isinstance(content, list):
                 user_content_blocks = []
                 for block in content:
+                    if not isinstance(block, dict):
+                        user_content_blocks.append({"type": "text", "text": str(block)})
+                        continue
+
                     if block.get("type") == "tool_result":
                         converted_messages.append(
                             {
@@ -3448,13 +3963,13 @@ async def anthropic_messages(request: Request):
                                 "content": block.get("content", ""),
                             }
                         )
-                    elif block.get("type") == "image_url":
-                        # Preserve image_url blocks - don't strip them
-                        user_content_blocks.append(block)
                     elif block.get("type") == "text":
                         user_content_blocks.append(
                             {"type": "text", "text": block.get("text", "")}
                         )
+                    else:
+                        # Preserve any non-tool_result block as-is (image_url, image, input_image, etc.)
+                        user_content_blocks.append(block)
 
                 # If we have image blocks, send as list
                 if user_content_blocks:
@@ -3475,6 +3990,8 @@ async def anthropic_messages(request: Request):
 
     # Get backend
     backend = get_backend(model)
+    if backend is None:
+        return model_not_found_response(model)
     virtual_model = model
     if hasattr(backend, "virtual_model_name"):
         virtual_model = backend.virtual_model_name
@@ -3699,6 +4216,8 @@ async def completions(request: Request):
 
     # Get backend for this model
     backend = get_backend(model)
+    if backend is None:
+        return model_not_found_response(model)
 
     # Call backend
     backend_result, error, status_code = await backend.chat_completion(
@@ -3778,6 +4297,8 @@ async def embeddings(request: Request):
 
     # Get backend for this model (checks virtual models first)
     backend = get_backend(model)
+    if backend is None:
+        return model_not_found_response(model)
 
     # Check if backend supports embeddings
     if hasattr(backend, "embeddings"):
@@ -4437,6 +4958,7 @@ ENV_KEY_MAP = {
     "aimenu_url": "AIMENU_URL",
     "use_ai_queue": "USE_AI_QUEUE",
     "ai_queue_url": "AI_QUEUE_URL",
+    "payload_audit_enabled": "PAYLOAD_AUDIT_ENABLED",
 }
 
 
