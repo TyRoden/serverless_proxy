@@ -51,6 +51,9 @@ AUTH_ENABLED=false
 ```bash
 # Build and start the container
 docker compose up -d --build
+
+# Verify FastAPI is served via Uvicorn (required for API routes)
+docker compose exec serverless-proxy sh -c "ps aux | grep uvicorn" || echo "WARNING: Uvicorn not running. Ensure serverless-proxy service uses 'uvicorn simple_bridge:app' in docker-compose.yml. See docs for details."
 ```
 
 ### Step 4: Configure in the Admin UI
@@ -64,7 +67,7 @@ docker compose up -d --build
    - **Name**: Something like "My Ollama" or "RunPod Production"
    - **URL**: Your backend URL (e.g., `http://localhost:11434` for local Ollama, or your RunPod endpoint URL)
    - **API Key**: Your API key if required (leave blank for local Ollama)
-   - **Type**: Select the type (`ollama`, `openai`, `runpod`, `anthropic`, `deepinfra`, etc.)
+- **Type**: Select the type (`openwebui`, `openai`, `ollama`, `runpod`, `anthropic`, `deepinfra`, etc.)
    - Click **Save**
 
 #### Add a Virtual Model
@@ -175,7 +178,7 @@ Configure backend endpoints with:
 - **Name**: Friendly identifier
 - **URL**: Base URL (e.g., `http://localhost:11434`, `https://api.runpod.ai/v2/xxxx`)
 - **API Key**: Authorization token (if required)
-- **Type**: `openai`, `ollama`, `vllm`, `together`, `runpod`, `anthropic`, `deepinfra`, `queue`
+- **Type**: `openwebui`, `openai`, `ollama`, `vllm`, `together`, `runpod`, `anthropic`, `deepinfra`, `queue`
 - **Priority**: Higher priority endpoints are preferred
 - **Enabled**: Enable/disable endpoint
 
@@ -271,11 +274,15 @@ curl -X POST http://localhost:8002/v1/chat/completions \
 
 | Type | Description |
 |------|-------------|
-| `openai` | OpenAI-compatible API |
+| `openwebui` | OpenWebUI API (`/api/chat/completions`, `/api/models`, `/api/v1/embeddings`) |
+| `openai` | OpenAI-compatible API (`/v1/chat/completions`, `/v1/models`, `/v1/embeddings`) |
 | `ollama` | Ollama API |
 | `vllm` | vLLM API |
 | `together` | Together AI |
 | `runpod` | RunPod Serverless |
+| `anthropic` | Anthropic Messages API (`/v1/messages`) |
+| `deepinfra` | DeepInfra OpenAI-compatible API (`/v1/openai/chat/completions`) |
+| `queue` | AI Queue endpoint (`/v1/chat/completions`, `/v1/embeddings`) |
 
 ## AI Queue Integration (Optional)
 

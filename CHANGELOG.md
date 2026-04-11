@@ -2,6 +2,20 @@
 
 All notable changes to the Serverless Proxy will be documented in this file.
 
+## [2.4.1] - 2026-04-11
+
+### Added
+
+- **OpenWebUI Endpoint Type** - New endpoint type for native OpenWebUI upstreams:
+  - Added `openwebui` option to endpoint type dropdown in admin UI
+  - Routes chat completions to `/api/chat/completions`
+  - Routes embeddings to `/api/v1/embeddings`
+  - Supports OpenWebUI model discovery routes (`/api/models`, `/api/v1/models`) in endpoint model fetch fallback chain
+
+### Changed
+
+- **Documentation Updates** - Added OpenWebUI-specific upstream guidance in `README.md`, `AGENTS.md`, and deployment docs.
+
 ## [2.4.0] - 2026-04-05
 
 ### Added

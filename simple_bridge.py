@@ -1934,6 +1934,8 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
                 payload = {"input": payload}
             elif self.endpoint_type == "openai":
                 endpoint = f"{self.url}/v1/chat/completions"
+            elif self.endpoint_type == "openwebui":
+                endpoint = f"{self.url}/api/chat/completions"
             elif self.endpoint_type == "together":
                 endpoint = f"{self.url}/v1/chat/completions"
             elif self.endpoint_type == "deepinfra":
@@ -2053,10 +2055,12 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
 
             payload = {"model": self.model, "input": input_text}
 
+            endpoint = f"{self.url}/v1/embeddings"
+            if self.endpoint_type == "openwebui":
+                endpoint = f"{self.url}/api/v1/embeddings"
+
             async with httpx.AsyncClient(timeout=120.0) as client:
-                response = await client.post(
-                    f"{self.url}/v1/embeddings", headers=headers, json=payload
-                )
+                response = await client.post(endpoint, headers=headers, json=payload)
 
                 if response.status_code != 200:
                     return (
@@ -4029,6 +4033,8 @@ async def anthropic_messages(request: Request):
         if hasattr(backend, "endpoint_type"):
             if backend.endpoint_type == "deepinfra":
                 endpoint = f"{endpoint}/v1/openai/chat/completions"
+            elif backend.endpoint_type == "openwebui":
+                endpoint = f"{endpoint}/api/chat/completions"
             elif backend.endpoint_type == "queue":
                 endpoint = f"{endpoint}/v1/chat/completions"
             else:
@@ -4597,21 +4603,14 @@ def fetch_endpoint_models(endpoint_id):
         if endpoint.get("api_key"):
             headers["Authorization"] = f"Bearer {endpoint['api_key']}"
 
-        # Try /v1/models first
-        resp = httpx.get(f"{endpoint['url']}/v1/models", headers=headers, timeout=15)
-        if resp.status_code == 200:
-            data = resp.json()
-            models = data.get("data", [])
-            model_list = sorted([m.get("id") for m in models])
-            return flask_jsonify({"models": model_list})
-
-        # Fallback to /models
-        resp = httpx.get(f"{endpoint['url']}/models", headers=headers, timeout=15)
-        if resp.status_code == 200:
-            data = resp.json()
-            models = data.get("models", []) or data.get("data", [])
-            model_list = sorted([m.get("id") or m.get("name") for m in models])
-            return flask_jsonify({"models": model_list})
+        model_paths = ["/v1/models", "/models", "/api/models", "/api/v1/models"]
+        for path in model_paths:
+            resp = httpx.get(f"{endpoint['url']}{path}", headers=headers, timeout=15)
+            if resp.status_code == 200:
+                data = resp.json()
+                models = data.get("models", []) or data.get("data", [])
+                model_list = sorted([m.get("id") or m.get("name") for m in models])
+                return flask_jsonify({"models": model_list})
 
         return flask_jsonify({"error": f"Status: {resp.status_code}"}), resp.status_code
     except Exception as e:
