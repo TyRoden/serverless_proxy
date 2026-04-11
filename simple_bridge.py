@@ -4603,14 +4603,28 @@ def fetch_endpoint_models(endpoint_id):
         if endpoint.get("api_key"):
             headers["Authorization"] = f"Bearer {endpoint['api_key']}"
 
-        model_paths = ["/v1/models", "/models", "/api/models", "/api/v1/models"]
+        endpoint_type = (endpoint.get("endpoint_type") or "").lower()
+        if endpoint_type == "openwebui":
+            model_paths = ["/api/models", "/api/v1/models", "/v1/models", "/models"]
+        else:
+            model_paths = ["/v1/models", "/models", "/api/models", "/api/v1/models"]
+
+        parse_errors = []
         for path in model_paths:
             resp = httpx.get(f"{endpoint['url']}{path}", headers=headers, timeout=15)
             if resp.status_code == 200:
-                data = resp.json()
+                try:
+                    data = resp.json()
+                except Exception:
+                    snippet = (resp.text or "")[:180].replace("\n", " ").strip()
+                    parse_errors.append(f"{path}: non-JSON 200 response ({snippet})")
+                    continue
                 models = data.get("models", []) or data.get("data", [])
                 model_list = sorted([m.get("id") or m.get("name") for m in models])
                 return flask_jsonify({"models": model_list})
+
+        if parse_errors:
+            return flask_jsonify({"error": "; ".join(parse_errors)}), 502
 
         return flask_jsonify({"error": f"Status: {resp.status_code}"}), resp.status_code
     except Exception as e:
