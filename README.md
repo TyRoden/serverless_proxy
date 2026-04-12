@@ -313,7 +313,9 @@ Forwarded to configured Ollama endpoint (resolved by model backend first, or def
 #### Conformance and roadmap docs
 
 - Runtime conformance smoke script: `scripts/ollama_runtime_conformance.sh`
+- Full-surface conformance script: `scripts/ollama_full_surface_conformance.sh`
 - Compatibility roadmap and checklist: `docs/ollama-compatibility-roadmap.md`
+- Version-dependent compatibility notes: `docs/ollama-version-notes.md`
 
 Run conformance checks:
 
@@ -321,6 +323,12 @@ Run conformance checks:
 OLLAMA_PROXY_BASE_URL=http://localhost:8002 \
 OLLAMA_TEST_MODEL=gemma4:26b \
 ./scripts/ollama_runtime_conformance.sh
+
+# Full-surface non-mutating checks
+./scripts/ollama_full_surface_conformance.sh
+
+# Full-surface including mutating lifecycle checks
+OLLAMA_RUN_MUTATING=1 ./scripts/ollama_full_surface_conformance.sh
 ```
 
 ### Admin API (port 5001)

@@ -49,8 +49,8 @@ Goal: support full native Ollama API surface for model lifecycle and admin opera
   - [x] `POST /api/blobs/:digest`
   - [x] `HEAD /api/blobs/:digest`
 - [ ] Add explicit capability contracts and errors for unsupported upstreams
-- [ ] Add end-to-end conformance suite for full surface
-- [ ] Document known version-dependent behavior by Ollama release
+- [x] Add end-to-end conformance suite for full surface (`scripts/ollama_full_surface_conformance.sh`)
+- [x] Document known version-dependent behavior by Ollama release (`docs/ollama-version-notes.md`)
 
 ## Acceptance Criteria
 
