@@ -13,9 +13,10 @@ Features:
 """
 
 from fastapi import FastAPI, Request
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -23,6 +24,7 @@ from fastapi.requests import Request as FastAPIRequest
 import httpx
 import os
 import time
+import time as time_module
 import json
 import asyncio
 import re
@@ -125,6 +127,277 @@ def debug_log(level, msg):
         return
     if level == "error" or level == "warn" or mode == "full":
         print(f"[DEBUG:{level.upper()}] {msg}", flush=True)
+
+
+def _ollama_options_from_openai(
+    temperature: float,
+    max_tokens: int,
+    top_p: float,
+    kwargs: dict,
+) -> dict:
+    """Map OpenAI-style sampling params into Ollama options."""
+    options = {}
+    if temperature is not None:
+        options["temperature"] = temperature
+    if max_tokens is not None:
+        options["num_predict"] = max_tokens
+    if top_p is not None:
+        options["top_p"] = top_p
+
+    if kwargs.get("stop") is not None:
+        options["stop"] = kwargs.get("stop")
+    if kwargs.get("presence_penalty") is not None:
+        options["presence_penalty"] = kwargs.get("presence_penalty")
+    if kwargs.get("frequency_penalty") is not None:
+        options["frequency_penalty"] = kwargs.get("frequency_penalty")
+
+    return options
+
+
+def _openai_to_ollama_chat_payload(
+    model: str,
+    messages: list,
+    stream: bool,
+    temperature: float,
+    max_tokens: int,
+    top_p: float,
+    tools: Optional[list],
+    kwargs: dict,
+) -> dict:
+    """Build Ollama-native /api/chat payload from OpenAI-style request."""
+    payload = {
+        "model": model,
+        "messages": _normalize_ollama_messages(messages),
+        "stream": stream,
+        "options": _ollama_options_from_openai(temperature, max_tokens, top_p, kwargs),
+    }
+
+    if tools:
+        payload["tools"] = tools
+
+    # Do not forward OpenAI tool_choice object to Ollama; some versions reject it.
+
+    if kwargs.get("format") is not None:
+        payload["format"] = kwargs.get("format")
+
+    response_format = kwargs.get("response_format")
+    if response_format is not None and payload.get("format") is None:
+        if isinstance(response_format, str):
+            if response_format == "json":
+                payload["format"] = "json"
+        elif isinstance(response_format, dict):
+            rf_type = response_format.get("type")
+            if rf_type == "json_object":
+                payload["format"] = "json"
+            # Skip json_schema passthrough for Ollama compatibility.
+
+    if kwargs.get("keep_alive") is not None:
+        payload["keep_alive"] = kwargs.get("keep_alive")
+
+    return payload
+
+
+def _normalize_ollama_messages(messages: list) -> list:
+    """Ensure Ollama messages[].content is always a string."""
+    out = []
+    if not isinstance(messages, list):
+        return out
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        item = dict(msg)
+        content = item.get("content", "")
+        if isinstance(content, list):
+            parts = []
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type")
+                if btype == "text":
+                    parts.append(str(block.get("text") or ""))
+                elif btype == "image_url":
+                    parts.append("[image]")
+            item["content"] = "\n".join([p for p in parts if p]).strip()
+        elif content is None:
+            item["content"] = ""
+        elif not isinstance(content, str):
+            item["content"] = str(content)
+        out.append(item)
+
+    return out
+
+
+def _ollama_tool_calls_to_openai(ollama_tool_calls: list) -> list:
+    """Convert Ollama tool_calls into OpenAI tool_calls format."""
+    out = []
+    if not isinstance(ollama_tool_calls, list):
+        return out
+
+    for idx, tc in enumerate(ollama_tool_calls):
+        if not isinstance(tc, dict):
+            continue
+        fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+        name = fn.get("name") or tc.get("name") or "unknown"
+        arguments = fn.get("arguments") or tc.get("arguments") or {}
+        if not isinstance(arguments, str):
+            arguments = json.dumps(arguments)
+        out.append(
+            {
+                "id": tc.get("id") or f"call_{int(time.time() * 1000)}_{idx}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": arguments,
+                },
+            }
+        )
+    return out
+
+
+def _ollama_nonstream_to_openai(result: dict, model: str) -> dict:
+    """Convert Ollama /api/chat non-stream response into OpenAI format."""
+    message = result.get("message", {}) if isinstance(result, dict) else {}
+    content = message.get("content") or ""
+    reasoning_content = message.get("thinking") or ""
+    tool_calls = _ollama_tool_calls_to_openai(message.get("tool_calls") or [])
+    done_reason = result.get("done_reason") if isinstance(result, dict) else None
+    finish_reason = (
+        "tool_calls" if tool_calls and not content else (done_reason or "stop")
+    )
+    if finish_reason == "tool_calls":
+        finish_reason = "tool_calls"
+    elif finish_reason in ("stop", "length"):
+        pass
+    else:
+        finish_reason = "stop"
+
+    prompt_tokens = (
+        result.get("prompt_eval_count", 0) if isinstance(result, dict) else 0
+    )
+    completion_tokens = result.get("eval_count", 0) if isinstance(result, dict) else 0
+
+    return {
+        "id": result.get("id", f"chat-{int(time.time())}"),
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": content,
+                    "reasoning_content": reasoning_content,
+                    "tool_calls": tool_calls if tool_calls else None,
+                },
+                "finish_reason": finish_reason,
+            }
+        ],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+    }
+
+
+def _ollama_stream_to_openai_sse(stream_data: str, model: str) -> str:
+    """Convert Ollama JSONL stream into OpenAI-style SSE stream."""
+    out_lines = []
+    created = int(time.time())
+    chunk_id = f"chat-{int(time.time() * 1000)}"
+
+    for line in (stream_data or "").splitlines():
+        raw = line.strip()
+        if not raw:
+            continue
+        try:
+            chunk = json.loads(raw)
+        except Exception:
+            continue
+
+        message = chunk.get("message", {}) if isinstance(chunk, dict) else {}
+        content = message.get("content") or ""
+        thinking = message.get("thinking") or ""
+        ollama_tc = message.get("tool_calls") or []
+        tool_calls = _ollama_tool_calls_to_openai(ollama_tc)
+
+        delta = {}
+        if content:
+            delta["content"] = content
+        if thinking:
+            delta["reasoning_content"] = thinking
+        if tool_calls:
+            delta["tool_calls"] = []
+            for idx, tc in enumerate(tool_calls):
+                delta["tool_calls"].append(
+                    {
+                        "index": idx,
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tc["function"]["name"],
+                            "arguments": tc["function"]["arguments"],
+                        },
+                    }
+                )
+
+        finish_reason = None
+        if chunk.get("done"):
+            finish_reason = "tool_calls" if tool_calls and not content else "stop"
+
+        openai_chunk = {
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": delta,
+                    "finish_reason": finish_reason,
+                }
+            ],
+        }
+
+        if chunk.get("done"):
+            prompt_tokens = chunk.get("prompt_eval_count", 0)
+            completion_tokens = chunk.get("eval_count", 0)
+            openai_chunk["usage"] = {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            }
+
+        out_lines.append(f"data: {json.dumps(openai_chunk)}")
+        out_lines.append("")
+
+    out_lines.append("data: [DONE]")
+    out_lines.append("")
+    return "\n".join(out_lines)
+
+
+def _openai_to_ollama_chat_response(result: dict, model: str) -> dict:
+    """Convert OpenAI-style chat result into Ollama /api/chat response."""
+    choice = (result.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    usage = result.get("usage") or {}
+    response = {
+        "model": model,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "message": {
+            "role": "assistant",
+            "content": message.get("content") or "",
+        },
+        "done": True,
+        "done_reason": choice.get("finish_reason") or "stop",
+        "prompt_eval_count": usage.get("prompt_tokens", 0),
+        "eval_count": usage.get("completion_tokens", 0),
+    }
+    if message.get("tool_calls"):
+        response["message"]["tool_calls"] = message.get("tool_calls")
+    return response
 
 
 def _hash_text(value: str) -> str:
@@ -1296,6 +1569,59 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def diagnostics_request_logger(request: Request, call_next):
+    """Optional ingress/egress HTTP logging controlled by debug_mode."""
+    mode = is_debug_mode()
+    log_enabled = mode in ("basic", "full")
+
+    start = time.time()
+    if log_enabled:
+        request_id = request.headers.get("x-request-id", "-")
+        ua = request.headers.get("user-agent", "")[:80]
+        print(
+            f"[HTTP_IN] method={request.method} path={request.url.path} query={request.url.query or '-'} "
+            f"rid={request_id} ua={ua}",
+            flush=True,
+        )
+
+    try:
+        response = await call_next(request)
+    except Exception as e:
+        if log_enabled:
+            elapsed_ms = int((time.time() - start) * 1000)
+            print(
+                f"[HTTP_OUT] method={request.method} path={request.url.path} status=500 elapsed_ms={elapsed_ms} err={str(e)[:160]}",
+                flush=True,
+            )
+        raise
+
+    response.headers["X-Proxy"] = "serverless-proxy"
+
+    if log_enabled:
+        elapsed_ms = int((time.time() - start) * 1000)
+        print(
+            f"[HTTP_OUT] method={request.method} path={request.url.path} status={response.status_code} elapsed_ms={elapsed_ms}",
+            flush=True,
+        )
+
+    return response
+
+
+@app.exception_handler(StarletteHTTPException)
+async def diagnostics_http_exception_handler(
+    request: Request, exc: StarletteHTTPException
+):
+    """Log explicit 404s/HTTP errors when diagnostics are enabled."""
+    mode = is_debug_mode()
+    if mode in ("basic", "full"):
+        print(
+            f"[HTTP_ERR] method={request.method} path={request.url.path} status={exc.status_code} detail={str(exc.detail)[:160]}",
+            flush=True,
+        )
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+
 # ============================================================================
 # Backend Abstraction Layer
 # ============================================================================
@@ -1503,6 +1829,15 @@ class AIQueueBackend(LLMBackend):
                 )
 
                 if response.status_code != 200:
+                    if self.endpoint_type == "ollama":
+                        try:
+                            payload_preview = json.dumps(payload)[:2000]
+                        except Exception:
+                            payload_preview = str(payload)[:2000]
+                        debug_log(
+                            "warn",
+                            f"[OLLAMA_400] request_id={request_id} status={response.status_code} body={response.text[:400]} payload={payload_preview}",
+                        )
                     return (
                         None,
                         {
@@ -1771,6 +2106,113 @@ def get_virtual_model(model_name: str) -> Optional[dict]:
         return None
 
 
+def get_enabled_virtual_models() -> list[dict]:
+    """Return enabled virtual model records joined with endpoint metadata."""
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT vm.name, vm.actual_model, e.name as endpoint_name, e.endpoint_type as endpoint_type
+                FROM virtual_models vm
+                JOIN endpoints e ON vm.endpoint_id = e.id
+                WHERE vm.enabled = 1 AND e.enabled = 1
+            """
+            )
+            return [dict(row) for row in cursor.fetchall()]
+    except Exception:
+        return []
+
+
+def get_default_ollama_endpoint() -> Optional[dict]:
+    """Return highest-priority enabled endpoint configured as ollama."""
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT *
+                FROM endpoints
+                WHERE enabled = 1 AND lower(endpoint_type) = 'ollama'
+                ORDER BY priority DESC, id ASC
+                LIMIT 1
+            """
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+    except Exception:
+        return None
+
+
+def _resolve_ollama_target_for_request(
+    model_name: Optional[str] = None,
+) -> tuple[Optional[str], Optional[str]]:
+    """Resolve Ollama base URL/api_key using model backend or default ollama endpoint."""
+    if model_name:
+        backend = get_backend(model_name)
+        if backend is not None and getattr(backend, "endpoint_type", "") == "ollama":
+            return getattr(backend, "url", None), getattr(backend, "api_key", None)
+
+    endpoint = get_default_ollama_endpoint()
+    if endpoint:
+        return endpoint.get("url"), endpoint.get("api_key")
+    return None, None
+
+
+async def _ollama_passthrough(
+    request: Request, upstream_path: str, method: str = "POST"
+):
+    """Forward request to configured Ollama endpoint for full API compatibility."""
+    body = None
+    model_name = None
+    if method.upper() in ("POST", "PUT", "PATCH", "DELETE"):
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                model_name = body.get("model")
+        except Exception:
+            body = None
+
+    url, api_key = _resolve_ollama_target_for_request(model_name)
+    if not url:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "No enabled Ollama endpoint is configured"},
+        )
+
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    stream_requested = isinstance(body, dict) and bool(body.get("stream", False))
+    full_url = f"{url}{upstream_path}"
+
+    if stream_requested:
+
+        async def ndjson_generator():
+            async with httpx.AsyncClient(timeout=1200.0) as client:
+                async with client.stream(
+                    method.upper(), full_url, headers=headers, json=body
+                ) as resp:
+                    async for line in resp.aiter_lines():
+                        if line:
+                            yield line + "\n"
+
+        return StreamingResponse(ndjson_generator(), media_type="application/x-ndjson")
+
+    async with httpx.AsyncClient(timeout=300.0) as client:
+        resp = await client.request(
+            method.upper(), full_url, headers=headers, json=body
+        )
+        try:
+            content = resp.json()
+            return JSONResponse(status_code=resp.status_code, content=content)
+        except Exception:
+            return JSONResponse(
+                status_code=resp.status_code, content={"error": resp.text}
+            )
+
+
 def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
     """Create a backend from virtual model configuration."""
     endpoint_type = vm.get("endpoint_type", "openai")
@@ -1837,6 +2279,43 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
                 "top_p": top_p,
                 "stream": stream,
             }
+            ollama_openai_payload = None
+
+            if self.endpoint_type == "ollama":
+                ollama_openai_payload = {
+                    "model": self.model,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                    "top_p": top_p,
+                    "stream": stream,
+                }
+                if tools:
+                    ollama_openai_payload["tools"] = tools
+                for k, v in kwargs.items():
+                    if (
+                        v is not None
+                        and not k.startswith("_")
+                        and k
+                        not in (
+                            "stop",
+                            "presence_penalty",
+                            "frequency_penalty",
+                        )
+                    ):
+                        ollama_openai_payload[k] = v
+
+            if self.endpoint_type == "ollama":
+                payload = _openai_to_ollama_chat_payload(
+                    model=self.model,
+                    messages=messages,
+                    stream=stream,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    top_p=top_p,
+                    tools=tools,
+                    kwargs=kwargs,
+                )
 
             # Debug: log message structure for vision requests
             if messages:
@@ -1893,7 +2372,7 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
 
             # For non-Anthropic backends (OpenAI-compatible), always add tools if provided
             # This ensures tool_choice works correctly
-            if self.endpoint_type != "anthropic" and tools:
+            if self.endpoint_type not in ("anthropic", "ollama") and tools:
                 payload["tools"] = tools
 
             # Safety: if tool_choice/parallel_tool_calls but no tools, strip them to avoid upstream validation errors
@@ -1914,13 +2393,14 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
                     if k not in ("tool_choice", "parallel_tool_calls")
                 }
 
-            for k, v in kwargs.items():
-                if v is not None and k not in [
-                    "stop",
-                    "presence_penalty",
-                    "frequency_penalty",
-                ]:
-                    payload[k] = v
+            if self.endpoint_type != "ollama":
+                for k, v in kwargs.items():
+                    if v is not None and k not in [
+                        "stop",
+                        "presence_penalty",
+                        "frequency_penalty",
+                    ]:
+                        payload[k] = v
 
             # For RunPod serverless, use /runsync endpoint which waits for completion
             if self.endpoint_type == "runpod":
@@ -1943,6 +2423,8 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
             elif self.endpoint_type == "anthropic":
                 endpoint = f"{self.url}/v1/messages"
             elif self.endpoint_type == "queue":
+                endpoint = f"{self.url}/v1/chat/completions"
+            elif self.endpoint_type == "ollama":
                 endpoint = f"{self.url}/v1/chat/completions"
             else:
                 endpoint = f"{self.url}/v1/chat/completions"
@@ -1973,9 +2455,23 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
 
             async with httpx.AsyncClient(timeout=timeout) as client:
                 try:
-                    response = await client.post(
-                        endpoint, headers=headers, json=payload
-                    )
+                    used_ollama_api_chat = False
+                    if self.endpoint_type == "ollama":
+                        response = await client.post(
+                            endpoint,
+                            headers=headers,
+                            json=(ollama_openai_payload or payload),
+                        )
+                        if response.status_code in (404, 405):
+                            endpoint = f"{self.url}/api/chat"
+                            response = await client.post(
+                                endpoint, headers=headers, json=payload
+                            )
+                            used_ollama_api_chat = True
+                    else:
+                        response = await client.post(
+                            endpoint, headers=headers, json=payload
+                        )
                 except Exception as e:
                     debug_log(
                         "error",
@@ -1993,6 +2489,15 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
                     )
 
                 if response.status_code != 200:
+                    if self.endpoint_type == "ollama":
+                        try:
+                            payload_preview = json.dumps(payload)[:2000]
+                        except Exception:
+                            payload_preview = str(payload)[:2000]
+                        print(
+                            f"[OLLAMA_400] request_id={request_id} status={response.status_code} body={response.text[:500]} payload={payload_preview}",
+                            flush=True,
+                        )
                     return (
                         None,
                         {
@@ -2007,12 +2512,19 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
                 try:
                     if stream:
                         # For streaming, return the raw text (SSE format)
+                        if self.endpoint_type == "ollama" and used_ollama_api_chat:
+                            sse_data = _ollama_stream_to_openai_sse(
+                                response.text, self.model
+                            )
+                            return {"_stream_data": sse_data}, None, 200
                         debug_log(
                             "info",
                             f"[VM_BACKEND_RESP] request_id={request_id} status={response.status_code} len={len(response.text)} stream=true",
                         )
                         return {"_stream_data": response.text}, None, 200
                     result = response.json()
+                    if self.endpoint_type == "ollama" and used_ollama_api_chat:
+                        result = _ollama_nonstream_to_openai(result, self.model)
                     # Debug: log response details
                     choices = result.get("choices", [])
                     if choices:
@@ -2059,8 +2571,20 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
             if self.endpoint_type == "openwebui":
                 endpoint = f"{self.url}/api/v1/embeddings"
 
+            if self.endpoint_type == "ollama":
+                endpoint = f"{self.url}/api/embed"
+
             async with httpx.AsyncClient(timeout=120.0) as client:
                 response = await client.post(endpoint, headers=headers, json=payload)
+
+                if self.endpoint_type == "ollama" and response.status_code in (
+                    404,
+                    405,
+                ):
+                    endpoint = f"{self.url}/api/embeddings"
+                    response = await client.post(
+                        endpoint, headers=headers, json=payload
+                    )
 
                 if response.status_code != 200:
                     return (
@@ -2069,7 +2593,33 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
                         response.status_code,
                     )
 
-                return response.json(), None, 200
+                result = response.json()
+
+                if self.endpoint_type == "ollama":
+                    embeddings = result.get("embeddings")
+                    if embeddings is None and result.get("embedding") is not None:
+                        embeddings = [result.get("embedding")]
+                    if embeddings is None:
+                        embeddings = []
+                    normalized = {
+                        "object": "list",
+                        "data": [
+                            {
+                                "object": "embedding",
+                                "index": i,
+                                "embedding": emb,
+                            }
+                            for i, emb in enumerate(embeddings)
+                        ],
+                        "model": self.model,
+                        "usage": {
+                            "prompt_tokens": result.get("prompt_eval_count", 0),
+                            "total_tokens": result.get("prompt_eval_count", 0),
+                        },
+                    }
+                    return normalized, None, 200
+
+                return result, None, 200
 
         async def health_check(self) -> bool:
             try:
@@ -2843,7 +3393,15 @@ async def chat_completions(request: Request):
     ua_lower = user_agent.lower()
     is_openai_js = "openai/js" in ua_lower or "openclaw" in ua_lower
     is_opencode = "opencode" in ua_lower or "ai-sdk" in ua_lower
-    if stream and (is_openai_js or is_opencode) and not wants_sse and not accepts_all:
+    # OpenAI JS/OpenClaw can request stream=true while using application/json and
+    # still correctly consume SSE. Do not force non-streaming for that client.
+    if (
+        stream
+        and is_opencode
+        and not is_openai_js
+        and not wants_sse
+        and not accepts_all
+    ):
         print(
             f"[COMPAT] Forcing non-streaming: accept={accept_header} user-agent={user_agent}",
             flush=True,
@@ -3333,6 +3891,18 @@ async def chat_completions(request: Request):
         )
 
     return JSONResponse(content=response_content)
+
+
+@app.post("/chat/completions")
+async def chat_completions_alias(request: Request):
+    """Compatibility alias for OpenAI-style clients missing /v1 prefix."""
+    return await chat_completions(request)
+
+
+@app.post("/api/chat/completions")
+async def chat_completions_api_alias(request: Request):
+    """Compatibility alias used by some OpenWebUI/OpenAI clients."""
+    return await chat_completions(request)
 
 
 async def _generate_sse(
@@ -4168,20 +4738,7 @@ async def anthropic_messages(request: Request):
 
 @app.get("/v1/models")
 async def list_models():
-    # Get virtual models from database
-    virtual_models = []
-    try:
-        with get_db() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT vm.name, vm.actual_model, e.name as endpoint_name
-                FROM virtual_models vm
-                JOIN endpoints e ON vm.endpoint_id = e.id
-                WHERE vm.enabled = 1 AND e.enabled = 1
-            """)
-            virtual_models = [dict(row) for row in cursor.fetchall()]
-    except Exception:
-        pass
+    virtual_models = get_enabled_virtual_models()
 
     # Build response with virtual models only
     models = []
@@ -4201,6 +4758,326 @@ async def list_models():
         "object": "list",
         "data": models,
     }
+
+
+@app.get("/models")
+async def list_models_alias():
+    return await list_models()
+
+
+@app.get("/api/models")
+async def list_models_api_alias():
+    return await list_models()
+
+
+@app.get("/api/v1/models")
+async def list_models_api_v1_alias():
+    return await list_models()
+
+
+@app.get("/api/version")
+async def ollama_version():
+    return {"version": "serverless-proxy"}
+
+
+@app.get("/api/tags")
+async def ollama_tags():
+    virtual_models = get_enabled_virtual_models()
+    models = []
+    for vm in virtual_models:
+        models.append(
+            {
+                "name": vm["name"],
+                "model": vm["name"],
+                "modified_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "size": 0,
+                "digest": "",
+                "details": {
+                    "family": "proxy",
+                    "parameter_size": "unknown",
+                    "quantization_level": "unknown",
+                },
+            }
+        )
+    return {"models": models}
+
+
+@app.post("/api/chat")
+async def ollama_chat(request: Request):
+    data = await request.json()
+    model = data.get("model")
+    if not model:
+        return JSONResponse(status_code=400, content={"error": "model is required"})
+
+    backend = get_backend(model)
+    if backend is None:
+        return JSONResponse(status_code=404, content={"error": "model not found"})
+
+    stream = bool(data.get("stream", False))
+
+    if getattr(backend, "endpoint_type", "") == "ollama":
+        payload = dict(data)
+        payload["model"] = getattr(backend, "model", model)
+        payload["messages"] = _normalize_ollama_messages(payload.get("messages") or [])
+        headers = {
+            "Content-Type": "application/json",
+            "X-Source": request.headers.get("x-source", "serverless-proxy"),
+        }
+        if getattr(backend, "api_key", ""):
+            headers["Authorization"] = f"Bearer {backend.api_key}"
+
+        if stream:
+
+            async def ndjson_generator():
+                async with httpx.AsyncClient(timeout=1200.0) as client:
+                    async with client.stream(
+                        "POST", f"{backend.url}/api/chat", headers=headers, json=payload
+                    ) as resp:
+                        async for line in resp.aiter_lines():
+                            if line:
+                                yield line + "\n"
+
+            return StreamingResponse(
+                ndjson_generator(), media_type="application/x-ndjson"
+            )
+
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            resp = await client.post(
+                f"{backend.url}/api/chat", headers=headers, json=payload
+            )
+            if resp.status_code != 200:
+                return JSONResponse(
+                    status_code=resp.status_code, content={"error": resp.text}
+                )
+            return JSONResponse(content=resp.json())
+
+    messages = data.get("messages") or []
+    options = data.get("options") or {}
+    backend_result, error, status_code = await backend.chat_completion(
+        messages=messages,
+        model=model,
+        temperature=options.get("temperature", 0.7),
+        max_tokens=options.get("num_predict", 256),
+        top_p=options.get("top_p", 1.0),
+        stream=False,
+        tools=data.get("tools") or [],
+    )
+    if error:
+        return JSONResponse(status_code=status_code, content=error)
+    result = backend_result.get("result", backend_result)
+    return JSONResponse(content=_openai_to_ollama_chat_response(result, model))
+
+
+@app.post("/api/generate")
+async def ollama_generate(request: Request):
+    data = await request.json()
+    model = data.get("model")
+    if not model:
+        return JSONResponse(status_code=400, content={"error": "model is required"})
+
+    backend = get_backend(model)
+    if backend is None:
+        return JSONResponse(status_code=404, content={"error": "model not found"})
+
+    stream = bool(data.get("stream", False))
+
+    # Native passthrough for Ollama endpoints
+    if getattr(backend, "endpoint_type", "") == "ollama":
+        payload = {
+            "model": getattr(backend, "model", model),
+            "prompt": data.get("prompt", ""),
+            "stream": stream,
+        }
+        for k in (
+            "suffix",
+            "images",
+            "think",
+            "format",
+            "options",
+            "system",
+            "template",
+            "raw",
+            "keep_alive",
+            "context",
+            "width",
+            "height",
+            "steps",
+        ):
+            if data.get(k) is not None:
+                payload[k] = data.get(k)
+
+        headers = {
+            "Content-Type": "application/json",
+            "X-Source": request.headers.get("x-source", "serverless-proxy"),
+        }
+        if getattr(backend, "api_key", ""):
+            headers["Authorization"] = f"Bearer {backend.api_key}"
+
+        if stream:
+
+            async def ndjson_generator():
+                async with httpx.AsyncClient(timeout=1200.0) as client:
+                    async with client.stream(
+                        "POST",
+                        f"{backend.url}/api/generate",
+                        headers=headers,
+                        json=payload,
+                    ) as resp:
+                        async for line in resp.aiter_lines():
+                            if line:
+                                yield line + "\n"
+
+            return StreamingResponse(
+                ndjson_generator(), media_type="application/x-ndjson"
+            )
+
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            resp = await client.post(
+                f"{backend.url}/api/generate", headers=headers, json=payload
+            )
+            if resp.status_code != 200:
+                return JSONResponse(
+                    status_code=resp.status_code, content={"error": resp.text}
+                )
+            return JSONResponse(content=resp.json())
+
+    prompt = data.get("prompt", "")
+    messages = []
+    if data.get("system"):
+        messages.append({"role": "system", "content": data.get("system")})
+    messages.append({"role": "user", "content": prompt})
+
+    options = data.get("options") or {}
+    backend_result, error, status_code = await backend.chat_completion(
+        messages=messages,
+        model=model,
+        temperature=options.get("temperature", 0.7),
+        max_tokens=options.get("num_predict", 256),
+        top_p=options.get("top_p", 1.0),
+        stream=False,
+    )
+    if error:
+        return JSONResponse(status_code=status_code, content=error)
+    raw = _openai_to_ollama_chat_response(
+        backend_result.get("result", backend_result), model
+    )
+    return {
+        "model": raw.get("model", model),
+        "created_at": raw.get(
+            "created_at", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        ),
+        "response": (raw.get("message") or {}).get("content", ""),
+        "done": True,
+        "done_reason": raw.get("done_reason", "stop"),
+        "prompt_eval_count": raw.get("prompt_eval_count", 0),
+        "eval_count": raw.get("eval_count", 0),
+    }
+
+
+@app.post("/api/embed")
+@app.post("/api/embeddings")
+async def ollama_embed(request: Request):
+    data = await request.json()
+    model = data.get("model")
+    if not model:
+        return JSONResponse(status_code=400, content={"error": "model is required"})
+
+    backend = get_backend(model)
+    if backend is None:
+        return JSONResponse(status_code=404, content={"error": "model not found"})
+
+    result, error, status_code = await backend.embeddings(
+        input_text=data.get("input", ""),
+        model=model,
+    )
+    if error:
+        return JSONResponse(status_code=status_code, content=error)
+
+    vectors = [
+        row.get("embedding") for row in result.get("data", []) if isinstance(row, dict)
+    ]
+    return {"model": model, "embeddings": vectors}
+
+
+@app.post("/api/show")
+async def ollama_show(request: Request):
+    return await _ollama_passthrough(request, "/api/show", method="POST")
+
+
+@app.get("/api/ps")
+@app.post("/api/ps")
+async def ollama_ps(request: Request):
+    method = request.method.upper()
+    return await _ollama_passthrough(request, "/api/ps", method=method)
+
+
+@app.post("/api/pull")
+async def ollama_pull(request: Request):
+    return await _ollama_passthrough(request, "/api/pull", method="POST")
+
+
+@app.post("/api/push")
+async def ollama_push(request: Request):
+    return await _ollama_passthrough(request, "/api/push", method="POST")
+
+
+@app.post("/api/create")
+async def ollama_create(request: Request):
+    return await _ollama_passthrough(request, "/api/create", method="POST")
+
+
+@app.post("/api/copy")
+async def ollama_copy(request: Request):
+    return await _ollama_passthrough(request, "/api/copy", method="POST")
+
+
+@app.delete("/api/delete")
+@app.post("/api/delete")
+async def ollama_delete(request: Request):
+    method = request.method.upper()
+    return await _ollama_passthrough(request, "/api/delete", method=method)
+
+
+@app.head("/api/blobs/{digest}")
+async def ollama_blob_head(request: Request, digest: str):
+    url, api_key = _resolve_ollama_target_for_request(None)
+    if not url:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "No enabled Ollama endpoint is configured"},
+        )
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        resp = await client.head(f"{url}/api/blobs/{digest}", headers=headers)
+        return Response(status_code=resp.status_code)
+
+
+@app.post("/api/blobs/{digest}")
+async def ollama_blob_post(request: Request, digest: str):
+    url, api_key = _resolve_ollama_target_for_request(None)
+    if not url:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "No enabled Ollama endpoint is configured"},
+        )
+
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    raw_body = await request.body()
+    async with httpx.AsyncClient(timeout=300.0) as client:
+        resp = await client.post(
+            f"{url}/api/blobs/{digest}", headers=headers, content=raw_body
+        )
+        try:
+            return JSONResponse(status_code=resp.status_code, content=resp.json())
+        except Exception:
+            return JSONResponse(
+                status_code=resp.status_code, content={"error": resp.text}
+            )
 
 
 @app.post("/v1/completions")
@@ -4348,6 +5225,16 @@ async def embeddings(request: Request):
             }
         },
     )
+
+
+@app.post("/embeddings")
+async def embeddings_alias(request: Request):
+    return await embeddings(request)
+
+
+@app.post("/api/v1/embeddings")
+async def embeddings_api_v1_alias(request: Request):
+    return await embeddings(request)
 
 
 # ============================================================================
@@ -4606,6 +5493,8 @@ def fetch_endpoint_models(endpoint_id):
         endpoint_type = (endpoint.get("endpoint_type") or "").lower()
         if endpoint_type == "openwebui":
             model_paths = ["/api/models", "/api/v1/models", "/v1/models", "/models"]
+        elif endpoint_type == "ollama":
+            model_paths = ["/api/tags", "/v1/models", "/models", "/api/models"]
         else:
             model_paths = ["/v1/models", "/models", "/api/models", "/api/v1/models"]
 
@@ -4620,7 +5509,9 @@ def fetch_endpoint_models(endpoint_id):
                     parse_errors.append(f"{path}: non-JSON 200 response ({snippet})")
                     continue
                 models = data.get("models", []) or data.get("data", [])
-                model_list = sorted([m.get("id") or m.get("name") for m in models])
+                model_list = sorted(
+                    [m.get("id") or m.get("name") or m.get("model") for m in models]
+                )
                 return flask_jsonify({"models": model_list})
 
         if parse_errors:

@@ -253,6 +253,76 @@ curl -X POST http://localhost:8002/v1/chat/completions \
 - `POST /v1/embeddings` - Embeddings
 - `GET /health` - Health check
 
+### Ollama Compatibility API (port 8002)
+
+The proxy now supports both Ollama-native routes and OpenAI-compatible routes when a virtual model maps to an `ollama` endpoint.
+
+#### Runtime inference routes (Phase 1)
+
+- `GET /api/tags`
+- `GET /api/version`
+- `POST /api/chat`
+- `POST /api/generate`
+- `POST /api/embed`
+- `POST /api/embeddings` (alias)
+
+#### OpenAI client compatibility aliases
+
+- `POST /chat/completions` -> OpenAI handler alias
+- `POST /api/chat/completions` -> OpenAI handler alias
+- `GET /models`, `GET /api/models`, `GET /api/v1/models` -> model listing aliases
+- `POST /embeddings`, `POST /api/v1/embeddings` -> embeddings aliases
+
+#### Full native surface passthrough (Phase 2)
+
+Forwarded to configured Ollama endpoint (resolved by model backend first, or default enabled Ollama endpoint):
+
+- `POST /api/show`
+- `GET|POST /api/ps`
+- `POST /api/pull`
+- `POST /api/push`
+- `POST /api/create`
+- `POST /api/copy`
+- `DELETE|POST /api/delete`
+- `HEAD /api/blobs/{digest}`
+- `POST /api/blobs/{digest}`
+
+#### Behavior details
+
+- **Upstream selection for ollama virtual models**:
+  - tries Ollama OpenAI-compatible upstream `POST /v1/chat/completions` first
+  - falls back to native `POST /api/chat` if upstream returns `404/405`
+- **Message normalization**:
+  - converts OpenAI block-style `messages[].content` arrays to Ollama-safe string content for native `/api/chat`
+- **Streaming**:
+  - native Ollama routes stream as NDJSON (`application/x-ndjson`)
+  - OpenAI routes stream as SSE (`text/event-stream`)
+- **Embeddings**:
+  - for Ollama endpoints, proxy tries `/api/embed` then falls back to `/api/embeddings`
+  - capability errors from upstream are returned as non-200 responses (for example `501` if model lacks embedding support)
+
+#### Diagnostics for compatibility debugging
+
+- Request/response diagnostics under debug mode:
+  - `[HTTP_IN]`, `[HTTP_OUT]`, `[HTTP_ERR]`
+- Ollama upstream payload diagnostics:
+  - `[OLLAMA_400] ... body=... payload=...`
+- Response marker header:
+  - `X-Proxy: serverless-proxy`
+
+#### Conformance and roadmap docs
+
+- Runtime conformance smoke script: `scripts/ollama_runtime_conformance.sh`
+- Compatibility roadmap and checklist: `docs/ollama-compatibility-roadmap.md`
+
+Run conformance checks:
+
+```bash
+OLLAMA_PROXY_BASE_URL=http://localhost:8002 \
+OLLAMA_TEST_MODEL=gemma4:26b \
+./scripts/ollama_runtime_conformance.sh
+```
+
 ### Admin API (port 5001)
 
 | Endpoint | Method | Description |
@@ -276,7 +346,7 @@ curl -X POST http://localhost:8002/v1/chat/completions \
 |------|-------------|
 | `openwebui` | OpenWebUI API (`/api/chat/completions`, `/api/models`, `/api/v1/embeddings`) |
 | `openai` | OpenAI-compatible API (`/v1/chat/completions`, `/v1/models`, `/v1/embeddings`) |
-| `ollama` | Ollama API |
+| `ollama` | Ollama API (native `/api/*` + OpenAI-compatible `/v1/*` bridging) |
 | `vllm` | vLLM API |
 | `together` | Together AI |
 | `runpod` | RunPod Serverless |
