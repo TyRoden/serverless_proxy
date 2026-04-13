@@ -980,6 +980,39 @@ def init_database():
                     87,
                 ),
                 (
+                    "qwen_xml_named_params",
+                    "xml",
+                    r"<tool_call>\s*<function=(\w+)>\s*([\s\S]*?)\s*</function>\s*(?:</tool_call>)?",
+                    None,
+                    1,
+                    None,
+                    '{"bash":"bash","read":"read","write":"write","edit":"edit","glob":"glob","grep":"grep","task":"task"}',
+                    '{"file_path":"filePath"}',
+                    97,
+                ),
+                (
+                    "qwen_xml_call",
+                    "xml",
+                    r"<tool_call>\s*<function=(\w+)>\s*<parameter=command>\s*([\s\S]*?)\s*</parameter>(?:\s*<parameter=description>\s*[\s\S]*?\s*</parameter>)?\s*(?:</function>\s*)?(?:</tool_call>)?",
+                    None,
+                    1,
+                    None,
+                    '{"bash":"bash","read":"read","write":"write","edit":"edit","glob":"glob","grep":"grep","task":"task"}',
+                    "{}",
+                    95,
+                ),
+                (
+                    "qwen_xml_read_filepath",
+                    "xml",
+                    r"<tool_call>\s*<function=read>\s*<parameter=filePath>\s*([\s\S]*?)\s*</parameter>\s*(?:</function>\s*)?(?:</tool_call>)?",
+                    "read",
+                    None,
+                    None,
+                    "{}",
+                    '{"file_path":"filePath"}',
+                    96,
+                ),
+                (
                     "bracket_tool",
                     "bracket",
                     r"\[tool\](\w+)\[/tool\]\s*(\{.*?\})",
@@ -1268,6 +1301,94 @@ def init_database():
             """,
             (
                 r"<tool_call>\s*(\w+)\s*<parameter=(\w+)>\s*(.*?)\s*</parameter>\s*(?:</function>\s*)?(?:</tool_call>)?",
+            ),
+        )
+
+        # Migration: ensure Qwen XML tool-call patterns exist (for existing installs)
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO tool_patterns
+            (pattern_name, pattern_type, regex_pattern, tool_name, tool_name_group, tool_name_json_path, tool_name_mapping, parameter_mapping, priority)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "qwen_xml_named_params",
+                "xml",
+                r"<tool_call>\s*<function=(\w+)>\s*([\s\S]*?)\s*</function>\s*(?:</tool_call>)?",
+                None,
+                1,
+                None,
+                '{"bash":"bash","read":"read","write":"write","edit":"edit","glob":"glob","grep":"grep","task":"task"}',
+                '{"file_path":"filePath"}',
+                97,
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO tool_patterns
+            (pattern_name, pattern_type, regex_pattern, tool_name, tool_name_group, tool_name_json_path, tool_name_mapping, parameter_mapping, priority)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "qwen_xml_call",
+                "xml",
+                r"<tool_call>\s*<function=(\w+)>\s*<parameter=command>\s*([\s\S]*?)\s*</parameter>(?:\s*<parameter=description>\s*[\s\S]*?\s*</parameter>)?\s*(?:</function>\s*)?(?:</tool_call>)?",
+                None,
+                1,
+                None,
+                '{"bash":"bash","read":"read","write":"write","edit":"edit","glob":"glob","grep":"grep","task":"task"}',
+                "{}",
+                95,
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO tool_patterns
+            (pattern_name, pattern_type, regex_pattern, tool_name, tool_name_group, tool_name_json_path, tool_name_mapping, parameter_mapping, priority)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "qwen_xml_read_filepath",
+                "xml",
+                r"<tool_call>\s*<function=read>\s*<parameter=filePath>\s*([\s\S]*?)\s*</parameter>\s*(?:</function>\s*)?(?:</tool_call>)?",
+                "read",
+                None,
+                None,
+                "{}",
+                '{"file_path":"filePath"}',
+                96,
+            ),
+        )
+
+        # Migration: keep Qwen XML regex patterns up to date
+        cursor.execute(
+            """
+            UPDATE tool_patterns
+            SET regex_pattern = ?
+            WHERE pattern_name = 'qwen_xml_named_params'
+            """,
+            (
+                r"<tool_call>\s*<function=(\w+)>\s*([\s\S]*?)\s*</function>\s*(?:</tool_call>)?",
+            ),
+        )
+        cursor.execute(
+            """
+            UPDATE tool_patterns
+            SET regex_pattern = ?
+            WHERE pattern_name = 'qwen_xml_call'
+            """,
+            (
+                r"<tool_call>\s*<function=(\w+)>\s*<parameter=command>\s*([\s\S]*?)\s*</parameter>(?:\s*<parameter=description>\s*[\s\S]*?\s*</parameter>)?\s*(?:</function>\s*)?(?:</tool_call>)?",
+            ),
+        )
+        cursor.execute(
+            """
+            UPDATE tool_patterns
+            SET regex_pattern = ?
+            WHERE pattern_name = 'qwen_xml_read_filepath'
+            """,
+            (
+                r"<tool_call>\s*<function=read>\s*<parameter=filePath>\s*([\s\S]*?)\s*</parameter>\s*(?:</function>\s*)?(?:</tool_call>)?",
             ),
         )
 
@@ -2857,7 +2978,17 @@ def extract_tool_calls(content):
                                 args_dict = {"value": raw_args.strip()}
                     else:
                         # Non-JSON content - check pattern type
-                        if pattern["type"] == "bracket":
+                        if pattern["type"] == "xml" and "<parameter=" in raw_args:
+                            param_pairs = re.findall(
+                                r"<parameter=(\w+)>\s*(.*?)\s*</parameter>",
+                                raw_args,
+                                flags=re.DOTALL,
+                            )
+                            if param_pairs:
+                                for k, v in param_pairs:
+                                    mapped_key = pattern["param_map"].get(k, k)
+                                    args_dict[mapped_key] = v.strip()
+                        elif pattern["type"] == "bracket":
                             # Extract path from text
                             import re as re_module
 
@@ -2913,6 +3044,47 @@ def extract_tool_calls(content):
                         "command": args_dict.get("command", ""),
                         "description": args_dict.get("description", "Run bash command"),
                     }
+                elif tool_name == "read":
+                    if "filePath" not in args_dict:
+                        for key in ("file_path", "path", "value", "query"):
+                            if key in args_dict and isinstance(args_dict[key], str):
+                                args_dict["filePath"] = args_dict[key]
+                                break
+                    if "filePath" in args_dict:
+                        args_dict = {"filePath": args_dict["filePath"]}
+                elif tool_name == "write":
+                    if "filePath" not in args_dict:
+                        for key in ("file_path", "path"):
+                            if key in args_dict and isinstance(args_dict[key], str):
+                                args_dict["filePath"] = args_dict[key]
+                                break
+                    if "content" not in args_dict:
+                        for key in ("value", "query"):
+                            if key in args_dict and isinstance(args_dict[key], str):
+                                args_dict["content"] = args_dict[key]
+                                break
+                    if isinstance(raw_args, str) and "<parameter=" in raw_args:
+                        if "filePath" not in args_dict:
+                            m_fp = re.search(
+                                r"<parameter=filePath>\s*(.*?)\s*</parameter>",
+                                raw_args,
+                                flags=re.DOTALL,
+                            )
+                            if m_fp:
+                                args_dict["filePath"] = m_fp.group(1).strip()
+                        if "content" not in args_dict:
+                            m_ct = re.search(
+                                r"<parameter=content>\s*(.*?)\s*</parameter>",
+                                raw_args,
+                                flags=re.DOTALL,
+                            )
+                            if m_ct:
+                                args_dict["content"] = m_ct.group(1)
+                    if "filePath" in args_dict and "content" in args_dict:
+                        args_dict = {
+                            "filePath": args_dict["filePath"],
+                            "content": args_dict["content"],
+                        }
 
                 args_str = json.dumps(args_dict, ensure_ascii=False)
 
