@@ -102,6 +102,42 @@ The system auto-seeds these patterns on first run:
 | bracket_tool | bracket | `\[tool\](\w+)\[/tool\]\s*(\{.*?\})` | Group 1 |
 | action | action | `\[([a-zA-Z][^\]]+)\]` | Keyword mapping |
 
+### Qwen 3.5 XML patterns
+
+Qwen 3.5 can emit XML-like tool calls such as:
+
+```xml
+<tool_call>
+<function=read>
+<parameter=filePath>
+/mnt/ai/ai-queue-master/app/config.py
+</parameter>
+</function>
+</tool_call>
+```
+
+and:
+
+```xml
+<tool_call>
+<function=bash>
+<parameter=command>
+ls -la /mnt/ai/ai-queue-master/app/
+</parameter>
+<parameter=description>
+List app directory
+</parameter>
+</function>
+</tool_call>
+```
+
+Recommended DB-backed patterns:
+
+- `qwen_xml_call` (priority ~95) for `<function=bash>` with `parameter=command`
+- `qwen_xml_read_filepath` (priority ~96) for `<function=read>` with `parameter=filePath`
+
+Tip: make these tolerant of truncated output by allowing optional closing `</function>` / `</tool_call>` where needed.
+
 ## Mapping Examples
 
 ### Tool Name Mapping

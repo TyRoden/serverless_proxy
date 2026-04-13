@@ -2,6 +2,13 @@
 
 All notable changes to the Serverless Proxy will be documented in this file.
 
+## [2.4.2] - 2026-04-13
+
+### Fixed
+
+- **Qwen 3.5 Tool-Call Compatibility (DB patterns)** - Added documentation and operational guidance for handling Qwen 3.5 XML-style tool calls through `tool_patterns` table records instead of hardcoded parsing rules.
+- **Truncated XML Tool Calls** - Documented tolerant pattern strategy for partial `<tool_call>` payloads so extraction still succeeds when responses are cut off before closing tags.
+
 ## [2.4.1] - 2026-04-11
 
 ### Added

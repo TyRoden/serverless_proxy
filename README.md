@@ -152,6 +152,37 @@ The admin dashboard includes a **Patterns** tab for fixing model-specific tool c
 
 See [docs/tool_patterns.md](docs/tool_patterns.md) for full details and examples.
 
+#### Qwen 3.5 tool-call compatibility
+
+Qwen 3.5 may emit XML-style tool calls instead of OpenAI JSON function calls, for example:
+
+```xml
+<tool_call>
+<function=read>
+<parameter=filePath>
+/mnt/ai/ai-queue-master/app/config.py
+</parameter>
+</function>
+</tool_call>
+```
+
+or:
+
+```xml
+<tool_call>
+<function=bash>
+<parameter=command>
+ls -la /mnt/ai/ai-queue-master/app/
+</parameter>
+<parameter=description>
+List app directory
+</parameter>
+</function>
+</tool_call>
+```
+
+The proxy supports these via DB-backed `tool_patterns` records (not hardcoded), so compatibility can be adjusted from the Patterns UI/API without code edits.
+
 ### Docker Ports
 
 | Port | Service |
