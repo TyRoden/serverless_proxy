@@ -2980,14 +2980,26 @@ def extract_tool_calls(content):
                         # Non-JSON content - check pattern type
                         if pattern["type"] == "xml" and "<parameter=" in raw_args:
                             param_pairs = re.findall(
-                                r"<parameter=(\w+)>\s*(.*?)\s*</parameter>",
+                                r"<parameter=(\w+)>([\s\S]*?)</parameter>",
                                 raw_args,
                                 flags=re.DOTALL,
                             )
                             if param_pairs:
                                 for k, v in param_pairs:
                                     mapped_key = pattern["param_map"].get(k, k)
-                                    args_dict[mapped_key] = v.strip()
+                                    if mapped_key in (
+                                        "oldString",
+                                        "newString",
+                                        "content",
+                                    ):
+                                        val = v
+                                        if val.startswith("\n"):
+                                            val = val[1:]
+                                        if val.endswith("\n"):
+                                            val = val[:-1]
+                                        args_dict[mapped_key] = val
+                                    else:
+                                        args_dict[mapped_key] = v.strip()
                         elif pattern["type"] == "bracket":
                             # Extract path from text
                             import re as re_module
@@ -3050,8 +3062,22 @@ def extract_tool_calls(content):
                             if key in args_dict and isinstance(args_dict[key], str):
                                 args_dict["filePath"] = args_dict[key]
                                 break
+                    normalized = {}
                     if "filePath" in args_dict:
-                        args_dict = {"filePath": args_dict["filePath"]}
+                        normalized["filePath"] = args_dict["filePath"]
+                    for key in ("offset", "limit"):
+                        if key in args_dict:
+                            v = args_dict[key]
+                            if isinstance(v, str):
+                                sv = v.strip()
+                                if sv.isdigit():
+                                    v = int(sv)
+                                else:
+                                    continue
+                            if isinstance(v, (int, float)):
+                                normalized[key] = int(v)
+                    if normalized:
+                        args_dict = normalized
                 elif tool_name == "write":
                     if "filePath" not in args_dict:
                         for key in ("file_path", "path"):
