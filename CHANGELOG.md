@@ -2,6 +2,41 @@
 
 All notable changes to the Serverless Proxy will be documented in this file.
 
+## [2.4.3] - 2026-04-18
+
+### Added
+
+- **OpenAI OAuth Provider Type (`openai_oauth`)** - Added a new endpoint type for OAuth-backed OpenAI-compatible upstreams with OpenAI-first defaults.
+- **OAuth Endpoint UI Fields** - Added endpoint form fields for OAuth configuration in the admin dashboard:
+  - `oauth_enabled`
+  - `oauth_grant_type` (`refresh_token`, `client_credentials`)
+  - `oauth_token_url`, `oauth_client_id`, `oauth_client_secret`
+  - `oauth_scope`, `oauth_refresh_token`
+  - `oauth_token_request_format` (`json`, `form`)
+  - `oauth_client_auth_method` (`client_secret_post`, `client_secret_basic`)
+- **OAuth Runtime Auth Resolution** - Added endpoint auth precedence logic:
+  1. OAuth bearer token (if configured)
+  2. Static API key bearer token (fallback)
+  3. No auth header
+- **OAuth Token Lifecycle Handling** - Added token fetch/refresh support with in-memory access token cache and refresh-token rotation persistence to SQLite.
+- **Encryption-Ready OAuth Schema** - Added additive `endpoints` columns to support future at-rest secret encryption rollout without destructive migrations.
+- **OAuth Implementation Runbook** - Added `docs/oauth-encryption-secrets-storage.md` with migration, key-rotation, and recovery notes for future encryption enablement.
+
+### Changed
+
+- **Endpoint CRUD APIs** - Updated endpoint create/update routes to accept and persist OAuth fields on both admin API surfaces.
+- **Backend Routing Compatibility** - `openai_oauth` endpoints route through OpenAI-compatible upstream paths (`/v1/chat/completions`, `/v1/models`, `/v1/embeddings`).
+- **Endpoint Test/Model Fetch Auth** - Endpoint test and model discovery now use OAuth-first auth resolution when configured.
+
+### Fixed
+
+- **Endpoint Test Lookup** - Fixed endpoint lookup in `/endpoints/<id>/test` to avoid double `fetchone()` consumption.
+
+### Documentation
+
+- **README OAuth Docs** - Added detailed OAuth configuration and compatibility documentation.
+- **README Upgrade Section** - Added explicit "How to Update Safely" upgrade/rollback workflow, including required DB backup step and container stop/restart commands.
+
 ## [2.4.2] - 2026-04-13
 
 ### Fixed
