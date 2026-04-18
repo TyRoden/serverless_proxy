@@ -8,7 +8,7 @@ A universal OpenAI-compatible API proxy that bridges standard API requests to mu
 Client (OpenAI format) → Serverless Proxy (port 8002) → Configured Backends
 ```
 
-- **Universal**: Connect to any LLM backend (RunPod, Ollama, OpenAI, Together AI, etc.)
+- **Universal**: Connect to any LLM backend (RunPod, Ollama, OpenAI, OAuth-based OpenAI-compatible providers, Together AI, etc.)
 - **Virtual Models**: Map user-facing model names to actual backend models
 - **Admin UI**: Configure endpoints and virtual models via web interface
 - **Tool-Call Compatibility**: Normalize misformatted model tool calls with DB-driven regex patterns
@@ -67,8 +67,9 @@ docker compose exec serverless-proxy sh -c "ps aux | grep uvicorn" || echo "WARN
    - **Name**: Something like "My Ollama" or "RunPod Production"
    - **URL**: Your backend URL (e.g., `http://localhost:11434` for local Ollama, or your RunPod endpoint URL)
    - **API Key**: Your API key if required (leave blank for local Ollama)
-- **Type**: Select the type (`openwebui`, `openai`, `ollama`, `runpod`, `anthropic`, `deepinfra`, etc.)
-   - Click **Save**
+   - **Type**: Select the type (`openwebui`, `openai`, `openai_oauth`, `ollama`, `runpod`, `anthropic`, `deepinfra`, etc.)
+   - If you choose **OpenAI OAuth**, OAuth fields are shown and prefilled with OpenAI defaults
+    - Click **Save**
 
 #### Add a Virtual Model
 5. Click **+ Add Virtual Model** under Virtual Models
@@ -209,9 +210,66 @@ Configure backend endpoints with:
 - **Name**: Friendly identifier
 - **URL**: Base URL (e.g., `http://localhost:11434`, `https://api.runpod.ai/v2/xxxx`)
 - **API Key**: Authorization token (if required)
-- **Type**: `openwebui`, `openai`, `ollama`, `vllm`, `together`, `runpod`, `anthropic`, `deepinfra`, `queue`
+- **Type**: `openwebui`, `openai`, `openai_oauth`, `ollama`, `vllm`, `together`, `runpod`, `anthropic`, `deepinfra`, `queue`
 - **Priority**: Higher priority endpoints are preferred
 - **Enabled**: Enable/disable endpoint
+
+### OAuth Endpoint Configuration (`openai_oauth`)
+
+Use `openai_oauth` when your provider requires OAuth instead of a static API key.
+
+When selected in the dashboard, the form auto-fills OpenAI-compatible defaults:
+
+- `url`: `https://api.openai.com`
+- `oauth_enabled`: `true`
+- `oauth_grant_type`: `refresh_token`
+- `oauth_token_url`: `https://auth.openai.com/oauth/token`
+- `oauth_token_request_format`: `json`
+- `oauth_client_auth_method`: `client_secret_post`
+
+You can override all fields for non-OpenAI providers.
+
+#### Supported OAuth grant types
+
+- `refresh_token`
+- `client_credentials`
+
+#### Supported token request compatibility options
+
+- **Request format**: `json`, `form` (`application/x-www-form-urlencoded`)
+- **Client auth method**: `client_secret_post`, `client_secret_basic`
+
+#### Authentication precedence
+
+For an endpoint, the proxy resolves auth in this order:
+
+1. OAuth bearer token (if OAuth is enabled and fully configured)
+2. Static API key bearer token (fallback)
+3. No Authorization header
+
+#### Token lifecycle and persistence
+
+- Access tokens are cached in memory for runtime efficiency
+- Refresh token rotations returned by provider are persisted to SQLite immediately
+- `oauth_token_expires_at` metadata is persisted
+- Behavior survives container restarts because durable OAuth state is stored in the DB
+
+#### OpenAI-compatible routing behavior
+
+`openai_oauth` uses OpenAI-compatible upstream paths:
+
+- `POST /v1/chat/completions`
+- `GET /v1/models`
+- `POST /v1/embeddings`
+
+#### Security and encryption-ready schema
+
+OAuth and encryption-ready columns are provisioned in `endpoints` for future at-rest encryption rollout.
+Current behavior remains plaintext secret storage (same model as existing `api_key` handling).
+
+Detailed implementation and migration runbook:
+
+- `docs/oauth-encryption-secrets-storage.md`
 
 ### Virtual Models
 
@@ -379,12 +437,27 @@ OLLAMA_RUN_MUTATING=1 ./scripts/ollama_full_surface_conformance.sh
 | `/api/admin/tool-patterns` | GET, POST | List/create tool patterns |
 | `/api/admin/tool-patterns/<id>` | PUT, DELETE | Update/delete tool pattern |
 
+OAuth fields are accepted by endpoint create/update APIs (`/endpoints`, `/endpoints/<id>`, `/api/admin/endpoints`, `/api/admin/endpoints/<id>`).
+
+Common OAuth payload fields:
+
+- `oauth_enabled` (bool)
+- `oauth_grant_type` (`refresh_token` or `client_credentials`)
+- `oauth_token_url`
+- `oauth_client_id`
+- `oauth_client_secret`
+- `oauth_scope`
+- `oauth_refresh_token`
+- `oauth_token_request_format` (`json` or `form`)
+- `oauth_client_auth_method` (`client_secret_post` or `client_secret_basic`)
+
 ## Backend Types
 
 | Type | Description |
 |------|-------------|
 | `openwebui` | OpenWebUI API (`/api/chat/completions`, `/api/models`, `/api/v1/embeddings`) |
 | `openai` | OpenAI-compatible API (`/v1/chat/completions`, `/v1/models`, `/v1/embeddings`) |
+| `openai_oauth` | OpenAI-compatible API using OAuth token acquisition/refresh (`/v1/chat/completions`, `/v1/models`, `/v1/embeddings`) |
 | `ollama` | Ollama API (native `/api/*` + OpenAI-compatible `/v1/*` bridging) |
 | `vllm` | vLLM API |
 | `together` | Together AI |

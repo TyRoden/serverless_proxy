@@ -190,6 +190,10 @@
                         window.location.href = '/login?redirect=' + encodeURIComponent(window.location.pathname);
                     } else {
                         document.getElementById('username').textContent = d.username;
+                        const epType = document.getElementById('ep-type');
+                        const oauthEnabled = document.getElementById('ep-oauth-enabled');
+                        if (epType) epType.addEventListener('change', toggleOAuthFields);
+                        if (oauthEnabled) oauthEnabled.addEventListener('change', toggleOAuthFields);
                         loadEndpoints();
                         loadVirtualModels();
                         loadModelFilter();
@@ -369,6 +373,7 @@
                                 <label for="ep-type">Endpoint Type</label>
                                 <select id="ep-type" name="endpoint_type">
                                     <option value="openai">OpenAI Compatible</option>
+                                    <option value="openai_oauth">OpenAI OAuth</option>
                                     <option value="openwebui">OpenWebUI</option>
                                     <option value="ollama">Ollama</option>
                                     <option value="vllm">vLLM</option>
@@ -383,6 +388,61 @@
                                 <label for="ep-priority">Priority</label>
                                 <input type="number" id="ep-priority" name="priority" value="0" min="0">
                                 <small>Higher = preferred</small>
+                            </div>
+                        </div>
+                        <div id="oauth-fields" class="hidden" style="border:1px solid var(--border);border-radius:8px;padding:14px;margin-top:10px;">
+                            <div class="checkbox-row" style="margin-bottom:10px;">
+                                <input type="checkbox" id="ep-oauth-enabled" name="oauth_enabled">
+                                <label for="ep-oauth-enabled">Enable OAuth for this endpoint</label>
+                            </div>
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label for="ep-oauth-grant-type">OAuth Grant Type</label>
+                                    <select id="ep-oauth-grant-type" name="oauth_grant_type">
+                                        <option value="refresh_token">refresh_token</option>
+                                        <option value="client_credentials">client_credentials</option>
+                                    </select>
+                                </div>
+                                <div class="form-group">
+                                    <label for="ep-oauth-token-url">OAuth Token URL</label>
+                                    <input type="text" id="ep-oauth-token-url" name="oauth_token_url" placeholder="https://auth.openai.com/oauth/token">
+                                </div>
+                            </div>
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label for="ep-oauth-client-id">OAuth Client ID</label>
+                                    <input type="text" id="ep-oauth-client-id" name="oauth_client_id" placeholder="client id">
+                                </div>
+                                <div class="form-group">
+                                    <label for="ep-oauth-client-secret">OAuth Client Secret</label>
+                                    <input type="password" id="ep-oauth-client-secret" name="oauth_client_secret" placeholder="client secret">
+                                </div>
+                            </div>
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label for="ep-oauth-scope">OAuth Scope</label>
+                                    <input type="text" id="ep-oauth-scope" name="oauth_scope" placeholder="openid profile email offline_access">
+                                </div>
+                                <div class="form-group">
+                                    <label for="ep-oauth-refresh-token">OAuth Refresh Token</label>
+                                    <input type="password" id="ep-oauth-refresh-token" name="oauth_refresh_token" placeholder="refresh token">
+                                </div>
+                            </div>
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label for="ep-oauth-token-request-format">Token Request Format</label>
+                                    <select id="ep-oauth-token-request-format" name="oauth_token_request_format">
+                                        <option value="json">json</option>
+                                        <option value="form">form-urlencoded</option>
+                                    </select>
+                                </div>
+                                <div class="form-group">
+                                    <label for="ep-oauth-client-auth-method">Client Auth Method</label>
+                                    <select id="ep-oauth-client-auth-method" name="oauth_client_auth_method">
+                                        <option value="client_secret_post">client_secret_post</option>
+                                        <option value="client_secret_basic">client_secret_basic</option>
+                                    </select>
+                                </div>
                             </div>
                         </div>
                         <div class="checkbox-row">
@@ -892,6 +952,44 @@
     // Endpoint CRUD
     // ==========================================
     
+    const OPENAI_OAUTH_DEFAULTS = {
+        url: 'https://api.openai.com',
+        oauth_enabled: true,
+        oauth_grant_type: 'refresh_token',
+        oauth_token_url: 'https://auth.openai.com/oauth/token',
+        oauth_token_request_format: 'json',
+        oauth_client_auth_method: 'client_secret_post'
+    };
+
+    function applyOpenAIOAuthDefaultsIfNeeded() {
+        const type = document.getElementById('ep-type').value;
+        if (type !== 'openai_oauth') return;
+
+        const url = document.getElementById('ep-url');
+        const oauthEnabled = document.getElementById('ep-oauth-enabled');
+        const grantType = document.getElementById('ep-oauth-grant-type');
+        const tokenUrl = document.getElementById('ep-oauth-token-url');
+        const reqFormat = document.getElementById('ep-oauth-token-request-format');
+        const authMethod = document.getElementById('ep-oauth-client-auth-method');
+
+        if (!url.value) url.value = OPENAI_OAUTH_DEFAULTS.url;
+        oauthEnabled.checked = true;
+        if (!grantType.value) grantType.value = OPENAI_OAUTH_DEFAULTS.oauth_grant_type;
+        if (!tokenUrl.value) tokenUrl.value = OPENAI_OAUTH_DEFAULTS.oauth_token_url;
+        if (!reqFormat.value) reqFormat.value = OPENAI_OAUTH_DEFAULTS.oauth_token_request_format;
+        if (!authMethod.value) authMethod.value = OPENAI_OAUTH_DEFAULTS.oauth_client_auth_method;
+    }
+
+    function toggleOAuthFields() {
+        const type = document.getElementById('ep-type').value;
+        const oauthWrap = document.getElementById('oauth-fields');
+        const showOAuth = type === 'openai_oauth' || document.getElementById('ep-oauth-enabled').checked;
+        oauthWrap.classList.toggle('hidden', !showOAuth);
+        if (type === 'openai_oauth') {
+            applyOpenAIOAuthDefaultsIfNeeded();
+        }
+    }
+
     function openEndpointModal(data) {
         document.getElementById('endpoint-modal-title').textContent = data ? 'Edit Endpoint' : 'Add Endpoint';
         document.getElementById('ep-id').value = data ? data.id : '';
@@ -901,12 +999,23 @@
         document.getElementById('ep-type').value = data ? data.endpoint_type : 'openai';
         document.getElementById('ep-priority').value = data ? data.priority : 0;
         document.getElementById('ep-enabled').checked = data ? data.enabled : true;
+        document.getElementById('ep-oauth-enabled').checked = data ? !!data.oauth_enabled : false;
+        document.getElementById('ep-oauth-grant-type').value = data ? (data.oauth_grant_type || 'refresh_token') : 'refresh_token';
+        document.getElementById('ep-oauth-token-url').value = data ? (data.oauth_token_url || '') : '';
+        document.getElementById('ep-oauth-client-id').value = data ? (data.oauth_client_id || '') : '';
+        document.getElementById('ep-oauth-client-secret').value = data ? (data.oauth_client_secret || '') : '';
+        document.getElementById('ep-oauth-scope').value = data ? (data.oauth_scope || '') : '';
+        document.getElementById('ep-oauth-refresh-token').value = data ? (data.oauth_refresh_token || '') : '';
+        document.getElementById('ep-oauth-token-request-format').value = data ? (data.oauth_token_request_format || 'json') : 'json';
+        document.getElementById('ep-oauth-client-auth-method').value = data ? (data.oauth_client_auth_method || 'client_secret_post') : 'client_secret_post';
+        toggleOAuthFields();
         document.getElementById('endpoint-modal').classList.remove('hidden');
     }
     
     function closeEndpointModal() {
         document.getElementById('endpoint-modal').classList.add('hidden');
         document.getElementById('endpoint-form').reset();
+        document.getElementById('oauth-fields').classList.add('hidden');
     }
     
     function saveEndpoint(e) {
@@ -919,7 +1028,16 @@
             api_key: form.api_key.value,
             endpoint_type: form.endpoint_type.value,
             priority: parseInt(form.priority.value) || 0,
-            enabled: form.enabled.checked
+            enabled: form.enabled.checked,
+            oauth_enabled: form.oauth_enabled.checked,
+            oauth_grant_type: form.oauth_grant_type.value,
+            oauth_token_url: form.oauth_token_url.value,
+            oauth_client_id: form.oauth_client_id.value,
+            oauth_client_secret: form.oauth_client_secret.value,
+            oauth_scope: form.oauth_scope.value,
+            oauth_refresh_token: form.oauth_refresh_token.value,
+            oauth_token_request_format: form.oauth_token_request_format.value,
+            oauth_client_auth_method: form.oauth_client_auth_method.value
         };
         
         const method = id ? 'PUT' : 'POST';

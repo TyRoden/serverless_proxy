@@ -1239,6 +1239,34 @@ def init_database():
             except:
                 pass
 
+        # Migration: Add OAuth columns to endpoints table (encryption-ready schema)
+        oauth_columns = [
+            "oauth_enabled INTEGER DEFAULT 0",
+            "oauth_grant_type TEXT DEFAULT 'refresh_token'",
+            "oauth_token_url TEXT",
+            "oauth_client_id TEXT",
+            "oauth_client_secret TEXT",
+            "oauth_scope TEXT",
+            "oauth_refresh_token TEXT",
+            "oauth_token_expires_at INTEGER DEFAULT 0",
+            "oauth_token_request_format TEXT DEFAULT 'json'",
+            "oauth_client_auth_method TEXT DEFAULT 'client_secret_post'",
+            "oauth_secret_storage_mode TEXT DEFAULT 'plain'",
+            "oauth_secret_key_version TEXT DEFAULT ''",
+            "oauth_client_secret_ciphertext TEXT DEFAULT ''",
+            "oauth_client_secret_nonce TEXT DEFAULT ''",
+            "oauth_client_secret_tag TEXT DEFAULT ''",
+            "oauth_refresh_token_ciphertext TEXT DEFAULT ''",
+            "oauth_refresh_token_nonce TEXT DEFAULT ''",
+            "oauth_refresh_token_tag TEXT DEFAULT ''",
+            "oauth_secret_last_migrated_at INTEGER DEFAULT 0",
+        ]
+        for col_def in oauth_columns:
+            try:
+                cursor.execute(f"ALTER TABLE endpoints ADD COLUMN {col_def}")
+            except:
+                pass
+
         # Create indexes for performance
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_request_usage_virtual_model ON request_usage(virtual_model)"
@@ -2214,7 +2242,17 @@ def get_virtual_model(model_name: str) -> Optional[dict]:
             cursor.execute(
                 """
                 SELECT vm.*, e.url as endpoint_url, e.api_key as endpoint_api_key, 
-                       e.endpoint_type as endpoint_type
+                       e.endpoint_type as endpoint_type,
+                       e.oauth_enabled as oauth_enabled,
+                       e.oauth_grant_type as oauth_grant_type,
+                       e.oauth_token_url as oauth_token_url,
+                       e.oauth_client_id as oauth_client_id,
+                       e.oauth_client_secret as oauth_client_secret,
+                       e.oauth_scope as oauth_scope,
+                       e.oauth_refresh_token as oauth_refresh_token,
+                       e.oauth_token_expires_at as oauth_token_expires_at,
+                       e.oauth_token_request_format as oauth_token_request_format,
+                       e.oauth_client_auth_method as oauth_client_auth_method
                 FROM virtual_models vm
                 JOIN endpoints e ON vm.endpoint_id = e.id
                 WHERE vm.name = ? AND vm.enabled = 1 AND e.enabled = 1
@@ -2243,6 +2281,265 @@ def get_enabled_virtual_models() -> list[dict]:
             return [dict(row) for row in cursor.fetchall()]
     except Exception:
         return []
+
+
+def _coerce_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return False
+
+
+def _oauth_defaults_for_endpoint_type(endpoint_type: str) -> dict[str, Any]:
+    et = (endpoint_type or "").lower()
+    if et == "openai_oauth":
+        return {
+            "url": "https://api.openai.com",
+            "oauth_enabled": 1,
+            "oauth_grant_type": "refresh_token",
+            "oauth_token_url": "https://auth.openai.com/oauth/token",
+            "oauth_token_request_format": "json",
+            "oauth_client_auth_method": "client_secret_post",
+        }
+    return {}
+
+
+def _apply_endpoint_defaults(data: dict[str, Any]) -> dict[str, Any]:
+    out = dict(data or {})
+    endpoint_type = (out.get("endpoint_type") or "openai").lower()
+    defaults = _oauth_defaults_for_endpoint_type(endpoint_type)
+    for key, value in defaults.items():
+        current = out.get(key)
+        if current is None or current == "":
+            out[key] = value
+    return out
+
+
+_oauth_token_cache: dict[int, tuple[str, int]] = {}
+_oauth_refresh_locks: dict[int, asyncio.Lock] = {}
+
+
+def _oauth_endpoint_is_configured(endpoint: dict[str, Any]) -> bool:
+    if not _coerce_bool(endpoint.get("oauth_enabled", 0)):
+        return False
+    grant_type = (endpoint.get("oauth_grant_type") or "").strip()
+    token_url = (endpoint.get("oauth_token_url") or "").strip()
+    if not grant_type or not token_url:
+        return False
+    if grant_type == "refresh_token":
+        return bool((endpoint.get("oauth_refresh_token") or "").strip())
+    if grant_type == "client_credentials":
+        return bool((endpoint.get("oauth_client_secret") or "").strip())
+    return False
+
+
+def _oauth_build_token_request(endpoint: dict[str, Any]) -> tuple[dict[str, str], dict[str, Any], Optional[tuple[str, str]], bool]:
+    grant_type = (endpoint.get("oauth_grant_type") or "refresh_token").strip()
+    client_id = (endpoint.get("oauth_client_id") or "").strip()
+    client_secret = (endpoint.get("oauth_client_secret") or "").strip()
+    refresh_token = (endpoint.get("oauth_refresh_token") or "").strip()
+    scope = (endpoint.get("oauth_scope") or "").strip()
+    request_format = (endpoint.get("oauth_token_request_format") or "json").strip().lower()
+    client_auth_method = (
+        (endpoint.get("oauth_client_auth_method") or "client_secret_post").strip().lower()
+    )
+
+    payload: dict[str, Any] = {"grant_type": grant_type}
+    auth: Optional[tuple[str, str]] = None
+
+    if grant_type == "refresh_token":
+        payload["refresh_token"] = refresh_token
+        if client_id:
+            payload["client_id"] = client_id
+    elif grant_type == "client_credentials":
+        if client_id:
+            payload["client_id"] = client_id
+    if scope:
+        payload["scope"] = scope
+
+    if client_auth_method == "client_secret_basic" and client_id and client_secret:
+        auth = (client_id, client_secret)
+        payload.pop("client_id", None)
+    elif client_secret:
+        payload["client_secret"] = client_secret
+
+    use_form = request_format == "form"
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded"
+        if use_form
+        else "application/json"
+    }
+    return headers, payload, auth, use_form
+
+
+def _persist_oauth_rotation(endpoint_id: int, refresh_token: str, expires_at: int) -> None:
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            if refresh_token:
+                cursor.execute(
+                    """
+                    UPDATE endpoints
+                    SET oauth_refresh_token = ?, oauth_token_expires_at = ?, updated_at = strftime('%s', 'now')
+                    WHERE id = ?
+                    """,
+                    (refresh_token, expires_at, endpoint_id),
+                )
+            else:
+                cursor.execute(
+                    """
+                    UPDATE endpoints
+                    SET oauth_token_expires_at = ?, updated_at = strftime('%s', 'now')
+                    WHERE id = ?
+                    """,
+                    (expires_at, endpoint_id),
+                )
+            conn.commit()
+    except Exception as exc:
+        debug_log("warn", f"[OAUTH] failed to persist token metadata endpoint_id={endpoint_id}: {exc}")
+
+
+async def resolve_oauth_access_token_async(endpoint: dict[str, Any]) -> Optional[str]:
+    if not _oauth_endpoint_is_configured(endpoint):
+        return None
+    endpoint_id = int(endpoint.get("id") or 0)
+    if endpoint_id <= 0:
+        return None
+
+    now = int(time.time())
+    cached = _oauth_token_cache.get(endpoint_id)
+    if cached and cached[1] > now + 60:
+        return cached[0]
+
+    lock = _oauth_refresh_locks.setdefault(endpoint_id, asyncio.Lock())
+    async with lock:
+        cached = _oauth_token_cache.get(endpoint_id)
+        now = int(time.time())
+        if cached and cached[1] > now + 60:
+            return cached[0]
+
+        token_url = (endpoint.get("oauth_token_url") or "").strip()
+        headers, payload, auth, use_form = _oauth_build_token_request(endpoint)
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                req_kwargs: dict[str, Any] = {"headers": headers}
+                if auth:
+                    req_kwargs["auth"] = auth
+                if use_form:
+                    req_kwargs["data"] = payload
+                else:
+                    req_kwargs["json"] = payload
+                resp = await client.post(token_url, **req_kwargs)
+        except Exception as exc:
+            debug_log("warn", f"[OAUTH] token fetch failed endpoint_id={endpoint_id}: {exc}")
+            return None
+
+        if resp.status_code >= 400:
+            debug_log("warn", f"[OAUTH] token fetch rejected endpoint_id={endpoint_id} status={resp.status_code}")
+            return None
+
+        try:
+            token_data = resp.json()
+        except Exception:
+            debug_log("warn", f"[OAUTH] token response invalid JSON endpoint_id={endpoint_id}")
+            return None
+
+        access_token = str(token_data.get("access_token") or "").strip()
+        if not access_token:
+            return None
+
+        try:
+            expires_in = int(token_data.get("expires_in") or 3600)
+        except Exception:
+            expires_in = 3600
+        expires_at = int(time.time()) + max(expires_in, 60)
+
+        rotated_refresh_token = str(token_data.get("refresh_token") or "").strip()
+        if rotated_refresh_token:
+            endpoint["oauth_refresh_token"] = rotated_refresh_token
+
+        _persist_oauth_rotation(endpoint_id, rotated_refresh_token, expires_at)
+        _oauth_token_cache[endpoint_id] = (access_token, expires_at)
+        return access_token
+
+
+def resolve_oauth_access_token_sync(endpoint: dict[str, Any]) -> Optional[str]:
+    if not _oauth_endpoint_is_configured(endpoint):
+        return None
+    endpoint_id = int(endpoint.get("id") or 0)
+    if endpoint_id <= 0:
+        return None
+
+    now = int(time.time())
+    cached = _oauth_token_cache.get(endpoint_id)
+    if cached and cached[1] > now + 60:
+        return cached[0]
+
+    token_url = (endpoint.get("oauth_token_url") or "").strip()
+    headers, payload, auth, use_form = _oauth_build_token_request(endpoint)
+    try:
+        req_kwargs: dict[str, Any] = {"headers": headers, "timeout": 15}
+        if auth:
+            req_kwargs["auth"] = auth
+        if use_form:
+            req_kwargs["data"] = payload
+        else:
+            req_kwargs["json"] = payload
+        resp = httpx.post(token_url, **req_kwargs)
+    except Exception as exc:
+        debug_log("warn", f"[OAUTH] token fetch failed endpoint_id={endpoint_id}: {exc}")
+        return None
+
+    if resp.status_code >= 400:
+        debug_log("warn", f"[OAUTH] token fetch rejected endpoint_id={endpoint_id} status={resp.status_code}")
+        return None
+
+    try:
+        token_data = resp.json()
+    except Exception:
+        debug_log("warn", f"[OAUTH] token response invalid JSON endpoint_id={endpoint_id}")
+        return None
+
+    access_token = str(token_data.get("access_token") or "").strip()
+    if not access_token:
+        return None
+
+    try:
+        expires_in = int(token_data.get("expires_in") or 3600)
+    except Exception:
+        expires_in = 3600
+    expires_at = int(time.time()) + max(expires_in, 60)
+
+    rotated_refresh_token = str(token_data.get("refresh_token") or "").strip()
+    if rotated_refresh_token:
+        endpoint["oauth_refresh_token"] = rotated_refresh_token
+
+    _persist_oauth_rotation(endpoint_id, rotated_refresh_token, expires_at)
+    _oauth_token_cache[endpoint_id] = (access_token, expires_at)
+    return access_token
+
+
+async def resolve_endpoint_auth_header_async(endpoint: dict[str, Any]) -> Optional[str]:
+    oauth_token = await resolve_oauth_access_token_async(endpoint)
+    if oauth_token:
+        return f"Bearer {oauth_token}"
+    api_key = (endpoint.get("api_key") or endpoint.get("endpoint_api_key") or "").strip()
+    if api_key:
+        return f"Bearer {api_key}"
+    return None
+
+
+def resolve_endpoint_auth_header_sync(endpoint: dict[str, Any]) -> Optional[str]:
+    oauth_token = resolve_oauth_access_token_sync(endpoint)
+    if oauth_token:
+        return f"Bearer {oauth_token}"
+    api_key = (endpoint.get("api_key") or endpoint.get("endpoint_api_key") or "").strip()
+    if api_key:
+        return f"Bearer {api_key}"
+    return None
 
 
 def get_default_ollama_endpoint() -> Optional[dict]:
@@ -2340,6 +2637,7 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
 
     class VirtualModelBackend(LLMBackend):
         def __init__(self):
+            self.endpoint_id = vm.get("endpoint_id")
             self.url = vm["endpoint_url"]
             self.api_key = vm.get("endpoint_api_key", "")
             self.model = vm["actual_model"]
@@ -2348,6 +2646,18 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
             self.virtual_model_name = vm.get("name")
             self.custom_headers = vm.get("custom_headers", "")
             self.show_reasoning = vm.get("show_reasoning", 1) == 1
+            self.oauth_enabled = vm.get("oauth_enabled", 0)
+            self.oauth_grant_type = vm.get("oauth_grant_type", "refresh_token")
+            self.oauth_token_url = vm.get("oauth_token_url", "")
+            self.oauth_client_id = vm.get("oauth_client_id", "")
+            self.oauth_client_secret = vm.get("oauth_client_secret", "")
+            self.oauth_scope = vm.get("oauth_scope", "")
+            self.oauth_refresh_token = vm.get("oauth_refresh_token", "")
+            self.oauth_token_expires_at = vm.get("oauth_token_expires_at", 0)
+            self.oauth_token_request_format = vm.get("oauth_token_request_format", "json")
+            self.oauth_client_auth_method = vm.get(
+                "oauth_client_auth_method", "client_secret_post"
+            )
 
         async def chat_completion(
             self,
@@ -2369,8 +2679,24 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
                 stream = False
 
             headers = {"Content-Type": "application/json"}
-            if self.api_key:
-                headers["Authorization"] = f"Bearer {self.api_key}"
+            auth_header = await resolve_endpoint_auth_header_async(
+                {
+                    "id": self.endpoint_id,
+                    "api_key": self.api_key,
+                    "oauth_enabled": self.oauth_enabled,
+                    "oauth_grant_type": self.oauth_grant_type,
+                    "oauth_token_url": self.oauth_token_url,
+                    "oauth_client_id": self.oauth_client_id,
+                    "oauth_client_secret": self.oauth_client_secret,
+                    "oauth_scope": self.oauth_scope,
+                    "oauth_refresh_token": self.oauth_refresh_token,
+                    "oauth_token_expires_at": self.oauth_token_expires_at,
+                    "oauth_token_request_format": self.oauth_token_request_format,
+                    "oauth_client_auth_method": self.oauth_client_auth_method,
+                }
+            )
+            if auth_header:
+                headers["Authorization"] = auth_header
 
             # Add X-Source header for tracking - use incoming from kwargs if available
             incoming_src = kwargs.get("_incoming_source", "serverless-proxy")
@@ -2533,7 +2859,7 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
                 )
                 endpoint = f"https://api.runpod.ai/v2/{endpoint_id}/runsync"
                 payload = {"input": payload}
-            elif self.endpoint_type == "openai":
+            elif self.endpoint_type in ("openai", "openai_oauth"):
                 endpoint = f"{self.url}/v1/chat/completions"
             elif self.endpoint_type == "openwebui":
                 endpoint = f"{self.url}/api/chat/completions"
@@ -4788,8 +5114,28 @@ async def anthropic_messages(request: Request):
     if stream:
         # Handle streaming - similar to chat_completions but return SSE
         headers = {"Content-Type": "application/json"}
-        if hasattr(backend, "api_key") and backend.api_key:
-            headers["Authorization"] = f"Bearer {backend.api_key}"
+        auth_header = await resolve_endpoint_auth_header_async(
+            {
+                "id": getattr(backend, "endpoint_id", None),
+                "api_key": getattr(backend, "api_key", ""),
+                "oauth_enabled": getattr(backend, "oauth_enabled", 0),
+                "oauth_grant_type": getattr(backend, "oauth_grant_type", ""),
+                "oauth_token_url": getattr(backend, "oauth_token_url", ""),
+                "oauth_client_id": getattr(backend, "oauth_client_id", ""),
+                "oauth_client_secret": getattr(backend, "oauth_client_secret", ""),
+                "oauth_scope": getattr(backend, "oauth_scope", ""),
+                "oauth_refresh_token": getattr(backend, "oauth_refresh_token", ""),
+                "oauth_token_expires_at": getattr(backend, "oauth_token_expires_at", 0),
+                "oauth_token_request_format": getattr(
+                    backend, "oauth_token_request_format", "json"
+                ),
+                "oauth_client_auth_method": getattr(
+                    backend, "oauth_client_auth_method", "client_secret_post"
+                ),
+            }
+        )
+        if auth_header:
+            headers["Authorization"] = auth_header
 
         # Add tracking headers - use incoming source
         headers["X-Source"] = incoming_source
@@ -5562,14 +5908,21 @@ def admin_endpoints():
         data = flask_request.get_json()
         if not data:
             return flask_jsonify({"error": "No data provided"}), 400
+        data = _apply_endpoint_defaults(data)
 
         try:
             with get_db() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
                     """
-                    INSERT INTO endpoints (name, url, api_key, endpoint_type, priority, enabled)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO endpoints (
+                        name, url, api_key, endpoint_type, priority, enabled,
+                        oauth_enabled, oauth_grant_type, oauth_token_url,
+                        oauth_client_id, oauth_client_secret, oauth_scope,
+                        oauth_refresh_token, oauth_token_expires_at,
+                        oauth_token_request_format, oauth_client_auth_method
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                     (
                         data.get("name"),
@@ -5578,6 +5931,16 @@ def admin_endpoints():
                         data.get("endpoint_type", "openai"),
                         int(data.get("priority", 0)),
                         1 if data.get("enabled", True) else 0,
+                        1 if _coerce_bool(data.get("oauth_enabled", 0)) else 0,
+                        data.get("oauth_grant_type", "refresh_token"),
+                        data.get("oauth_token_url", ""),
+                        data.get("oauth_client_id", ""),
+                        data.get("oauth_client_secret", ""),
+                        data.get("oauth_scope", ""),
+                        data.get("oauth_refresh_token", ""),
+                        int(data.get("oauth_token_expires_at", 0) or 0),
+                        data.get("oauth_token_request_format", "json"),
+                        data.get("oauth_client_auth_method", "client_secret_post"),
                     ),
                 )
                 conn.commit()
@@ -5598,13 +5961,17 @@ def update_endpoint(endpoint_id):
     if not auth.get("valid"):
         return flask_jsonify({"error": "Unauthorized"}), 401
 
-    data = flask_request.get_json()
+    data = _apply_endpoint_defaults(flask_request.get_json() or {})
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute(
             """
             UPDATE endpoints 
             SET name = ?, url = ?, api_key = ?, endpoint_type = ?, priority = ?, enabled = ?,
+                oauth_enabled = ?, oauth_grant_type = ?, oauth_token_url = ?,
+                oauth_client_id = ?, oauth_client_secret = ?, oauth_scope = ?,
+                oauth_refresh_token = ?, oauth_token_expires_at = ?,
+                oauth_token_request_format = ?, oauth_client_auth_method = ?,
                 updated_at = strftime('%s', 'now')
             WHERE id = ?
         """,
@@ -5615,6 +5982,16 @@ def update_endpoint(endpoint_id):
                 data.get("endpoint_type", "openai"),
                 int(data.get("priority", 0)),
                 1 if data.get("enabled", True) else 0,
+                1 if _coerce_bool(data.get("oauth_enabled", 0)) else 0,
+                data.get("oauth_grant_type", "refresh_token"),
+                data.get("oauth_token_url", ""),
+                data.get("oauth_client_id", ""),
+                data.get("oauth_client_secret", ""),
+                data.get("oauth_scope", ""),
+                data.get("oauth_refresh_token", ""),
+                int(data.get("oauth_token_expires_at", 0) or 0),
+                data.get("oauth_token_request_format", "json"),
+                data.get("oauth_client_auth_method", "client_secret_post"),
                 endpoint_id,
             ),
         )
@@ -5651,15 +6028,17 @@ def test_endpoint(endpoint_id):
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM endpoints WHERE id = ?", (endpoint_id,))
-        endpoint = dict(cursor.fetchone()) if cursor.fetchone() else None
+        row = cursor.fetchone()
+        endpoint = dict(row) if row else None
 
     if not endpoint:
         return flask_jsonify({"error": "Endpoint not found"}), 404
 
     try:
         headers = {}
-        if endpoint.get("api_key"):
-            headers["Authorization"] = f"Bearer {endpoint['api_key']}"
+        auth_header = resolve_endpoint_auth_header_sync(endpoint)
+        if auth_header:
+            headers["Authorization"] = auth_header
 
         resp = httpx.get(f"{endpoint['url']}/health", headers=headers, timeout=10)
         return flask_jsonify({"status": "ok", "endpoint_status": resp.status_code})
@@ -5685,8 +6064,9 @@ def fetch_endpoint_models(endpoint_id):
 
     try:
         headers = {}
-        if endpoint.get("api_key"):
-            headers["Authorization"] = f"Bearer {endpoint['api_key']}"
+        auth_header = resolve_endpoint_auth_header_sync(endpoint)
+        if auth_header:
+            headers["Authorization"] = auth_header
 
         endpoint_type = (endpoint.get("endpoint_type") or "").lower()
         if endpoint_type == "openwebui":
@@ -5891,14 +6271,21 @@ def api_admin_endpoints_create():
     data = flask_request.json
     if not data:
         return flask_jsonify({"error": "No data provided"}), 400
+    data = _apply_endpoint_defaults(data)
 
     try:
         with get_db() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
-                INSERT INTO endpoints (name, url, api_key, endpoint_type, priority, enabled)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO endpoints (
+                    name, url, api_key, endpoint_type, priority, enabled,
+                    oauth_enabled, oauth_grant_type, oauth_token_url,
+                    oauth_client_id, oauth_client_secret, oauth_scope,
+                    oauth_refresh_token, oauth_token_expires_at,
+                    oauth_token_request_format, oauth_client_auth_method
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
                 (
                     data.get("name"),
@@ -5907,6 +6294,16 @@ def api_admin_endpoints_create():
                     data.get("endpoint_type", "openai"),
                     int(data.get("priority", 0)),
                     1 if data.get("enabled", True) else 0,
+                    1 if _coerce_bool(data.get("oauth_enabled", 0)) else 0,
+                    data.get("oauth_grant_type", "refresh_token"),
+                    data.get("oauth_token_url", ""),
+                    data.get("oauth_client_id", ""),
+                    data.get("oauth_client_secret", ""),
+                    data.get("oauth_scope", ""),
+                    data.get("oauth_refresh_token", ""),
+                    int(data.get("oauth_token_expires_at", 0) or 0),
+                    data.get("oauth_token_request_format", "json"),
+                    data.get("oauth_client_auth_method", "client_secret_post"),
                 ),
             )
             conn.commit()
@@ -5927,6 +6324,7 @@ def api_admin_endpoints_update(endpoint_id):
     data = flask_request.json
     if not data:
         return flask_jsonify({"error": "No data provided"}), 400
+    data = _apply_endpoint_defaults(data)
 
     try:
         with get_db() as conn:
@@ -5935,6 +6333,10 @@ def api_admin_endpoints_update(endpoint_id):
                 """
                 UPDATE endpoints 
                 SET name = ?, url = ?, api_key = ?, endpoint_type = ?, priority = ?, enabled = ?,
+                    oauth_enabled = ?, oauth_grant_type = ?, oauth_token_url = ?,
+                    oauth_client_id = ?, oauth_client_secret = ?, oauth_scope = ?,
+                    oauth_refresh_token = ?, oauth_token_expires_at = ?,
+                    oauth_token_request_format = ?, oauth_client_auth_method = ?,
                     updated_at = strftime('%s', 'now')
                 WHERE id = ?
             """,
@@ -5945,6 +6347,16 @@ def api_admin_endpoints_update(endpoint_id):
                     data.get("endpoint_type", "openai"),
                     int(data.get("priority", 0)),
                     1 if data.get("enabled", True) else 0,
+                    1 if _coerce_bool(data.get("oauth_enabled", 0)) else 0,
+                    data.get("oauth_grant_type", "refresh_token"),
+                    data.get("oauth_token_url", ""),
+                    data.get("oauth_client_id", ""),
+                    data.get("oauth_client_secret", ""),
+                    data.get("oauth_scope", ""),
+                    data.get("oauth_refresh_token", ""),
+                    int(data.get("oauth_token_expires_at", 0) or 0),
+                    data.get("oauth_token_request_format", "json"),
+                    data.get("oauth_client_auth_method", "client_secret_post"),
                     endpoint_id,
                 ),
             )
