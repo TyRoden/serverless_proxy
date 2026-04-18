@@ -86,7 +86,7 @@ If Serverless Proxy runs in Docker, the app can only read files visible inside t
 - `401/invalid_client`: incorrect client ID/secret or wrong auth method
 - `404` on token URL: wrong token endpoint (verify `https://auth.openai.com/oauth/token`)
 - Works with API key but not OAuth: verify `oauth_enabled` and required OAuth fields are populated
-- Endpoint **Models** button returns `404`: some OpenAI/Codex OAuth tokens do not expose OpenAI-compatible `/models` routes. You can still save the endpoint and map known model IDs manually.
+- Endpoint **Models** button returns `404`: some OpenAI/Codex OAuth tokens do not expose OpenAI-compatible `/models` routes. You can still save the endpoint and map known model IDs manually (for this setup, `gpt-5.4` is known to work).
 - Chat/completions request returns `Upstream returned HTTP 404`: verify `openai_oauth` endpoint URL is `https://chatgpt.com` (not `https://api.openai.com`).
 - OpenAI auth page shows `AuthApiFailure` / `unknown_error` immediately after clicking Start Web OAuth:
   - This is usually authorize-request compatibility (not URL-encoding on your side)

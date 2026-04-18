@@ -341,6 +341,7 @@ For an endpoint, the proxy resolves auth in this order:
 - Converts responses back to OpenAI-style chat completion output for clients
 
 Model listing is best-effort for OAuth backends; some tokens/scopes may not expose `/models` routes.
+If model discovery fails, set the model manually in your virtual model mapping (for this setup, `gpt-5.4` is confirmed to work).
 
 #### Security and encryption-ready schema
 
