@@ -2661,6 +2661,9 @@ OPENAI_WEB_OAUTH_AUTHORIZE_URL = os.getenv(
 OPENAI_WEB_OAUTH_TOKEN_URL = os.getenv(
     "OPENAI_WEB_OAUTH_TOKEN_URL", "https://auth.openai.com/oauth/token"
 )
+OPENAI_WEB_OAUTH_DEFAULT_REDIRECT_URI = os.getenv(
+    "OPENAI_WEB_OAUTH_DEFAULT_REDIRECT_URI", "http://127.0.0.1:1455/auth/callback"
+)
 
 # state -> pending session
 _oauth_web_sessions: dict[str, dict[str, Any]] = {}
@@ -2712,6 +2715,66 @@ def _resolve_oauth_callback_base() -> str:
     if scheme not in ("http", "https"):
         scheme = flask_request.scheme or "http"
     return f"{scheme}://{host}"
+
+
+def _extract_code_and_state_from_redirect_input(raw: str) -> tuple[str, str, str]:
+    text = (raw or "").strip()
+    if not text:
+        return "", "", "Missing input"
+    if "?" in text or "code=" in text:
+        try:
+            parsed = urllib.parse.urlparse(text)
+            query = urllib.parse.parse_qs(parsed.query)
+            code = (query.get("code", [""])[0] or "").strip()
+            state = (query.get("state", [""])[0] or "").strip()
+            if not code and text.startswith("code="):
+                query2 = urllib.parse.parse_qs(text)
+                code = (query2.get("code", [""])[0] or "").strip()
+                state = (query2.get("state", [""])[0] or "").strip()
+            if not code:
+                return "", "", "Could not extract code from redirect input"
+            return code, state, ""
+        except Exception:
+            return "", "", "Invalid redirect URL"
+    return text, "", ""
+
+
+def _exchange_openai_oauth_code(
+    token_url: str,
+    code: str,
+    client_id: str,
+    redirect_uri: str,
+    code_verifier: str,
+    client_secret: str = "",
+) -> tuple[Optional[dict[str, Any]], Optional[str], Optional[str]]:
+    payload = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "code_verifier": code_verifier,
+    }
+    if client_secret:
+        payload["client_secret"] = client_secret
+
+    try:
+        resp = httpx.post(
+            token_url,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data=payload,
+            timeout=20,
+        )
+    except Exception as exc:
+        return None, f"Token exchange request failed: {exc}", None
+
+    if resp.status_code >= 400:
+        return None, f"Token exchange failed ({resp.status_code})", resp.text[:300]
+
+    try:
+        token_data = resp.json()
+    except Exception:
+        return None, "Token exchange succeeded but returned invalid JSON", resp.text[:300]
+    return token_data, None, None
 
 
 def get_default_ollama_endpoint() -> Optional[dict]:
@@ -6650,8 +6713,15 @@ def api_admin_openai_oauth_start_web_auth():
     )
     client_secret = (body.get("oauth_client_secret") or "").strip()
 
-    callback_base = _resolve_oauth_callback_base()
-    redirect_uri = f"{callback_base}/api/admin/oauth/openai/callback"
+    callback_mode = (body.get("callback_mode") or "local_paste").strip().lower()
+    if callback_mode == "proxy_callback":
+        callback_base = _resolve_oauth_callback_base()
+        redirect_uri = f"{callback_base}/api/admin/oauth/openai/callback"
+    else:
+        redirect_uri = (
+            (body.get("redirect_uri") or "").strip()
+            or OPENAI_WEB_OAUTH_DEFAULT_REDIRECT_URI
+        )
 
     state = secrets.token_urlsafe(24)
     verifier = secrets.token_urlsafe(64)
@@ -6676,6 +6746,9 @@ def api_admin_openai_oauth_start_web_auth():
         "state": state,
         "code_challenge": challenge,
         "code_challenge_method": "S256",
+        "id_token_add_organizations": "true",
+        "codex_cli_simplified_flow": "true",
+        "originator": "serverless-proxy",
     }
     auth_url = f"{authorize_url}?{urllib.parse.urlencode(query)}"
     return flask_jsonify(
@@ -6684,6 +6757,8 @@ def api_admin_openai_oauth_start_web_auth():
             "state": state,
             "authorization_url": auth_url,
             "redirect_uri": redirect_uri,
+            "callback_mode": callback_mode,
+            "instructions": "Complete login in browser, then paste full redirect URL (or code) into the form and click Complete Web OAuth.",
         }
     )
 
@@ -6718,73 +6793,56 @@ def api_admin_openai_oauth_callback():
             "error": "Missing authorization code",
         }
     else:
-        token_payload = {
-            "grant_type": "authorization_code",
-            "code": code,
-            "client_id": session.get("client_id", ""),
-            "redirect_uri": session.get("redirect_uri", ""),
-            "code_verifier": session.get("verifier", ""),
-        }
-        if session.get("client_secret"):
-            token_payload["client_secret"] = session.get("client_secret")
-
         token_url = session.get("token_url") or OPENAI_WEB_OAUTH_TOKEN_URL
-        try:
-            resp = httpx.post(
-                token_url,
-                headers={"Content-Type": "application/json"},
-                json=token_payload,
-                timeout=20,
-            )
-            if resp.status_code >= 400:
-                body_preview = resp.text[:300]
-                _oauth_web_results[state] = {
-                    "created_at": int(time.time()),
-                    "status": "error",
-                    "error": f"Token exchange failed ({resp.status_code})",
-                    "details": body_preview,
-                }
-            else:
-                token_data = resp.json()
-                refresh_token = str(token_data.get("refresh_token") or "").strip()
-                access_token = str(token_data.get("access_token") or "").strip()
-                expires_in = token_data.get("expires_in")
-                try:
-                    expires_in_int = int(expires_in or 0)
-                except Exception:
-                    expires_in_int = 0
-                scope = str(token_data.get("scope") or session.get("scope") or "").strip()
-                if not refresh_token and not access_token:
-                    _oauth_web_results[state] = {
-                        "created_at": int(time.time()),
-                        "status": "error",
-                        "error": "Token exchange succeeded but no token fields were returned",
-                    }
-                else:
-                    _oauth_web_results[state] = {
-                        "created_at": int(time.time()),
-                        "status": "ok",
-                        "fields": {
-                            "endpoint_type": "openai_oauth",
-                            "url": "https://api.openai.com",
-                            "oauth_enabled": True,
-                            "oauth_grant_type": "refresh_token",
-                            "oauth_token_url": token_url,
-                            "oauth_client_id": session.get("client_id", ""),
-                            "oauth_client_secret": session.get("client_secret", ""),
-                            "oauth_refresh_token": refresh_token,
-                            "oauth_scope": scope,
-                            "oauth_token_request_format": "json",
-                            "oauth_client_auth_method": "client_secret_post",
-                            "oauth_token_expires_at": int(time.time()) + expires_in_int,
-                        },
-                    }
-        except Exception as exc:
+        token_data, err_msg, err_details = _exchange_openai_oauth_code(
+            token_url=token_url,
+            code=code,
+            client_id=session.get("client_id", ""),
+            redirect_uri=session.get("redirect_uri", ""),
+            code_verifier=session.get("verifier", ""),
+            client_secret=session.get("client_secret", ""),
+        )
+        if err_msg:
             _oauth_web_results[state] = {
                 "created_at": int(time.time()),
                 "status": "error",
-                "error": f"Token exchange request failed: {exc}",
+                "error": err_msg,
+                "details": err_details,
             }
+        else:
+            refresh_token = str((token_data or {}).get("refresh_token") or "").strip()
+            access_token = str((token_data or {}).get("access_token") or "").strip()
+            expires_in = (token_data or {}).get("expires_in")
+            try:
+                expires_in_int = int(expires_in or 0)
+            except Exception:
+                expires_in_int = 0
+            scope = str((token_data or {}).get("scope") or session.get("scope") or "").strip()
+            if not refresh_token and not access_token:
+                _oauth_web_results[state] = {
+                    "created_at": int(time.time()),
+                    "status": "error",
+                    "error": "Token exchange succeeded but no token fields were returned",
+                }
+            else:
+                _oauth_web_results[state] = {
+                    "created_at": int(time.time()),
+                    "status": "ok",
+                    "fields": {
+                        "endpoint_type": "openai_oauth",
+                        "url": "https://api.openai.com",
+                        "oauth_enabled": True,
+                        "oauth_grant_type": "refresh_token",
+                        "oauth_token_url": token_url,
+                        "oauth_client_id": session.get("client_id", ""),
+                        "oauth_client_secret": session.get("client_secret", ""),
+                        "oauth_refresh_token": refresh_token,
+                        "oauth_scope": scope,
+                        "oauth_token_request_format": "json",
+                        "oauth_client_auth_method": "client_secret_post",
+                        "oauth_token_expires_at": int(time.time()) + expires_in_int,
+                    },
+                }
 
     message_payload = {"type": "openai-oauth-web-complete", "state": state}
     html = f"""
@@ -6827,6 +6885,75 @@ def api_admin_openai_oauth_auth_result():
     if not result:
         return flask_jsonify({"status": "pending"})
     return flask_jsonify(result)
+
+
+@flask_app.route("/api/admin/oauth/openai/complete-web-auth", methods=["POST"])
+def api_admin_openai_oauth_complete_web_auth():
+    """Complete OAuth by pasting redirect URL or auth code from browser."""
+    auth = validate_session()
+    if not auth.get("valid"):
+        return flask_jsonify({"error": "Unauthorized"}), 401
+
+    _cleanup_oauth_web_cache()
+    body = flask_request.json or {}
+    if not isinstance(body, dict):
+        body = {}
+
+    state = (body.get("state") or "").strip()
+    input_text = (body.get("redirect_url_or_code") or "").strip()
+    if not state:
+        return flask_jsonify({"error": "Missing state"}), 400
+    if not input_text:
+        return flask_jsonify({"error": "Paste redirect URL or code first"}), 400
+
+    session = _oauth_web_sessions.pop(state, None)
+    if not session:
+        return flask_jsonify({"error": "OAuth session expired or invalid state"}), 400
+
+    code, parsed_state, parse_err = _extract_code_and_state_from_redirect_input(input_text)
+    if parse_err:
+        return flask_jsonify({"error": parse_err}), 400
+    if parsed_state and parsed_state != state:
+        return flask_jsonify({"error": "State mismatch in pasted redirect URL"}), 400
+
+    token_url = session.get("token_url") or OPENAI_WEB_OAUTH_TOKEN_URL
+    token_data, err_msg, err_details = _exchange_openai_oauth_code(
+        token_url=token_url,
+        code=code,
+        client_id=session.get("client_id", ""),
+        redirect_uri=session.get("redirect_uri", ""),
+        code_verifier=session.get("verifier", ""),
+        client_secret=session.get("client_secret", ""),
+    )
+    if err_msg:
+        return flask_jsonify({"error": err_msg, "details": err_details}), 400
+
+    refresh_token = str((token_data or {}).get("refresh_token") or "").strip()
+    access_token = str((token_data or {}).get("access_token") or "").strip()
+    if not refresh_token and not access_token:
+        return flask_jsonify({"error": "Token exchange returned no usable token fields"}), 400
+
+    expires_in = (token_data or {}).get("expires_in")
+    try:
+        expires_in_int = int(expires_in or 0)
+    except Exception:
+        expires_in_int = 0
+
+    fields = {
+        "endpoint_type": "openai_oauth",
+        "url": "https://api.openai.com",
+        "oauth_enabled": True,
+        "oauth_grant_type": "refresh_token",
+        "oauth_token_url": token_url,
+        "oauth_client_id": session.get("client_id", ""),
+        "oauth_client_secret": session.get("client_secret", ""),
+        "oauth_refresh_token": refresh_token,
+        "oauth_scope": str((token_data or {}).get("scope") or session.get("scope") or "").strip(),
+        "oauth_token_request_format": "json",
+        "oauth_client_auth_method": "client_secret_post",
+        "oauth_token_expires_at": int(time.time()) + expires_in_int,
+    }
+    return flask_jsonify({"status": "ok", "fields": fields})
 
 
 @flask_app.route("/api/admin/virtual-models", methods=["GET"])

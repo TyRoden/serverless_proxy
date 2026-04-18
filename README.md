@@ -304,7 +304,7 @@ You can override all fields for non-OpenAI providers.
 
 OAuth helper buttons in endpoint form:
 
-- **Start Web OAuth** - Launches browser PKCE login and auto-fills OAuth fields on callback
+- **Start Web OAuth** - Launches browser PKCE login (then paste redirect URL/code to complete)
 - **Import from Codex auth.json** - Imports OAuth fields from local Codex/ChatGPT auth cache
 
 #### Supported OAuth grant types

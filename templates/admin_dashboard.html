@@ -442,6 +442,16 @@
                             </div>
                             <div class="form-row">
                                 <div class="form-group">
+                                    <label for="ep-oauth-pasted-callback">Paste Redirect URL or Auth Code</label>
+                                    <input type="text" id="ep-oauth-pasted-callback" placeholder="http://127.0.0.1:1455/auth/callback?code=...&state=...">
+                                    <small>After web login, copy the full redirected URL (or just code) and paste here.</small>
+                                </div>
+                                <div class="form-group" style="display:flex;align-items:end;gap:8px;">
+                                    <button type="button" class="btn btn-primary" onclick="completeOpenAIWebOAuth()">Complete Web OAuth</button>
+                                </div>
+                            </div>
+                            <div class="form-row">
+                                <div class="form-group">
                                     <label for="ep-oauth-token-request-format">Token Request Format</label>
                                     <select id="ep-oauth-token-request-format" name="oauth_token_request_format">
                                         <option value="json">json</option>
@@ -1011,6 +1021,7 @@
 
     let openaiOAuthPopup = null;
     let openaiOAuthPollTimer = null;
+    let openaiOAuthPendingState = '';
 
     function applyOAuthFields(f) {
         if (!f) return;
@@ -1080,6 +1091,7 @@
             oauth_client_secret: (document.getElementById('ep-oauth-client-secret').value || '').trim(),
             oauth_token_url: (document.getElementById('ep-oauth-token-url').value || '').trim(),
             oauth_scope: (document.getElementById('ep-oauth-scope').value || '').trim(),
+            callback_mode: 'local_paste',
         };
 
         fetch('/api/admin/oauth/openai/start-web-auth', {
@@ -1101,6 +1113,7 @@
             if (!authUrl || !state) {
                 throw new Error('OAuth start response missing authorization URL or state');
             }
+            openaiOAuthPendingState = state;
 
             const width = 520;
             const height = 760;
@@ -1112,14 +1125,50 @@
             if (!openaiOAuthPopup) {
                 setOAuthImportStatus('Popup blocked. Open this URL manually: ' + authUrl, true);
             } else {
-                setOAuthImportStatus('Complete login in popup window...', false);
+                setOAuthImportStatus('Complete login in popup, then paste redirect URL below and click Complete Web OAuth.', false);
                 try { openaiOAuthPopup.focus(); } catch (e) {}
             }
-
-            pollOpenAIWebOAuthResult(state);
+            const pasted = document.getElementById('ep-oauth-pasted-callback');
+            if (pasted) pasted.value = '';
         })
         .catch((err) => {
             setOAuthImportStatus(err.message || 'Failed to start OAuth', true);
+        });
+    }
+
+    function completeOpenAIWebOAuth() {
+        const state = (openaiOAuthPendingState || '').trim();
+        const input = (document.getElementById('ep-oauth-pasted-callback').value || '').trim();
+        if (!state) {
+            setOAuthImportStatus('Start Web OAuth first.', true);
+            return;
+        }
+        if (!input) {
+            setOAuthImportStatus('Paste redirect URL or code first.', true);
+            return;
+        }
+
+        setOAuthImportStatus('Completing OAuth...', false);
+        fetch('/api/admin/oauth/openai/complete-web-auth', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'same-origin',
+            body: JSON.stringify({ state: state, redirect_url_or_code: input })
+        })
+        .then(async (r) => {
+            const data = await r.json().catch(() => ({}));
+            if (!r.ok) {
+                throw new Error(data.error || data.details || 'OAuth completion failed');
+            }
+            return data;
+        })
+        .then((result) => {
+            applyOAuthFields(result.fields || {});
+            openaiOAuthPendingState = '';
+            setOAuthImportStatus('Web OAuth completed and fields populated.', false);
+        })
+        .catch((err) => {
+            setOAuthImportStatus(err.message || 'OAuth completion failed', true);
         });
     }
 
@@ -1175,6 +1224,8 @@
         document.getElementById('ep-oauth-token-request-format').value = data ? (data.oauth_token_request_format || 'json') : 'json';
         document.getElementById('ep-oauth-client-auth-method').value = data ? (data.oauth_client_auth_method || 'client_secret_post') : 'client_secret_post';
         document.getElementById('ep-oauth-auth-file').value = '';
+        document.getElementById('ep-oauth-pasted-callback').value = '';
+        openaiOAuthPendingState = '';
         setOAuthImportStatus('', false);
         toggleOAuthFields();
         document.getElementById('endpoint-modal').classList.remove('hidden');
@@ -1189,6 +1240,7 @@
             try { openaiOAuthPopup.close(); } catch (e) {}
         }
         openaiOAuthPopup = null;
+        openaiOAuthPendingState = '';
         setOAuthImportStatus('', false);
     }
     

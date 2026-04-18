@@ -41,7 +41,8 @@ Common values you will map into Serverless Proxy:
 4. Optional interactive login:
    - Click **Start Web OAuth**
    - Complete login/consent in the popup window
-   - The dashboard auto-fills returned OAuth fields when callback completes
+   - Copy the redirected URL (or just the `code` value)
+   - Paste it into **Paste Redirect URL or Auth Code** and click **Complete Web OAuth**
 5. Keep or verify defaults:
    - URL: `https://api.openai.com`
    - OAuth enabled: `true`
@@ -62,7 +63,7 @@ Common values you will map into Serverless Proxy:
 
 Serverless Proxy supports an in-app browser PKCE helper via **Start Web OAuth**.
 
-- The helper starts authorization and handles callback/token exchange to auto-fill endpoint fields
+- The helper starts authorization and supports manual redirect/code paste completion
 - For headless/remote setups, import from local `auth.json` remains the fallback path
 - You can still complete OAuth via official client flows (for example, Codex login) and then import credentials
 
