@@ -122,6 +122,79 @@ docker logs serverless-proxy
 docker restart serverless-proxy
 ```
 
+## How to Update Safely
+
+If you already have endpoints and virtual models configured, use this upgrade flow to avoid breaking your setup.
+
+### 1) Back up the database first (required)
+
+```bash
+sqlite3 /mnt/ai/serverless-proxy/data/proxy.db \
+  ".backup /mnt/ai/serverless-proxy/data/proxy-pre-upgrade-$(date +%Y%m%d-%H%M%S).db"
+```
+
+### 2) Stop the running container (recommended)
+
+```bash
+docker compose down
+```
+
+### 3) Pull the latest code
+
+```bash
+git pull
+```
+
+### 4) Rebuild and restart
+
+```bash
+docker compose up -d --build
+```
+
+### 5) Let migrations run automatically
+
+On startup, the proxy runs additive schema migrations (new columns only). Existing endpoint rows are preserved.
+
+### 6) Verify existing setup still works
+
+```bash
+# API health
+curl http://localhost:8002/health
+
+# List routed models
+curl http://localhost:8002/v1/models
+
+# Optional: test an existing virtual model
+curl -X POST http://localhost:8002/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "your-existing-virtual-model",
+    "messages": [{"role": "user", "content": "ping"}]
+  }'
+```
+
+### 7) (Optional) Start using OAuth endpoints
+
+Existing endpoints continue to work unchanged. To use OAuth, add a new endpoint with type `openai_oauth` and configure OAuth fields.
+
+### Rollback (if needed)
+
+If something fails after upgrade:
+
+1. Stop the container
+2. Restore the DB backup
+3. Restart with your prior image/commit
+
+```bash
+# Stop current container
+docker compose down
+
+# Example DB restore
+cp /mnt/ai/serverless-proxy/data/proxy-pre-upgrade-YYYYMMDD-HHMMSS.db \
+   /mnt/ai/serverless-proxy/data/proxy.db
+docker compose up -d
+```
+
 ## Configuration
 
 ### Environment Variables
