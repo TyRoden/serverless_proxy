@@ -302,6 +302,11 @@ When selected in the dashboard, the form auto-fills OpenAI-compatible defaults:
 
 You can override all fields for non-OpenAI providers.
 
+OAuth helper buttons in endpoint form:
+
+- **Start Web OAuth** - Launches browser PKCE login and auto-fills OAuth fields on callback
+- **Import from Codex auth.json** - Imports OAuth fields from local Codex/ChatGPT auth cache
+
 #### Supported OAuth grant types
 
 - `refresh_token`

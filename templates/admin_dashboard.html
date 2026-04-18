@@ -430,6 +430,18 @@
                             </div>
                             <div class="form-row">
                                 <div class="form-group">
+                                    <label for="ep-oauth-auth-file">Codex auth.json Path (optional)</label>
+                                    <input type="text" id="ep-oauth-auth-file" placeholder="~/.codex/auth.json">
+                                    <small>Use only if default discovery paths do not work.</small>
+                                </div>
+                                <div class="form-group" style="display:flex;align-items:end;gap:8px;">
+                                    <button type="button" class="btn btn-secondary" onclick="importOpenAIOAuthFromCodex()">Import from Codex auth.json</button>
+                                    <button type="button" class="btn btn-warning" onclick="startOpenAIWebOAuth()">Start Web OAuth</button>
+                                    <small id="ep-oauth-import-status" style="display:block;"></small>
+                                </div>
+                            </div>
+                            <div class="form-row">
+                                <div class="form-group">
                                     <label for="ep-oauth-token-request-format">Token Request Format</label>
                                     <select id="ep-oauth-token-request-format" name="oauth_token_request_format">
                                         <option value="json">json</option>
@@ -990,6 +1002,160 @@
         }
     }
 
+    function setOAuthImportStatus(msg, isError) {
+        const el = document.getElementById('ep-oauth-import-status');
+        if (!el) return;
+        el.textContent = msg || '';
+        el.style.color = isError ? 'var(--accent-red)' : 'var(--text-secondary)';
+    }
+
+    let openaiOAuthPopup = null;
+    let openaiOAuthPollTimer = null;
+
+    function applyOAuthFields(f) {
+        if (!f) return;
+        document.getElementById('ep-type').value = f.endpoint_type || 'openai_oauth';
+        document.getElementById('ep-url').value = f.url || document.getElementById('ep-url').value;
+        document.getElementById('ep-oauth-enabled').checked = !!f.oauth_enabled;
+        document.getElementById('ep-oauth-grant-type').value = f.oauth_grant_type || 'refresh_token';
+        document.getElementById('ep-oauth-token-url').value = f.oauth_token_url || '';
+        document.getElementById('ep-oauth-client-id').value = f.oauth_client_id || '';
+        document.getElementById('ep-oauth-client-secret').value = f.oauth_client_secret || '';
+        if (f.oauth_refresh_token) {
+            document.getElementById('ep-oauth-refresh-token').value = f.oauth_refresh_token;
+        }
+        document.getElementById('ep-oauth-scope').value = f.oauth_scope || '';
+        document.getElementById('ep-oauth-token-request-format').value = f.oauth_token_request_format || 'json';
+        document.getElementById('ep-oauth-client-auth-method').value = f.oauth_client_auth_method || 'client_secret_post';
+        toggleOAuthFields();
+    }
+
+    function stopOpenAIOAuthPoll() {
+        if (openaiOAuthPollTimer) {
+            clearInterval(openaiOAuthPollTimer);
+            openaiOAuthPollTimer = null;
+        }
+    }
+
+    function pollOpenAIWebOAuthResult(state) {
+        if (!state) return;
+        stopOpenAIOAuthPoll();
+        let attempts = 0;
+        openaiOAuthPollTimer = setInterval(() => {
+            attempts += 1;
+            fetch('/api/admin/oauth/openai/auth-result?state=' + encodeURIComponent(state), {
+                credentials: 'same-origin'
+            })
+            .then(r => r.json())
+            .then((data) => {
+                if (data.status === 'pending') {
+                    if (attempts >= 120) {
+                        stopOpenAIOAuthPoll();
+                        setOAuthImportStatus('OAuth result timed out. Try again.', true);
+                    }
+                    return;
+                }
+                stopOpenAIOAuthPoll();
+                if (data.status === 'ok') {
+                    applyOAuthFields(data.fields || {});
+                    setOAuthImportStatus('Web OAuth completed and fields populated.', false);
+                } else {
+                    const msg = data.error || data.details || 'OAuth flow failed';
+                    setOAuthImportStatus(msg, true);
+                }
+            })
+            .catch(() => {
+                if (attempts >= 120) {
+                    stopOpenAIOAuthPoll();
+                    setOAuthImportStatus('OAuth result check failed.', true);
+                }
+            });
+        }, 1000);
+    }
+
+    function startOpenAIWebOAuth() {
+        setOAuthImportStatus('Starting web OAuth...', false);
+        const payload = {
+            oauth_client_id: (document.getElementById('ep-oauth-client-id').value || '').trim(),
+            oauth_client_secret: (document.getElementById('ep-oauth-client-secret').value || '').trim(),
+            oauth_token_url: (document.getElementById('ep-oauth-token-url').value || '').trim(),
+            oauth_scope: (document.getElementById('ep-oauth-scope').value || '').trim(),
+        };
+
+        fetch('/api/admin/oauth/openai/start-web-auth', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'same-origin',
+            body: JSON.stringify(payload)
+        })
+        .then(async (r) => {
+            const data = await r.json().catch(() => ({}));
+            if (!r.ok) {
+                throw new Error(data.error || 'Failed to start OAuth');
+            }
+            return data;
+        })
+        .then((result) => {
+            const authUrl = result.authorization_url;
+            const state = result.state;
+            if (!authUrl || !state) {
+                throw new Error('OAuth start response missing authorization URL or state');
+            }
+
+            const width = 520;
+            const height = 760;
+            const left = Math.max(0, (window.screen.width - width) / 2);
+            const top = Math.max(0, (window.screen.height - height) / 2);
+            const features = `popup=yes,width=${width},height=${height},left=${left},top=${top}`;
+            openaiOAuthPopup = window.open(authUrl, 'openai-oauth-login', features);
+
+            if (!openaiOAuthPopup) {
+                setOAuthImportStatus('Popup blocked. Open this URL manually: ' + authUrl, true);
+            } else {
+                setOAuthImportStatus('Complete login in popup window...', false);
+                try { openaiOAuthPopup.focus(); } catch (e) {}
+            }
+
+            pollOpenAIWebOAuthResult(state);
+        })
+        .catch((err) => {
+            setOAuthImportStatus(err.message || 'Failed to start OAuth', true);
+        });
+    }
+
+    window.addEventListener('message', (event) => {
+        if (event.origin !== window.location.origin) return;
+        const data = event.data || {};
+        if (data.type !== 'openai-oauth-web-complete' || !data.state) return;
+        pollOpenAIWebOAuthResult(data.state);
+    });
+
+    function importOpenAIOAuthFromCodex() {
+        setOAuthImportStatus('Importing...', false);
+        const path = (document.getElementById('ep-oauth-auth-file').value || '').trim();
+
+        fetch('/api/admin/oauth/openai/import-codex', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'same-origin',
+            body: JSON.stringify({ path: path || null })
+        })
+        .then(async (r) => {
+            const data = await r.json().catch(() => ({}));
+            if (!r.ok) {
+                throw new Error(data.error || 'Import failed');
+            }
+            return data;
+        })
+        .then((result) => {
+            applyOAuthFields(result.fields || {});
+            setOAuthImportStatus(`Imported from ${result.source_path || 'auth.json'}`, false);
+        })
+        .catch((err) => {
+            setOAuthImportStatus(err.message || 'Import failed', true);
+        });
+    }
+
     function openEndpointModal(data) {
         document.getElementById('endpoint-modal-title').textContent = data ? 'Edit Endpoint' : 'Add Endpoint';
         document.getElementById('ep-id').value = data ? data.id : '';
@@ -1008,6 +1174,8 @@
         document.getElementById('ep-oauth-refresh-token').value = data ? (data.oauth_refresh_token || '') : '';
         document.getElementById('ep-oauth-token-request-format').value = data ? (data.oauth_token_request_format || 'json') : 'json';
         document.getElementById('ep-oauth-client-auth-method').value = data ? (data.oauth_client_auth_method || 'client_secret_post') : 'client_secret_post';
+        document.getElementById('ep-oauth-auth-file').value = '';
+        setOAuthImportStatus('', false);
         toggleOAuthFields();
         document.getElementById('endpoint-modal').classList.remove('hidden');
     }
@@ -1016,6 +1184,12 @@
         document.getElementById('endpoint-modal').classList.add('hidden');
         document.getElementById('endpoint-form').reset();
         document.getElementById('oauth-fields').classList.add('hidden');
+        stopOpenAIOAuthPoll();
+        if (openaiOAuthPopup && !openaiOAuthPopup.closed) {
+            try { openaiOAuthPopup.close(); } catch (e) {}
+        }
+        openaiOAuthPopup = null;
+        setOAuthImportStatus('', false);
     }
     
     function saveEndpoint(e) {

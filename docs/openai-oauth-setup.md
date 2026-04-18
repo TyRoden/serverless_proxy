@@ -34,21 +34,48 @@ Common values you will map into Serverless Proxy:
 
 1. Open Admin Dashboard: `http://localhost:5001/proxy-dashboard`
 2. Add endpoint and set **Type** to `openai_oauth`
-3. Keep or verify defaults:
+3. Optional quick import:
+   - Click **Import from Codex auth.json**
+   - Leave path blank to try default discovery paths, or provide a specific path
+   - If successful, OAuth fields are auto-populated
+4. Optional interactive login:
+   - Click **Start Web OAuth**
+   - Complete login/consent in the popup window
+   - The dashboard auto-fills returned OAuth fields when callback completes
+5. Keep or verify defaults:
    - URL: `https://api.openai.com`
    - OAuth enabled: `true`
    - Grant type: `refresh_token`
    - Token URL: `https://auth.openai.com/oauth/token`
    - Token request format: `json`
    - Client auth method: `client_secret_post`
-4. Fill in:
+6. Fill in (or verify imported values):
    - `oauth_client_id`
    - `oauth_refresh_token`
    - `oauth_client_secret` (if required by your token source)
    - `oauth_scope` (optional)
-5. Save endpoint
-6. Use **Fetch Models** on that endpoint to validate token exchange
-7. Map a virtual model to this endpoint and test with `POST /v1/chat/completions`
+7. Save endpoint
+8. Use **Fetch Models** on that endpoint to validate token exchange
+9. Map a virtual model to this endpoint and test with `POST /v1/chat/completions`
+
+## About web authorization from the dashboard
+
+Serverless Proxy supports an in-app browser PKCE helper via **Start Web OAuth**.
+
+- The helper starts authorization and handles callback/token exchange to auto-fill endpoint fields
+- For headless/remote setups, import from local `auth.json` remains the fallback path
+- You can still complete OAuth via official client flows (for example, Codex login) and then import credentials
+
+## Container path note
+
+If Serverless Proxy runs in Docker, the app can only read files visible inside the container.
+
+- If your `auth.json` is only on your host machine, mount it into the container or paste/import via a path that exists in-container
+- Default discovery paths include:
+  - `~/.codex/auth.json`
+  - `~/.chatgpt-local/auth.json`
+  - `/root/.codex/auth.json`
+  - `/root/.chatgpt-local/auth.json`
 
 ## Troubleshooting
 
