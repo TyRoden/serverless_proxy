@@ -2749,6 +2749,13 @@ def _resolve_openai_oauth_response_endpoint(base_url: str) -> str:
     base = (base_url or "").strip().rstrip("/")
     if not base:
         return "https://chatgpt.com/backend-api/codex/responses"
+    try:
+        parsed = urllib.parse.urlparse(base)
+        host = (parsed.netloc or "").lower()
+        if host in ("api.openai.com", "www.api.openai.com"):
+            return "https://chatgpt.com/backend-api/codex/responses"
+    except Exception:
+        pass
     if "/backend-api/codex/responses" in base:
         return base
     return f"{base}/backend-api/codex/responses"
@@ -3424,6 +3431,11 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
                     ):
                         detail_msg = (
                             f"{detail_msg} (OpenAI OAuth note: token may be missing required scope for this operation)"
+                        )
+                    elif self.endpoint_type == "openai_oauth" and response.status_code == 404:
+                        detail_msg = (
+                            f"{detail_msg} (OpenAI OAuth note: Codex backend path not found at {endpoint}. "
+                            "Use endpoint URL https://chatgpt.com for openai_oauth.)"
                         )
 
                     return (
