@@ -292,6 +292,10 @@ Configure backend endpoints with:
 
 Use `openai_oauth` when your provider requires OAuth instead of a static API key.
 
+Important reference guide:
+
+- See `docs/openai-oauth-setup.md` for the full current setup flow, web OAuth instructions, Codex `auth.json` import path, model fallback guidance, token estimation notes, and reverse-proxy/Caddy requirements.
+
 When selected in the dashboard, the form auto-fills OpenAI-compatible defaults:
 
 - `url`: `https://chatgpt.com`
