@@ -2768,6 +2768,7 @@ def _openai_chat_to_openai_oauth_payload(
     temperature: Optional[float],
     max_tokens: Optional[int],
     top_p: Optional[float],
+    tools: Optional[list] = None,
 ) -> dict[str, Any]:
     system_parts: list[str] = []
     input_items: list[dict[str, Any]] = []
@@ -2801,6 +2802,35 @@ def _openai_chat_to_openai_oauth_payload(
     # Keep payload minimal/compatible by omitting token-limit fields here.
     # NOTE: Codex/ChatGPT OAuth backend may reject OpenAI-style sampling params.
     # Omit temperature/top_p to keep compatibility broad.
+
+    # Tool mapping: OpenAI chat tools -> OAuth/Codex responses tools
+    # Incoming shape (chat):
+    #   {"type":"function","function":{"name":"...","description":"...","parameters":{...}}}
+    # Expected responses shape:
+    #   {"type":"function","name":"...","description":"...","parameters":{...}}
+    mapped_tools: list[dict[str, Any]] = []
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        ttype = str(tool.get("type") or "function").strip().lower()
+        if ttype != "function":
+            continue
+        fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        name = str(fn.get("name") or "").strip()
+        if not name:
+            continue
+        mapped: dict[str, Any] = {"type": "function", "name": name}
+        desc = fn.get("description")
+        if isinstance(desc, str) and desc.strip():
+            mapped["description"] = desc
+        params = fn.get("parameters")
+        if isinstance(params, dict):
+            mapped["parameters"] = params
+        mapped_tools.append(mapped)
+
+    if mapped_tools:
+        payload["tools"] = mapped_tools
+
     return payload
 
 
@@ -3181,6 +3211,7 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
                     temperature=temperature,
                     max_tokens=max_tokens,
                     top_p=top_p,
+                    tools=tools,
                 )
 
             if self.endpoint_type == "ollama":
@@ -3274,7 +3305,7 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
 
             # For non-Anthropic backends (OpenAI-compatible), always add tools if provided
             # This ensures tool_choice works correctly
-            if self.endpoint_type not in ("anthropic", "ollama") and tools:
+            if self.endpoint_type not in ("anthropic", "ollama", "openai_oauth") and tools:
                 payload["tools"] = tools
 
             # Safety: if tool_choice/parallel_tool_calls but no tools, strip them to avoid upstream validation errors
@@ -5618,6 +5649,7 @@ async def anthropic_messages(request: Request):
             temperature=temperature,
             max_tokens=max_tokens,
             top_p=top_p,
+            tools=tools,
         )
 
     # Check for streaming
