@@ -2781,9 +2781,50 @@ def _openai_chat_to_openai_oauth_payload(
                 system_parts.append(text)
             continue
 
-        if role not in ("user", "assistant", "tool"):
-            role = "user"
+        # Convert prior assistant tool calls (OpenAI chat format) into
+        # responses-style function_call items.
+        if role == "assistant" and isinstance(msg.get("tool_calls"), list):
+            for tc in msg.get("tool_calls") or []:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                name = str(fn.get("name") or "").strip()
+                if not name:
+                    continue
+                arguments = fn.get("arguments")
+                if isinstance(arguments, (dict, list)):
+                    arguments = json.dumps(arguments)
+                elif arguments is None:
+                    arguments = "{}"
+                else:
+                    arguments = str(arguments)
+                input_items.append(
+                    {
+                        "type": "function_call",
+                        "call_id": str(tc.get("id") or f"call_{int(time.time() * 1000)}"),
+                        "name": name,
+                        "arguments": arguments,
+                    }
+                )
+            # Keep optional assistant text too, if present.
+            if text:
+                input_items.append({"role": "assistant", "content": text})
+            continue
+
+        # Convert tool result messages into responses-style function_call_output.
         if role == "tool":
+            tool_call_id = str(msg.get("tool_call_id") or "").strip()
+            if tool_call_id:
+                input_items.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": tool_call_id,
+                        "output": text,
+                    }
+                )
+                continue
+
+        if role not in ("user", "assistant"):
             role = "user"
         input_items.append({"role": role, "content": text})
 
@@ -2861,6 +2902,39 @@ def _openai_oauth_response_to_chat_completion(
                             collected.append(txt)
             output_text = "".join(collected)
 
+    tool_calls: list[dict[str, Any]] = []
+    output_items = response_obj.get("output") or []
+    if isinstance(output_items, list):
+        for item in output_items:
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type") or "").lower()
+            if item_type not in ("function_call", "tool_call"):
+                continue
+            name = str(item.get("name") or item.get("tool_name") or "").strip()
+            if not name:
+                continue
+            arguments = item.get("arguments")
+            if isinstance(arguments, (dict, list)):
+                arguments = json.dumps(arguments)
+            elif arguments is None:
+                arguments = "{}"
+            else:
+                arguments = str(arguments)
+            call_id = str(item.get("call_id") or item.get("id") or "").strip()
+            if not call_id:
+                call_id = f"call_{int(time.time() * 1000)}_{len(tool_calls)}"
+            tool_calls.append(
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": arguments,
+                    },
+                }
+            )
+
     usage = response_obj.get("usage") or {}
     prompt_tokens = int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
     completion_tokens = int(
@@ -2870,6 +2944,14 @@ def _openai_oauth_response_to_chat_completion(
         usage.get("total_tokens") or (prompt_tokens + completion_tokens)
     )
 
+    finish_reason = "tool_calls" if tool_calls else "stop"
+    message_obj: dict[str, Any] = {
+        "role": "assistant",
+        "content": output_text,
+    }
+    if tool_calls:
+        message_obj["tool_calls"] = tool_calls
+
     return {
         "id": response_obj.get("id") or f"chatcmpl_{int(time.time() * 1000)}",
         "object": "chat.completion",
@@ -2878,8 +2960,8 @@ def _openai_oauth_response_to_chat_completion(
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": output_text},
-                "finish_reason": "stop",
+                "message": message_obj,
+                "finish_reason": finish_reason,
             }
         ],
         "usage": {
@@ -2892,6 +2974,7 @@ def _openai_oauth_response_to_chat_completion(
 
 def _openai_oauth_sse_to_openai_chat_sse(sse_text: str, model_name: str) -> str:
     out_lines: list[str] = []
+    saw_tool_call = False
     for raw in (sse_text or "").splitlines():
         line = raw.strip()
         if not line.startswith("data:"):
@@ -2921,7 +3004,50 @@ def _openai_oauth_sse_to_openai_chat_sse(sse_text: str, model_name: str) -> str:
         ):
             item = evt.get("item") or {}
             if isinstance(item, dict):
-                delta_text = str(item.get("text") or "")
+                item_type = str(item.get("type") or "").lower()
+                if item_type in ("function_call", "tool_call"):
+                    fn_name = str(item.get("name") or item.get("tool_name") or "").strip()
+                    fn_args = item.get("arguments")
+                    if isinstance(fn_args, (dict, list)):
+                        fn_args = json.dumps(fn_args)
+                    elif fn_args is None:
+                        fn_args = "{}"
+                    else:
+                        fn_args = str(fn_args)
+                    call_id = str(item.get("call_id") or item.get("id") or "").strip()
+                    if not call_id:
+                        call_id = f"call_{int(time.time() * 1000)}"
+                    if fn_name:
+                        chunk = {
+                            "id": evt.get("response_id")
+                            or f"chatcmpl_{int(time.time() * 1000)}",
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": model_name,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {
+                                        "tool_calls": [
+                                            {
+                                                "index": 0,
+                                                "id": call_id,
+                                                "type": "function",
+                                                "function": {
+                                                    "name": fn_name,
+                                                    "arguments": fn_args,
+                                                },
+                                            }
+                                        ]
+                                    },
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                        out_lines.append(f"data: {json.dumps(chunk)}\n")
+                        saw_tool_call = True
+                else:
+                    delta_text = str(item.get("text") or "")
 
         if delta_text:
             chunk = {
@@ -2940,13 +3066,14 @@ def _openai_oauth_sse_to_openai_chat_sse(sse_text: str, model_name: str) -> str:
             out_lines.append(f"data: {json.dumps(chunk)}\n")
 
         if evt_type in ("response.completed", "response.done", "completed"):
+            finish_reason = "tool_calls" if saw_tool_call else "stop"
             final_chunk = {
                 "id": evt.get("response_id") or f"chatcmpl_{int(time.time() * 1000)}",
                 "object": "chat.completion.chunk",
                 "created": int(time.time()),
                 "model": model_name,
                 "choices": [
-                    {"index": 0, "delta": {}, "finish_reason": "stop"}
+                    {"index": 0, "delta": {}, "finish_reason": finish_reason}
                 ],
             }
             out_lines.append(f"data: {json.dumps(final_chunk)}\n")
