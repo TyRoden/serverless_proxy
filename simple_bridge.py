@@ -1979,7 +1979,7 @@ class AIQueueBackend(LLMBackend):
                     json=payload,
                 )
 
-                if response.status_code != 200:
+                if response.status_code < 200 or response.status_code >= 300:
                     if self.endpoint_type == "ollama":
                         try:
                             payload_preview = json.dumps(payload)[:2000]
@@ -3400,11 +3400,37 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
                             f"[OLLAMA_400] request_id={request_id} status={response.status_code} body={response.text[:500]} payload={payload_preview}",
                             flush=True,
                         )
+                    body_text = (response.text or "").strip()
+                    parsed_message = ""
+                    try:
+                        err_obj = response.json()
+                        if isinstance(err_obj, dict):
+                            if isinstance(err_obj.get("error"), dict):
+                                parsed_message = str(
+                                    err_obj.get("error", {}).get("message") or ""
+                                ).strip()
+                            elif isinstance(err_obj.get("error"), str):
+                                parsed_message = err_obj.get("error", "").strip()
+                    except Exception:
+                        pass
+
+                    detail_msg = parsed_message or body_text
+                    if not detail_msg:
+                        detail_msg = f"Upstream returned HTTP {response.status_code}"
+
+                    if self.endpoint_type == "openai_oauth" and response.status_code in (
+                        401,
+                        403,
+                    ):
+                        detail_msg = (
+                            f"{detail_msg} (OpenAI OAuth note: token may be missing required scope for this operation)"
+                        )
+
                     return (
                         None,
                         {
                             "error": {
-                                "message": f"Error: {response.text}",
+                                "message": detail_msg,
                                 "type": "internal_server_error",
                             }
                         },
