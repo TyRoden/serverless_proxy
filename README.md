@@ -343,6 +343,7 @@ Current behavior remains plaintext secret storage (same model as existing `api_k
 Detailed implementation and migration runbook:
 
 - `docs/oauth-encryption-secrets-storage.md`
+- `docs/openai-oauth-setup.md`
 
 ### Virtual Models
 
