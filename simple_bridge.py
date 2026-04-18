@@ -2799,10 +2799,8 @@ def _openai_chat_to_openai_oauth_payload(
         payload["instructions"] = "\n\n".join(system_parts)
     # NOTE: Codex/ChatGPT OAuth backend may reject max_output_tokens.
     # Keep payload minimal/compatible by omitting token-limit fields here.
-    if temperature is not None:
-        payload["temperature"] = temperature
-    if top_p is not None:
-        payload["top_p"] = top_p
+    # NOTE: Codex/ChatGPT OAuth backend may reject OpenAI-style sampling params.
+    # Omit temperature/top_p to keep compatibility broad.
     return payload
 
 
