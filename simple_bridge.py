@@ -4997,8 +4997,32 @@ async def chat_completions(request: Request):
     if system_fingerprint:
         response_content["system_fingerprint"] = system_fingerprint
 
+    normalized_tool_calls = []
+    for idx, tc in enumerate(tool_calls_data or []):
+        if not isinstance(tc, dict):
+            continue
+        fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+        tc_name = str(fn.get("name") or "").strip()
+        if not tc_name:
+            continue
+        tc_id = str(tc.get("id") or f"call_{int(time.time() * 1000)}_{idx}").strip()
+        tc_args = fn.get("arguments")
+        if isinstance(tc_args, (dict, list)):
+            tc_args = json.dumps(tc_args)
+        elif tc_args is None:
+            tc_args = ""
+        else:
+            tc_args = str(tc_args)
+        normalized_tool_calls.append(
+            {
+                "id": tc_id,
+                "type": "function",
+                "function": {"name": tc_name, "arguments": tc_args},
+            }
+        )
+
     # Determine finish_reason: "tool_calls" only if tool calls present AND no text content
-    finish_reason = "tool_calls" if (tool_calls_data and not text_content) else "stop"
+    finish_reason = "tool_calls" if (normalized_tool_calls and not text_content) else "stop"
 
     if tool_calls_data:
         response_content["choices"].append(
@@ -5068,24 +5092,14 @@ async def chat_completions(request: Request):
     # Determine finish_reason: "tool_calls" only if tool calls present AND no text content
     finish_reason = "tool_calls" if (tool_calls_data and not text_content) else "stop"
 
-    if tool_calls_data:
+    if normalized_tool_calls:
         response_content["choices"].append(
             {
                 "index": 0,
                 "message": {
                     "role": "assistant",
                     "content": text_content,
-                    "tool_calls": [
-                        {
-                            "id": tc["id"],
-                            "type": "function",
-                            "function": {
-                                "name": tc["function"]["name"],
-                                "arguments": tc["function"]["arguments"],
-                            },
-                        }
-                        for tc in tool_calls_data
-                    ],
+                    "tool_calls": normalized_tool_calls,
                 },
                 "finish_reason": finish_reason,
             }
@@ -5129,8 +5143,36 @@ async def _generate_sse(
     if system_fingerprint:
         first_chunk_meta["system_fingerprint"] = system_fingerprint
 
-    if tool_calls_data:
-        for tc_index, tc in enumerate(tool_calls_data):
+    def _normalize_tool_calls(raw_tool_calls):
+        normalized = []
+        for idx, tc in enumerate(raw_tool_calls or []):
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+            tc_name = str(fn.get("name") or "").strip()
+            if not tc_name:
+                continue
+            tc_id = str(tc.get("id") or f"call_{int(time.time() * 1000)}_{idx}").strip()
+            tc_args = fn.get("arguments")
+            if isinstance(tc_args, (dict, list)):
+                tc_args = json.dumps(tc_args)
+            elif tc_args is None:
+                tc_args = ""
+            else:
+                tc_args = str(tc_args)
+            normalized.append(
+                {
+                    "id": tc_id,
+                    "type": "function",
+                    "function": {"name": tc_name, "arguments": tc_args},
+                }
+            )
+        return normalized
+
+    normalized_tool_calls = _normalize_tool_calls(tool_calls_data)
+
+    if normalized_tool_calls:
+        for tc_index, tc in enumerate(normalized_tool_calls):
             chunk = {
                 "id": chunk_id,
                 "object": "chat.completion.chunk",
@@ -5143,10 +5185,10 @@ async def _generate_sse(
                             "tool_calls": [
                                 {
                                     "index": tc_index,
-                                    "id": tc["id"],
+                                    "id": tc.get("id", f"call_{tc_index}"),
                                     "type": "function",
                                     "function": {
-                                        "name": tc["function"]["name"],
+                                        "name": tc.get("function", {}).get("name", ""),
                                         "arguments": "",
                                     },
                                 }
@@ -5159,7 +5201,7 @@ async def _generate_sse(
             yield f"data: {json.dumps(chunk)}\n\n"
             await asyncio.sleep(0.01)
 
-            args = tc["function"]["arguments"]
+            args = tc.get("function", {}).get("arguments", "")
             chunk = {
                 "id": chunk_id,
                 "object": "chat.completion.chunk",
@@ -5172,7 +5214,7 @@ async def _generate_sse(
                             "tool_calls": [
                                 {
                                     "index": tc_index,
-                                    "id": tc["id"],
+                                    "id": tc.get("id", f"call_{tc_index}"),
                                     "function": {"arguments": args},
                                 }
                             ]
@@ -5201,7 +5243,7 @@ async def _generate_sse(
         yield f"data: {json.dumps(chunk)}\n\n"
 
     # Determine finish_reason: "tool_calls" only if tool calls present AND no text content
-    finish_reason = "tool_calls" if (tool_calls_data and not text_content) else "stop"
+    finish_reason = "tool_calls" if (normalized_tool_calls and not text_content) else "stop"
 
     final_chunk = {
         "id": chunk_id,
