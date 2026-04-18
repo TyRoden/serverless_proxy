@@ -14,10 +14,21 @@ All notable changes to the Serverless Proxy will be documented in this file.
 - **Tool Call ID Correlation** - Added alias correlation between `item.id` and `call_id` in OAuth stream conversion to prevent duplicate/fragmented tool-call entries when argument deltas reference a different identifier.
 - **Empty Tool Arguments Compatibility** - Normalized empty/blank tool arguments to valid JSON (`{}`) in OpenAI-compatible response shaping paths to improve downstream tool parser compatibility.
 - **OAuth Model Discovery Fallback** - When OAuth-backed upstream model routes return non-success (common with scoped ChatGPT/Codex tokens), `/endpoints/<id>/models` now returns already-configured `virtual_models.actual_model` values for that endpoint so dashboard model selection remains usable.
+- **OAuth Usage Estimation** - Added OpenAI OAuth token estimation fallback for streaming chat requests when upstream token counts are missing, so Usage & Cost tracking records input/output/total token estimates instead of zeros.
+- **OAuth Secret Preservation on Edit** - Endpoint update routes now preserve existing `oauth_client_secret` and `oauth_refresh_token` when edit forms submit those fields blank, preventing accidental credential loss.
+- **OAuth Token Error Diagnostics** - Token refresh rejection logs now include parsed OAuth error code/message snippets (for example `refresh_token_reused`) to speed up troubleshooting.
 
 ### Added
 
 - **OAuth Tool Stream Diagnostics** - Added `[OAUTH_SSE]` debug telemetry for OAuth stream conversion with counters for event volume and tool assembly stages (`tool_added`, `tool_arg_delta`, `tool_done`, `unknown_delta`).
+- **Usage UI Estimate Marking** - Usage dashboard now marks OAuth-backed model/token totals with `*` and shows a footer note clarifying that OpenAI OAuth token counts are estimates when upstream counts are unavailable.
+- **Activity Tab (v1)** - Added a lightweight admin `Activity` tab with auto-refreshing recent request feed (route, model, IP, source, status, latency) and compact filters for quick operational scanning.
+- **Recent Activity Storage/API** - Added `recent_activity` SQLite table, retention pruning, and admin API routes (`GET /api/admin/activity` and `GET /api/admin/endpoints/activity`) for metadata-only traffic visibility.
+- **Activity Capture Coverage** - Added activity logging for chat, completions, embeddings, and model-list requests with normalized outcomes and latency.
+
+### Documentation
+
+- **README Updates** - Documented Activity tab behavior, activity admin APIs, and Caddy/reverse-proxy route requirements for OAuth admin paths (`/api/admin/oauth/*`) and activity paths.
 
 ### Validation
 

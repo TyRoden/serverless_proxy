@@ -272,6 +272,7 @@ Access the admin dashboard at `/proxy-dashboard`. Authentication is handled by t
 
 - **Endpoint Management**: Add, edit, delete backend endpoints
 - **Virtual Model Mapping**: Map virtual model names to actual backend models
+- **Activity Tab**: Recent request feed (route/model/IP/source/status/latency) with filters and auto-refresh
 - **Patterns Tab**: Manage tool-call translation patterns in the UI
 - **Model Discovery**: Fetch available models from endpoints
 - **Enable/Disable**: Toggle endpoints and virtual models
@@ -402,6 +403,16 @@ The Usage page shows:
 - Average response times
 - Cost per model and daily trends
 
+### Activity Feed (Admin)
+
+The admin dashboard includes an `Activity` tab for quick operational visibility.
+
+- Recent traffic table (newest first)
+- Default view: latest 100 rows, `/health` excluded
+- Filter by status, model, IP, and path
+- Auto-refresh every 10 seconds (toggleable)
+- Metadata-only storage (no prompts/tool args/response bodies)
+
 ## API Endpoints
 
 ### OpenAI-Compatible API (port 8002)
@@ -507,11 +518,18 @@ OLLAMA_RUN_MUTATING=1 ./scripts/ollama_full_surface_conformance.sh
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/api/admin/endpoints` | GET, POST | List/create endpoints |
+| `/api/admin/activity` | GET | Recent activity feed (FastAPI) |
+| `/api/admin/endpoints/activity` | GET | Recent activity feed (Flask/admin-compatible alias) |
 | `/endpoints` | GET, POST | Manage endpoints |
 | `/endpoints/<id>` | PUT | Update endpoint |
 | `/endpoints/<id>/delete` | GET, DELETE | Delete endpoint |
 | `/endpoints/<id>/test` | POST | Test endpoint connection |
 | `/endpoints/<id>/models` | GET | Fetch available models |
+| `/api/admin/oauth/openai/start-web-auth` | POST | Start OpenAI web OAuth flow |
+| `/api/admin/oauth/openai/complete-web-auth` | POST | Complete OpenAI web OAuth with pasted URL/code |
+| `/api/admin/oauth/openai/import-codex` | POST | Import OAuth fields from Codex `auth.json` |
+| `/api/admin/oauth/openai/auth-result` | GET | Poll OAuth popup result by state |
+| `/api/admin/oauth/openai/callback` | GET | OAuth callback handler |
 | `/api/admin/virtual-models` | GET | List virtual models |
 | `/virtual-models` | POST | Create virtual model |
 | `/virtual-models/<id>` | PUT | Update virtual model |
@@ -532,6 +550,39 @@ Common OAuth payload fields:
 - `oauth_refresh_token`
 - `oauth_token_request_format` (`json` or `form`)
 - `oauth_client_auth_method` (`client_secret_post` or `client_secret_basic`)
+
+### Reverse Proxy Routing Notes (Caddy)
+
+If you front the dashboard with Caddy (or another reverse proxy), route admin paths to the correct backend services before catch-all `/api/*` rules.
+
+- `127.0.0.1:5001` (Flask/admin):
+  - `/api/admin/endpoints*`
+  - `/api/admin/virtual-models*`
+  - `/api/admin/oauth/*`
+  - `/api/admin/endpoints/activity`
+  - `/endpoints*`, `/virtual-models*`
+- `127.0.0.1:8002` (FastAPI/API):
+  - `/api/admin/usage*`
+  - `/api/admin/activity`
+
+Example Caddy matchers:
+
+```caddy
+@proxy-api-usage path /api/admin/usage*
+handle @proxy-api-usage {
+    reverse_proxy 127.0.0.1:8002
+}
+
+@proxy-api-oauth path /api/admin/oauth/*
+handle @proxy-api-oauth {
+    reverse_proxy 127.0.0.1:5001
+}
+
+@proxy-api path /api/admin/endpoints* /api/admin/virtual-models* /api/admin/endpoints/activity /endpoints* /virtual-models*
+handle @proxy-api {
+    reverse_proxy 127.0.0.1:5001
+}
+```
 
 ## Backend Types
 

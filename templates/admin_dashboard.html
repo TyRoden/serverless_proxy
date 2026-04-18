@@ -215,6 +215,7 @@
         <nav class="nav">
             <a href="#" onclick="console.log('Dashboard clicked'); event.preventDefault(); showTab('dashboard');">Dashboard</a>
             <a href="#" onclick="console.log('Usage clicked'); event.preventDefault(); showTab('usage');">Usage & Cost</a>
+            <a href="#" onclick="console.log('Activity clicked'); event.preventDefault(); showTab('activity');">Activity</a>
             <a href="#" onclick="console.log('Settings clicked'); event.preventDefault(); showTab('settings');">Settings</a>
             <a href="#" onclick="console.log('Patterns clicked'); event.preventDefault(); showTab('patterns');">Patterns</a>
         </nav>
@@ -291,6 +292,62 @@
         <div class="card">
             <h2>Daily Breakdown</h2>
             <div id="daily-breakdown" style="margin-top:16px;"></div>
+        </div>
+    </div>
+
+    <!-- Activity Tab Content -->
+    <div id="activity-section" class="hidden">
+        <div class="card">
+            <h2>Activity</h2>
+            <p style="color:var(--text-secondary);margin-bottom:16px;font-size:14px;">
+                Recent request activity feed with route, source, status, and latency.
+            </p>
+            <div style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap;margin-bottom:14px;">
+                <div class="form-group" style="min-width:130px;">
+                    <label>Limit</label>
+                    <select id="activity-limit" onchange="loadActivity()">
+                        <option value="50">50</option>
+                        <option value="100" selected>100</option>
+                        <option value="200">200</option>
+                        <option value="500">500</option>
+                    </select>
+                </div>
+                <div class="form-group" style="min-width:150px;">
+                    <label>Status</label>
+                    <select id="activity-status" onchange="loadActivity()">
+                        <option value="">All</option>
+                        <option value="success">success</option>
+                        <option value="client_error">client_error</option>
+                        <option value="auth_error">auth_error</option>
+                        <option value="upstream_error">upstream_error</option>
+                        <option value="server_error">server_error</option>
+                    </select>
+                </div>
+                <div class="form-group" style="min-width:160px;">
+                    <label>Model</label>
+                    <input type="text" id="activity-model" placeholder="gpt-5.4-oath" oninput="loadActivityDebounced()">
+                </div>
+                <div class="form-group" style="min-width:140px;">
+                    <label>IP</label>
+                    <input type="text" id="activity-ip" placeholder="192.168" oninput="loadActivityDebounced()">
+                </div>
+                <div class="form-group" style="min-width:180px;">
+                    <label>Path</label>
+                    <input type="text" id="activity-path" placeholder="/v1/chat/completions" oninput="loadActivityDebounced()">
+                </div>
+                <div class="checkbox-row" style="margin-bottom:8px;">
+                    <input type="checkbox" id="activity-include-health" onchange="loadActivity()">
+                    <label for="activity-include-health">Include /health</label>
+                </div>
+                <div class="checkbox-row" style="margin-bottom:8px;">
+                    <input type="checkbox" id="activity-auto-refresh" checked onchange="toggleActivityAutoRefresh()">
+                    <label for="activity-auto-refresh">Auto-refresh (10s)</label>
+                </div>
+                <button class="btn btn-secondary btn-sm" onclick="loadActivity()">Refresh</button>
+            </div>
+            <div id="activity-loading" class="loading" style="display:none;">Loading...</div>
+            <div id="activity-error" style="color:var(--accent-red);display:none;"></div>
+            <div id="activity-table" style="margin-top:12px;"></div>
         </div>
     </div>
 
@@ -416,6 +473,7 @@
                                 <div class="form-group">
                                     <label for="ep-oauth-client-secret">OAuth Client Secret</label>
                                     <input type="password" id="ep-oauth-client-secret" name="oauth_client_secret" placeholder="client secret">
+                                    <small>Leave blank while editing to keep existing secret.</small>
                                 </div>
                             </div>
                             <div class="form-row">
@@ -426,6 +484,7 @@
                                 <div class="form-group">
                                     <label for="ep-oauth-refresh-token">OAuth Refresh Token</label>
                                     <input type="password" id="ep-oauth-refresh-token" name="oauth_refresh_token" placeholder="refresh token">
+                                    <small>Leave blank while editing to keep existing refresh token.</small>
                                 </div>
                             </div>
                             <div class="form-row">
@@ -675,24 +734,35 @@
     // ==========================================
     
     let currentTab = 'dashboard';
+    let activityAutoRefreshTimer = null;
+    let activityDebounceTimer = null;
     
     function showTab(tabName) {
         currentTab = tabName;
 
         // Update nav links
         document.querySelectorAll('.nav a').forEach(a => a.classList.remove('active'));
-        const tabIndex = { dashboard: 0, usage: 1, settings: 2, patterns: 3 };
+        const tabIndex = { dashboard: 0, usage: 1, activity: 2, settings: 3, patterns: 4 };
         document.querySelectorAll('.nav a')[tabIndex[tabName] ?? 0].classList.add('active');
 
         // Hide all tab sections first
         document.getElementById('dashboard-section').classList.add('hidden');
         document.getElementById('usage-section').classList.add('hidden');
+        document.getElementById('activity-section').classList.add('hidden');
         document.getElementById('settings-section').classList.add('hidden');
         document.getElementById('patterns-section').classList.add('hidden');
+
+        if (tabName !== 'activity') {
+            stopActivityAutoRefresh();
+        }
 
         if (tabName === 'usage') {
             document.getElementById('usage-section').classList.remove('hidden');
             loadUsage();
+        } else if (tabName === 'activity') {
+            document.getElementById('activity-section').classList.remove('hidden');
+            loadActivity();
+            toggleActivityAutoRefresh();
         } else if (tabName === 'settings') {
             document.getElementById('settings-section').classList.remove('hidden');
             loadSettings();
@@ -716,6 +786,129 @@
             customRange.classList.add('hidden');
         }
         loadUsage();
+    }
+
+    function stopActivityAutoRefresh() {
+        if (activityAutoRefreshTimer) {
+            clearInterval(activityAutoRefreshTimer);
+            activityAutoRefreshTimer = null;
+        }
+    }
+
+    function toggleActivityAutoRefresh() {
+        stopActivityAutoRefresh();
+        const enabled = document.getElementById('activity-auto-refresh')?.checked;
+        if (currentTab === 'activity' && enabled) {
+            activityAutoRefreshTimer = setInterval(() => {
+                loadActivity();
+            }, 10000);
+        }
+    }
+
+    function loadActivityDebounced() {
+        if (activityDebounceTimer) {
+            clearTimeout(activityDebounceTimer);
+        }
+        activityDebounceTimer = setTimeout(() => {
+            loadActivity();
+        }, 300);
+    }
+
+    function loadActivity() {
+        const loading = document.getElementById('activity-loading');
+        const table = document.getElementById('activity-table');
+        const error = document.getElementById('activity-error');
+        if (!loading || !table || !error) return;
+
+        loading.style.display = 'block';
+        error.style.display = 'none';
+
+        const params = new URLSearchParams({
+            limit: (document.getElementById('activity-limit')?.value || '100'),
+            status: (document.getElementById('activity-status')?.value || ''),
+            model: (document.getElementById('activity-model')?.value || '').trim(),
+            ip: (document.getElementById('activity-ip')?.value || '').trim(),
+            path: (document.getElementById('activity-path')?.value || '').trim(),
+            include_health: document.getElementById('activity-include-health')?.checked ? 'true' : 'false'
+        });
+
+        fetch('/api/admin/endpoints/activity?' + params.toString(), { credentials: 'same-origin' })
+            .then(r => r.json())
+            .then(data => {
+                if (data.error) {
+                    throw new Error(data.error);
+                }
+                renderActivityTable(data.items || []);
+            })
+            .catch(err => {
+                error.textContent = 'Error: ' + err.message;
+                error.style.display = 'block';
+                table.innerHTML = '';
+            })
+            .finally(() => {
+                loading.style.display = 'none';
+            });
+    }
+
+    function renderActivityTable(items) {
+        const target = document.getElementById('activity-table');
+        if (!target) return;
+        if (!items.length) {
+            target.innerHTML = '<p class="empty">No activity in selected filters</p>';
+            return;
+        }
+
+        const esc = (v) => String(v || '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+        const fmtTs = (s) => {
+            const n = Number(s || 0) * 1000;
+            if (!n) return '-';
+            return new Date(n).toLocaleString();
+        };
+        const shortUa = (ua) => {
+            const t = String(ua || '').trim();
+            if (!t) return '-';
+            return t.length > 70 ? t.slice(0, 70) + '…' : t;
+        };
+
+        const rows = items.map(it => {
+            const status = it.status_code || 0;
+            const outcome = esc(it.outcome || 'other');
+            const statusColor = status >= 200 && status < 400 ? 'var(--accent-green)' : (status >= 500 ? 'var(--accent-red)' : 'var(--accent-yellow)');
+            const route = esc((it.method || 'GET') + ' ' + (it.path || ''));
+            const model = esc(it.virtual_model || it.actual_model || '-');
+            const src = esc(it.x_source || '-');
+            const ip = esc(it.client_ip || '-');
+            const ua = esc(shortUa(it.user_agent));
+            const latency = Number(it.response_time_ms || 0);
+            const latencyTxt = latency >= 1000 ? (latency / 1000).toFixed(1) + ' s' : latency + ' ms';
+            const err = esc(it.error_summary || '');
+            const streamBadge = it.stream ? '<span style="font-size:11px;color:var(--text-secondary);">stream</span>' : '';
+            return `
+                <tr>
+                    <td>${fmtTs(it.created_at)}</td>
+                    <td>${route}</td>
+                    <td>${model}</td>
+                    <td>${ip}</td>
+                    <td>${src}</td>
+                    <td title="${esc(it.user_agent || '')}">${ua}</td>
+                    <td><span style="color:${statusColor};font-weight:600;">${status}</span> <span style="font-size:11px;color:var(--text-secondary);">${outcome}</span> ${streamBadge}</td>
+                    <td>${latencyTxt}</td>
+                </tr>
+                ${err ? `<tr class="model-breakdown-row"><td colspan="8" style="font-size:12px;color:var(--text-secondary);">${err}</td></tr>` : ''}
+            `;
+        }).join('');
+
+        target.innerHTML = `
+            <table>
+                <thead><tr><th>Time</th><th>Route</th><th>Model</th><th>IP</th><th>Source</th><th>Client</th><th>Status</th><th>Latency</th></tr></thead>
+                <tbody>${rows}</tbody>
+            </table>
+        `;
     }
     
     // ==========================================
@@ -764,8 +957,9 @@
                 if (data.error) {
                     showUsageError(data.error);
                 } else {
-                    renderSummaryCards(data.summary);
-                    renderDailyBreakdown(data.daily_breakdown);
+                    const estimatedModels = new Set(data.estimated_models || []);
+                    renderSummaryCards(data.summary, estimatedModels.size > 0);
+                    renderDailyBreakdown(data.daily_breakdown, estimatedModels);
                 }
                 document.getElementById('usage-loading').style.display = 'none';
             })
@@ -776,20 +970,21 @@
             });
     }
     
-    function renderSummaryCards(summary) {
+    function renderSummaryCards(summary, hasEstimatedModels) {
+        const estimateMark = hasEstimatedModels ? '*' : '';
         const cardsHTML = `
             <div class="card" style="margin-top:0;padding:16px;">
                 <div style="color:var(--text-secondary);font-size:12px;text-transform:uppercase;">Total Requests</div>
                 <div style="font-size:28px;font-weight:bold;color:var(--accent);margin-top:8px;">${summary.request_count}</div>
             </div>
             <div class="card" style="margin-top:0;padding:16px;">
-                <div style="color:var(--text-secondary);font-size:12px;text-transform:uppercase;">Total Tokens</div>
+                <div style="color:var(--text-secondary);font-size:12px;text-transform:uppercase;">Total Tokens${estimateMark}</div>
                 <div style="font-size:28px;font-weight:bold;color:var(--accent-green);margin-top:8px;">${formatNumber(summary.total_tokens)}</div>
                 <div style="font-size:12px;margin-top:4px;">In: ${formatNumber(summary.total_prompt_tokens)} | Out: ${formatNumber(summary.total_completion_tokens)}</div>
                 <div style="font-size:11px;margin-top:4px;color:var(--text-secondary);">Cached: ${formatNumber(summary.total_cached_input_tokens || 0)}</div>
             </div>
             <div class="card" style="margin-top:0;padding:16px;">
-                <div style="color:var(--text-secondary);font-size:12px;text-transform:uppercase;">Total Cost</div>
+                <div style="color:var(--text-secondary);font-size:12px;text-transform:uppercase;">Total Cost${estimateMark}</div>
                 <div style="font-size:28px;font-weight:bold;color:var(--accent-yellow);margin-top:8px;">$${summary.total_cost.toFixed(4)}</div>
                 <div style="font-size:11px;margin-top:4px;color:var(--text-secondary);">Cached: $${(summary.total_cached_cost || 0).toFixed(4)}</div>
             </div>
@@ -801,7 +996,7 @@
         document.getElementById('summary-cards').innerHTML = cardsHTML;
     }
     
-    function renderDailyBreakdown(dailyData) {
+    function renderDailyBreakdown(dailyData, estimatedModels) {
         if (!dailyData.length) {
             document.getElementById('daily-breakdown').innerHTML = '<p class="empty">No data in selected date range</p>';
             return;
@@ -829,7 +1024,7 @@
 
             const modelRows = (day.models || []).map(model => `
                 <tr class="model-breakdown-row">
-                    <td class="model-name-cell">↳ ${esc(model.virtual_model)}</td>
+                    <td class="model-name-cell">↳ ${esc(model.virtual_model)}${estimatedModels.has(model.virtual_model) ? '*' : ''}</td>
                     <td>${formatNumber(model.prompt_tokens)}</td>
                     <td>${formatNumber(model.cached_input_tokens || 0)}</td>
                     <td>${formatNumber(model.completion_tokens)}</td>
@@ -841,12 +1036,17 @@
 
             return dayRow + modelRows;
         }).join('');
+
+        const estimateNote = estimatedModels.size
+            ? '<div style="margin-top:10px;font-size:12px;color:var(--text-secondary);">* OpenAI OAuth endpoint does not provide token counts, these are estimates only.</div>'
+            : '';
         
         document.getElementById('daily-breakdown').innerHTML = `
             <table>
                 <thead><tr><th>Date</th><th>Prompt Tokens</th><th>Cached</th><th>Completion</th><th>Cost</th><th>Cached Cost</th><th>Requests</th></tr></thead>
                 <tbody>${rows}</tbody>
             </table>
+            ${estimateNote}
         `;
     }
     
@@ -1218,9 +1418,9 @@
         document.getElementById('ep-oauth-grant-type').value = data ? (data.oauth_grant_type || 'refresh_token') : 'refresh_token';
         document.getElementById('ep-oauth-token-url').value = data ? (data.oauth_token_url || '') : '';
         document.getElementById('ep-oauth-client-id').value = data ? (data.oauth_client_id || '') : '';
-        document.getElementById('ep-oauth-client-secret').value = data ? (data.oauth_client_secret || '') : '';
+        document.getElementById('ep-oauth-client-secret').value = '';
         document.getElementById('ep-oauth-scope').value = data ? (data.oauth_scope || '') : '';
-        document.getElementById('ep-oauth-refresh-token').value = data ? (data.oauth_refresh_token || '') : '';
+        document.getElementById('ep-oauth-refresh-token').value = '';
         document.getElementById('ep-oauth-token-request-format').value = data ? (data.oauth_token_request_format || 'json') : 'json';
         document.getElementById('ep-oauth-client-auth-method').value = data ? (data.oauth_client_auth_method || 'client_secret_post') : 'client_secret_post';
         document.getElementById('ep-oauth-auth-file').value = '';

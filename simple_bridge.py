@@ -861,6 +861,32 @@ def init_database():
             )
         """)
 
+        # Recent activity table (operational metadata only)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS recent_activity (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at INTEGER NOT NULL,
+                request_id TEXT,
+                method TEXT NOT NULL,
+                path TEXT NOT NULL,
+                request_type TEXT NOT NULL,
+                virtual_model TEXT,
+                actual_model TEXT,
+                endpoint_name TEXT,
+                endpoint_id INTEGER,
+                endpoint_type TEXT,
+                client_ip TEXT,
+                forwarded_for TEXT,
+                x_source TEXT,
+                user_agent TEXT,
+                stream INTEGER DEFAULT 0,
+                status_code INTEGER,
+                outcome TEXT,
+                response_time_ms INTEGER DEFAULT 0,
+                error_summary TEXT
+            )
+        """)
+
         # Settings table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS settings (
@@ -1282,6 +1308,18 @@ def init_database():
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_embedding_usage_created_at ON embedding_usage(created_at)"
         )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_recent_activity_created_at ON recent_activity(created_at)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_recent_activity_status ON recent_activity(status_code)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_recent_activity_virtual_model ON recent_activity(virtual_model)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_recent_activity_client_ip ON recent_activity(client_ip)"
+        )
 
         # Migration: ensure nested tool_call XML pattern exists
         cursor.execute(
@@ -1546,6 +1584,91 @@ def log_chat_usage(virtual_model, endpoint_name, endpoint_id, usage, response_ti
         print(f"Error logging chat usage: {e}")
 
 
+def _approx_token_count(text: str) -> int:
+    """Rough token estimate when upstream usage is unavailable."""
+    if not text:
+        return 0
+    return max(1, (len(text) + 3) // 4)
+
+
+def _append_usage_text(parts: list[str], value: Any) -> None:
+    """Collect text-like payloads while skipping binary-heavy blocks."""
+    if value is None:
+        return
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return
+        if stripped.startswith("data:image/"):
+            parts.append("[image]")
+            return
+        if len(stripped) > 2000 and re.fullmatch(r"[A-Za-z0-9+/=\s]+", stripped):
+            parts.append("[binary]")
+            return
+        parts.append(stripped)
+        return
+    if isinstance(value, list):
+        for item in value:
+            _append_usage_text(parts, item)
+        return
+    if isinstance(value, dict):
+        ctype = str(value.get("type") or "").lower()
+        if ctype in ("text", "input_text", "output_text"):
+            _append_usage_text(parts, value.get("text"))
+            return
+        if ctype in ("image_url", "input_image"):
+            parts.append("[image]")
+            return
+        if "name" in value:
+            _append_usage_text(parts, value.get("name"))
+        if "arguments" in value:
+            _append_usage_text(parts, value.get("arguments"))
+        if "content" in value:
+            _append_usage_text(parts, value.get("content"))
+        return
+    parts.append(str(value))
+
+
+def _estimate_openai_oauth_usage(
+    messages: list[dict[str, Any]],
+    tools: Any,
+    full_content: str,
+    full_reasoning: str,
+    tool_calls: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Estimate usage for openai_oauth streams when upstream omits token counts."""
+    prompt_parts: list[str] = []
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role") or "").strip()
+        if role:
+            prompt_parts.append(role)
+        _append_usage_text(prompt_parts, msg.get("content"))
+        _append_usage_text(prompt_parts, msg.get("name"))
+        _append_usage_text(prompt_parts, msg.get("tool_calls"))
+
+    if tools:
+        _append_usage_text(prompt_parts, tools)
+
+    completion_parts: list[str] = []
+    _append_usage_text(completion_parts, full_content)
+    _append_usage_text(completion_parts, full_reasoning)
+    _append_usage_text(completion_parts, tool_calls)
+
+    prompt_tokens = _approx_token_count("\n".join(prompt_parts))
+    completion_tokens = _approx_token_count("\n".join(completion_parts))
+    total_tokens = prompt_tokens + completion_tokens
+
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "is_estimated": True,
+        "estimate_source": "openai_oauth",
+    }
+
+
 def log_completion_usage(
     virtual_model, endpoint_name, endpoint_id, usage, response_time_ms
 ):
@@ -1666,6 +1789,204 @@ def log_embedding_usage(
             conn.commit()
     except Exception as e:
         print(f"Error logging embedding usage: {e}")
+
+
+ACTIVITY_MAX_ROWS = int(os.getenv("ACTIVITY_MAX_ROWS", "10000"))
+ACTIVITY_MAX_AGE_DAYS = int(os.getenv("ACTIVITY_MAX_AGE_DAYS", "30"))
+
+
+def _resolve_activity_client_ip(request: Request) -> tuple[str, str]:
+    forwarded_for = (request.headers.get("x-forwarded-for") or "").strip()
+    client_ip = ""
+    if forwarded_for:
+        client_ip = (forwarded_for.split(",")[0] or "").strip()
+    if not client_ip:
+        client_ip = (getattr(getattr(request, "client", None), "host", "") or "").strip()
+    return (client_ip or "-"), forwarded_for
+
+
+def _normalize_activity_request_type(path: str) -> str:
+    p = (path or "").lower()
+    if "chat/completions" in p or p == "/api/chat":
+        return "chat"
+    if "embeddings" in p or p == "/api/embed":
+        return "embeddings"
+    if "completions" in p:
+        return "completions"
+    if p.endswith("/models") or "/models" in p:
+        return "models"
+    if p.startswith("/api/admin"):
+        return "admin"
+    return "other"
+
+
+def _normalize_activity_outcome(status_code: int) -> str:
+    if 200 <= int(status_code or 0) < 400:
+        return "success"
+    if status_code in (401, 403):
+        return "auth_error"
+    if 400 <= int(status_code or 0) < 500:
+        return "client_error"
+    if status_code in (502, 503, 504):
+        return "upstream_error"
+    if int(status_code or 0) >= 500:
+        return "server_error"
+    return "other"
+
+
+def _sanitize_activity_error_summary(msg: Any, max_len: int = 220) -> str:
+    if msg is None:
+        return ""
+    txt = str(msg).replace("\n", " ").replace("\r", " ").strip()
+    if len(txt) <= max_len:
+        return txt
+    return txt[: max_len - 1].rstrip() + "…"
+
+
+def _resolve_endpoint_name(endpoint_id: Any) -> str:
+    try:
+        eid = int(endpoint_id or 0)
+    except Exception:
+        eid = 0
+    if eid <= 0:
+        return ""
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM endpoints WHERE id = ?", (eid,))
+            row = cursor.fetchone()
+            return str(row[0] or "") if row else ""
+    except Exception:
+        return ""
+
+
+def log_recent_activity(
+    *,
+    request_id: str,
+    method: str,
+    path: str,
+    request_type: str,
+    virtual_model: str,
+    actual_model: str,
+    endpoint_name: str,
+    endpoint_id: Any,
+    endpoint_type: str,
+    client_ip: str,
+    forwarded_for: str,
+    x_source: str,
+    user_agent: str,
+    stream: bool,
+    status_code: int,
+    response_time_ms: int,
+    error_summary: str = "",
+) -> None:
+    try:
+        try:
+            eid = int(endpoint_id or 0) if endpoint_id is not None else None
+            if eid == 0:
+                eid = None
+        except Exception:
+            eid = None
+
+        endpoint_name_value = (endpoint_name or "").strip()
+        if not endpoint_name_value and eid:
+            endpoint_name_value = _resolve_endpoint_name(eid)
+
+        summary = _sanitize_activity_error_summary(error_summary)
+        status = int(status_code or 0)
+        outcome = _normalize_activity_outcome(status)
+
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO recent_activity (
+                    created_at, request_id, method, path, request_type,
+                    virtual_model, actual_model, endpoint_name, endpoint_id, endpoint_type,
+                    client_ip, forwarded_for, x_source, user_agent, stream,
+                    status_code, outcome, response_time_ms, error_summary
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(time.time()),
+                    (request_id or "")[:64],
+                    (method or "GET")[:10],
+                    (path or "")[:255],
+                    (request_type or "other")[:32],
+                    (virtual_model or "")[:128],
+                    (actual_model or "")[:128],
+                    endpoint_name_value[:128],
+                    eid,
+                    (endpoint_type or "")[:64],
+                    (client_ip or "-")[:128],
+                    (forwarded_for or "")[:255],
+                    (x_source or "")[:128],
+                    (user_agent or "")[:180],
+                    1 if stream else 0,
+                    status,
+                    outcome,
+                    int(response_time_ms or 0),
+                    summary,
+                ),
+            )
+
+            max_age_cutoff = int(time.time()) - max(1, ACTIVITY_MAX_AGE_DAYS) * 86400
+            cursor.execute(
+                "DELETE FROM recent_activity WHERE created_at < ?", (max_age_cutoff,)
+            )
+            cursor.execute(
+                """
+                DELETE FROM recent_activity
+                WHERE id NOT IN (
+                    SELECT id FROM recent_activity ORDER BY id DESC LIMIT ?
+                )
+                """,
+                (max(1000, ACTIVITY_MAX_ROWS),),
+            )
+            conn.commit()
+    except Exception as exc:
+        debug_log("warn", f"[ACTIVITY] failed to log activity: {exc}")
+
+
+def _build_activity_query(
+    *,
+    limit: int,
+    status_filter: str,
+    model_filter: str,
+    path_filter: str,
+    ip_filter: str,
+    since: int,
+    include_health: bool,
+) -> tuple[str, list[Any]]:
+    sql = """
+        SELECT id, created_at, request_id, method, path, request_type,
+               virtual_model, actual_model, endpoint_name, endpoint_id, endpoint_type,
+               client_ip, forwarded_for, x_source, user_agent, stream,
+               status_code, outcome, response_time_ms, error_summary
+        FROM recent_activity
+        WHERE 1=1
+    """
+    params: list[Any] = []
+    if since > 0:
+        sql += " AND created_at >= ?"
+        params.append(since)
+    if not include_health:
+        sql += " AND path != '/health'"
+    if status_filter:
+        sql += " AND outcome = ?"
+        params.append(status_filter)
+    if model_filter:
+        sql += " AND virtual_model LIKE ?"
+        params.append(f"%{model_filter}%")
+    if path_filter:
+        sql += " AND path LIKE ?"
+        params.append(f"%{path_filter}%")
+    if ip_filter:
+        sql += " AND client_ip LIKE ?"
+        params.append(f"%{ip_filter}%")
+    sql += " ORDER BY created_at DESC LIMIT ?"
+    params.append(max(1, min(500, limit)))
+    return sql, params
 
 
 KNOWN_TOOL_NAMES = frozenset(
@@ -2320,6 +2641,43 @@ def _apply_endpoint_defaults(data: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _preserve_endpoint_oauth_secrets_on_update(
+    endpoint_id: int, data: dict[str, Any]
+) -> dict[str, Any]:
+    """Keep stored OAuth secrets when update payload leaves them blank.
+
+    This prevents accidental secret/token erasure when editing endpoints from UI forms
+    that intentionally do not prefill sensitive fields.
+    """
+    out = dict(data or {})
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT oauth_client_secret, oauth_refresh_token FROM endpoints WHERE id = ?",
+                (endpoint_id,),
+            )
+            row = cursor.fetchone()
+    except Exception:
+        row = None
+
+    if not row:
+        return out
+
+    existing_client_secret = str(row[0] or "")
+    existing_refresh_token = str(row[1] or "")
+
+    incoming_client_secret = out.get("oauth_client_secret")
+    if incoming_client_secret is None or str(incoming_client_secret).strip() == "":
+        out["oauth_client_secret"] = existing_client_secret
+
+    incoming_refresh_token = out.get("oauth_refresh_token")
+    if incoming_refresh_token is None or str(incoming_refresh_token).strip() == "":
+        out["oauth_refresh_token"] = existing_refresh_token
+
+    return out
+
+
 _oauth_token_cache: dict[int, tuple[str, int]] = {}
 _oauth_refresh_locks: dict[int, asyncio.Lock] = {}
 
@@ -2440,7 +2798,30 @@ async def resolve_oauth_access_token_async(endpoint: dict[str, Any]) -> Optional
             return None
 
         if resp.status_code >= 400:
-            debug_log("warn", f"[OAUTH] token fetch rejected endpoint_id={endpoint_id} status={resp.status_code}")
+            err_code = ""
+            err_msg = ""
+            try:
+                err_obj = resp.json()
+                if isinstance(err_obj, dict):
+                    err = err_obj.get("error")
+                    if isinstance(err, dict):
+                        err_code = str(err.get("code") or "").strip()
+                        err_msg = str(err.get("message") or "").strip()
+                    elif isinstance(err, str):
+                        err_msg = err.strip()
+                    if not err_code:
+                        err_code = str(err_obj.get("code") or "").strip()
+                    if not err_msg:
+                        err_msg = str(err_obj.get("message") or "").strip()
+            except Exception:
+                pass
+            suffix = (
+                f" code={err_code} msg={err_msg[:180]}" if (err_code or err_msg) else ""
+            )
+            debug_log(
+                "warn",
+                f"[OAUTH] token fetch rejected endpoint_id={endpoint_id} status={resp.status_code}{suffix}",
+            )
             return None
 
         try:
@@ -2496,7 +2877,28 @@ def resolve_oauth_access_token_sync(endpoint: dict[str, Any]) -> Optional[str]:
         return None
 
     if resp.status_code >= 400:
-        debug_log("warn", f"[OAUTH] token fetch rejected endpoint_id={endpoint_id} status={resp.status_code}")
+        err_code = ""
+        err_msg = ""
+        try:
+            err_obj = resp.json()
+            if isinstance(err_obj, dict):
+                err = err_obj.get("error")
+                if isinstance(err, dict):
+                    err_code = str(err.get("code") or "").strip()
+                    err_msg = str(err.get("message") or "").strip()
+                elif isinstance(err, str):
+                    err_msg = err.strip()
+                if not err_code:
+                    err_code = str(err_obj.get("code") or "").strip()
+                if not err_msg:
+                    err_msg = str(err_obj.get("message") or "").strip()
+        except Exception:
+            pass
+        suffix = f" code={err_code} msg={err_msg[:180]}" if (err_code or err_msg) else ""
+        debug_log(
+            "warn",
+            f"[OAUTH] token fetch rejected endpoint_id={endpoint_id} status={resp.status_code}{suffix}",
+        )
         return None
 
     try:
@@ -3001,6 +3403,7 @@ def _openai_oauth_response_to_chat_completion(
 def _openai_oauth_sse_to_openai_chat_sse(sse_text: str, model_name: str) -> str:
     out_lines: list[str] = []
     saw_tool_call = False
+    oauth_usage: Optional[dict[str, Any]] = None
     oauth_tool_stats: dict[str, int] = {
         "events": 0,
         "tool_added": 0,
@@ -3075,6 +3478,27 @@ def _openai_oauth_sse_to_openai_chat_sse(sse_text: str, model_name: str) -> str:
         out_lines.append(f"data: {json.dumps(chunk)}\n")
         saw_tool_call = True
 
+    def _normalize_usage(u: Any) -> Optional[dict[str, int]]:
+        if not isinstance(u, dict):
+            return None
+        prompt_tokens = int(u.get("input_tokens") or u.get("prompt_tokens") or 0)
+        completion_tokens = int(
+            u.get("output_tokens") or u.get("completion_tokens") or 0
+        )
+        total_tokens = int(u.get("total_tokens") or (prompt_tokens + completion_tokens))
+        if prompt_tokens <= 0 and completion_tokens <= 0 and total_tokens <= 0:
+            return None
+        normalized = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+        }
+
+        prompt_details = u.get("prompt_tokens_details")
+        if isinstance(prompt_details, dict) and prompt_details:
+            normalized["prompt_tokens_details"] = prompt_details
+        return normalized
+
     for raw in (sse_text or "").splitlines():
         line = raw.strip()
         if not line.startswith("data:"):
@@ -3092,6 +3516,10 @@ def _openai_oauth_sse_to_openai_chat_sse(sse_text: str, model_name: str) -> str:
 
         oauth_tool_stats["events"] += 1
         evt_type = str(evt.get("type") or "").lower()
+        if oauth_usage is None:
+            oauth_usage = _normalize_usage(evt.get("usage"))
+        if oauth_usage is None:
+            oauth_usage = _normalize_usage((evt.get("response") or {}).get("usage"))
         delta_text = ""
         if evt_type in (
             "response.output_text.delta",
@@ -3250,13 +3678,15 @@ def _openai_oauth_sse_to_openai_chat_sse(sse_text: str, model_name: str) -> str:
                     {"index": 0, "delta": {}, "finish_reason": finish_reason}
                 ],
             }
+            if oauth_usage:
+                final_chunk["usage"] = oauth_usage
             out_lines.append(f"data: {json.dumps(final_chunk)}\n")
             out_lines.append("data: [DONE]\n")
 
     if oauth_tool_stats["events"] > 0:
         debug_log(
             "info",
-            f"[OAUTH_SSE] model={model_name} events={oauth_tool_stats['events']} tool_added={oauth_tool_stats['tool_added']} tool_arg_delta={oauth_tool_stats['tool_arg_delta']} tool_done={oauth_tool_stats['tool_done']} unknown_delta={oauth_tool_stats['tool_unknown_delta']}",
+            f"[OAUTH_SSE] model={model_name} events={oauth_tool_stats['events']} tool_added={oauth_tool_stats['tool_added']} tool_arg_delta={oauth_tool_stats['tool_arg_delta']} tool_done={oauth_tool_stats['tool_done']} unknown_delta={oauth_tool_stats['tool_unknown_delta']} usage={'yes' if oauth_usage else 'no'}",
         )
 
     if not out_lines:
@@ -4747,7 +5177,7 @@ async def chat_completions(request: Request):
             f"[BASE64_NORMALIZE:WARN] request_id={request_id} unparsed_inline_base64 blocks={inbound_audit.get('base64_text_blocks', 0)}",
             flush=True,
         )
-        return JSONResponse(
+        response = JSONResponse(
             status_code=400,
             content={
                 "error": {
@@ -4757,6 +5187,27 @@ async def chat_completions(request: Request):
                 }
             },
         )
+        v_client_ip, v_forwarded_for = _resolve_activity_client_ip(request)
+        log_recent_activity(
+            request_id=request_id,
+            method=request.method,
+            path=request.url.path,
+            request_type="chat",
+            virtual_model=model or "",
+            actual_model="",
+            endpoint_name="",
+            endpoint_id=None,
+            endpoint_type="",
+            client_ip=v_client_ip,
+            forwarded_for=v_forwarded_for,
+            x_source=(request.headers.get("x-source") or "serverless-proxy"),
+            user_agent=(request.headers.get("user-agent") or ""),
+            stream=bool(data.get("stream", False)),
+            status_code=400,
+            response_time_ms=int((time_module.time() - start_time) * 1000),
+            error_summary="invalid_image_payload",
+        )
+        return response
 
     temperature = data.get("temperature", 0.7)
     max_tokens = data.get("max_tokens", 256)
@@ -4768,6 +5219,7 @@ async def chat_completions(request: Request):
     accept_header = request.headers.get("accept", "")
     user_agent = request.headers.get("user-agent", "")
     incoming_source = request.headers.get("x-source", "serverless-proxy")
+    client_ip, forwarded_for = _resolve_activity_client_ip(request)
     debug_log(
         "info",
         f"[REQUEST] request_id={request_id} model={model} stream={stream} tools={len(tools)} ua={user_agent[:40]} x-source={incoming_source}",
@@ -4797,9 +5249,54 @@ async def chat_completions(request: Request):
     virtual_model = model
     backend = get_backend(model)
     if backend is None:
-        return model_not_found_response(model)
+        response = model_not_found_response(model)
+        log_recent_activity(
+            request_id=request_id,
+            method=request.method,
+            path=request.url.path,
+            request_type="chat",
+            virtual_model=model or "",
+            actual_model="",
+            endpoint_name="",
+            endpoint_id=None,
+            endpoint_type="",
+            client_ip=client_ip,
+            forwarded_for=forwarded_for,
+            x_source=incoming_source,
+            user_agent=user_agent,
+            stream=bool(stream),
+            status_code=404,
+            response_time_ms=int((time_module.time() - start_time) * 1000),
+            error_summary=f"model not found: {model}",
+        )
+        return response
     if hasattr(backend, "virtual_model_name"):
         virtual_model = backend.virtual_model_name
+
+    endpoint_id = getattr(backend, "endpoint_id", None)
+    endpoint_type = getattr(backend, "endpoint_type", "")
+    actual_model = getattr(backend, "model", model)
+
+    def _log_chat_activity(status_code: int, error_summary: str = "", stream_flag: Optional[bool] = None):
+        log_recent_activity(
+            request_id=request_id,
+            method=request.method,
+            path=request.url.path,
+            request_type="chat",
+            virtual_model=virtual_model or "",
+            actual_model=actual_model or "",
+            endpoint_name="",
+            endpoint_id=endpoint_id,
+            endpoint_type=endpoint_type or "",
+            client_ip=client_ip,
+            forwarded_for=forwarded_for,
+            x_source=incoming_source,
+            user_agent=user_agent,
+            stream=bool(stream if stream_flag is None else stream_flag),
+            status_code=int(status_code or 0),
+            response_time_ms=int((time_module.time() - start_time) * 1000),
+            error_summary=error_summary,
+        )
 
     # Additional OpenAI parameters (include request_id for correlation)
     extra_params = {
@@ -4857,7 +5354,13 @@ async def chat_completions(request: Request):
     )
 
     if error:
-        return JSONResponse(status_code=status_code, content=error)
+        response = JSONResponse(status_code=status_code, content=error)
+        _log_chat_activity(
+            int(status_code or 500),
+            (error.get("error") if isinstance(error, dict) else str(error)),
+            stream_flag=bool(stream),
+        )
+        return response
 
     # For RunPod backend, extract result from wrapper
     result = backend_result
@@ -5049,7 +5552,7 @@ async def chat_completions(request: Request):
 
         # If upstream returned an error in stream, return explicit error response
         if stream_error:
-            return JSONResponse(
+            response = JSONResponse(
                 status_code=400,
                 content={
                     "error": {
@@ -5058,6 +5561,8 @@ async def chat_completions(request: Request):
                     }
                 },
             )
+            _log_chat_activity(400, f"Upstream error: {stream_error}", stream_flag=True)
+            return response
 
         # Check for empty response anomaly
         content_chars = len(full_content)
@@ -5105,6 +5610,37 @@ async def chat_completions(request: Request):
             else:
                 text_content = full_reasoning
 
+        # OpenAI OAuth streams frequently omit usage tokens. Keep upstream values when present,
+        # and estimate only for OAuth when usage is missing.
+        is_openai_oauth_backend = (
+            hasattr(backend, "endpoint_type") and backend.endpoint_type == "openai_oauth"
+        )
+        if is_openai_oauth_backend:
+            prompt_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+            completion_tokens = int(
+                usage.get("completion_tokens") or usage.get("output_tokens") or 0
+            )
+            total_tokens = int(usage.get("total_tokens") or 0)
+            if total_tokens <= 0:
+                total_tokens = prompt_tokens + completion_tokens
+
+            if prompt_tokens <= 0 and completion_tokens <= 0 and total_tokens <= 0:
+                usage = _estimate_openai_oauth_usage(
+                    messages=messages,
+                    tools=tools,
+                    full_content=full_content,
+                    full_reasoning=full_reasoning,
+                    tool_calls=extracted_tc or [],
+                )
+                debug_log(
+                    "info",
+                    f"[OAUTH_USAGE_ESTIMATE] request_id={request_id} model={model} prompt={usage.get('prompt_tokens', 0)} completion={usage.get('completion_tokens', 0)} total={usage.get('total_tokens', 0)}",
+                )
+            else:
+                usage["prompt_tokens"] = prompt_tokens
+                usage["completion_tokens"] = completion_tokens
+                usage["total_tokens"] = total_tokens
+
         # Generate proper SSE with extracted tool calls
         job_id = f"chat-{int(time_module.time())}"
 
@@ -5121,7 +5657,7 @@ async def chat_completions(request: Request):
             ):
                 yield chunk_data
 
-        return StreamingResponse(
+        response = StreamingResponse(
             stream_generator(),
             media_type="text/event-stream",
             headers={
@@ -5129,6 +5665,8 @@ async def chat_completions(request: Request):
                 "Connection": "keep-alive",
             },
         )
+        _log_chat_activity(200, "", stream_flag=True)
+        return response
 
     # Extract content from response
     content = ""
@@ -5192,7 +5730,7 @@ async def chat_completions(request: Request):
 
     # Handle streaming response - use stream (actual value used) not original_stream
     if stream:
-        return StreamingResponse(
+        response = StreamingResponse(
             _generate_sse(
                 job_id=job_id,
                 model=model,
@@ -5206,6 +5744,8 @@ async def chat_completions(request: Request):
                 "Connection": "keep-alive",
             },
         )
+        _log_chat_activity(200, "", stream_flag=True)
+        return response
 
     # Non-streaming response
     response_content = {
@@ -5342,7 +5882,9 @@ async def chat_completions(request: Request):
             }
         )
 
-    return JSONResponse(content=response_content)
+    response = JSONResponse(content=response_content)
+    _log_chat_activity(200, "", stream_flag=False)
+    return response
 
 
 @app.post("/chat/completions")
@@ -5511,6 +6053,52 @@ async def health_check():
 # ==================================================================================
 
 
+@app.get("/api/admin/activity")
+async def get_activity_feed(request: Request):
+    """Get recent request activity feed for admin dashboard."""
+    auth = validate_session_fastapi(request)
+    if not auth.get("valid"):
+        return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+
+    qp = request.query_params
+    try:
+        limit = int(qp.get("limit", "100") or 100)
+    except Exception:
+        limit = 100
+    status_filter = str(qp.get("status", "") or "").strip().lower()
+    model_filter = str(qp.get("model", "") or "").strip()
+    path_filter = str(qp.get("path", "") or "").strip()
+    ip_filter = str(qp.get("ip", "") or "").strip()
+    try:
+        since = int(qp.get("since", "0") or 0)
+    except Exception:
+        since = 0
+    include_health = str(qp.get("include_health", "false") or "false").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+    try:
+        sql, params = _build_activity_query(
+            limit=limit,
+            status_filter=status_filter,
+            model_filter=model_filter,
+            path_filter=path_filter,
+            ip_filter=ip_filter,
+            since=since,
+            include_health=include_health,
+        )
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(sql, params)
+            rows = [dict(row) for row in cursor.fetchall()]
+        return JSONResponse(content={"items": rows, "count": len(rows)})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
 @app.get("/api/admin/usage")
 async def get_usage_summary(request: Request):
     """Get usage summary with date filtering."""
@@ -5639,6 +6227,24 @@ async def get_usage_summary(request: Request):
                     }
                 )
 
+            estimated_models_query = """
+                SELECT DISTINCT ru.virtual_model
+                FROM request_usage ru
+                JOIN virtual_models vm ON vm.name = ru.virtual_model
+                JOIN endpoints e ON e.id = vm.endpoint_id
+                WHERE ru.created_at >= ? AND ru.created_at <= ?
+                  AND e.endpoint_type = 'openai_oauth'
+            """
+            estimated_params = [start_date, end_date]
+            if virtual_model:
+                estimated_models_query += " AND ru.virtual_model = ?"
+                estimated_params.append(virtual_model)
+            estimated_models_query += " ORDER BY ru.virtual_model"
+            cursor.execute(estimated_models_query, estimated_params)
+            estimated_models = [
+                r[0] for r in cursor.fetchall() if r and isinstance(r[0], str) and r[0].strip()
+            ]
+
             return JSONResponse(
                 content={
                     "summary": {
@@ -5653,6 +6259,7 @@ async def get_usage_summary(request: Request):
                         "avg_response_time_ms": round(summary[8] or 0, 2),
                     },
                     "daily_breakdown": daily_breakdown,
+                    "estimated_models": estimated_models,
                 }
             )
     except Exception as e:
@@ -6259,7 +6866,12 @@ async def anthropic_messages(request: Request):
 
 
 @app.get("/v1/models")
-async def list_models():
+async def list_models(request: Request):
+    started_at = time_module.time()
+    client_ip, forwarded_for = _resolve_activity_client_ip(request)
+    x_source = (request.headers.get("x-source") or "").strip()
+    user_agent = (request.headers.get("user-agent") or "").strip()
+
     virtual_models = get_enabled_virtual_models()
 
     # Build response with virtual models only
@@ -6276,25 +6888,46 @@ async def list_models():
             }
         )
 
-    return {
+    response = {
         "object": "list",
         "data": models,
     }
 
+    log_recent_activity(
+        request_id="",
+        method=request.method,
+        path=request.url.path,
+        request_type="models",
+        virtual_model="",
+        actual_model="",
+        endpoint_name="",
+        endpoint_id=None,
+        endpoint_type="",
+        client_ip=client_ip,
+        forwarded_for=forwarded_for,
+        x_source=x_source,
+        user_agent=user_agent,
+        stream=False,
+        status_code=200,
+        response_time_ms=int((time_module.time() - started_at) * 1000),
+        error_summary="",
+    )
+    return response
+
 
 @app.get("/models")
-async def list_models_alias():
-    return await list_models()
+async def list_models_alias(request: Request):
+    return await list_models(request)
 
 
 @app.get("/api/models")
-async def list_models_api_alias():
-    return await list_models()
+async def list_models_api_alias(request: Request):
+    return await list_models(request)
 
 
 @app.get("/api/v1/models")
-async def list_models_api_v1_alias():
-    return await list_models()
+async def list_models_api_v1_alias(request: Request):
+    return await list_models(request)
 
 
 @app.get("/api/version")
@@ -6609,6 +7242,9 @@ async def completions(request: Request):
     Many tools still use this for text-only completions.
     """
     start_time = time_module.time()
+    client_ip, forwarded_for = _resolve_activity_client_ip(request)
+    x_source = (request.headers.get("x-source") or "").strip()
+    user_agent = (request.headers.get("user-agent") or "").strip()
     data = await request.json()
 
     prompt = data.get("prompt", "")
@@ -6625,7 +7261,32 @@ async def completions(request: Request):
     # Get backend for this model
     backend = get_backend(model)
     if backend is None:
-        return model_not_found_response(model)
+        response = model_not_found_response(model)
+        log_recent_activity(
+            request_id="",
+            method=request.method,
+            path=request.url.path,
+            request_type="completions",
+            virtual_model=model or "",
+            actual_model="",
+            endpoint_name="",
+            endpoint_id=None,
+            endpoint_type="",
+            client_ip=client_ip,
+            forwarded_for=forwarded_for,
+            x_source=x_source,
+            user_agent=user_agent,
+            stream=bool(stream),
+            status_code=404,
+            response_time_ms=int((time_module.time() - start_time) * 1000),
+            error_summary=f"model not found: {model}",
+        )
+        return response
+
+    virtual_model = getattr(backend, "virtual_model_name", model)
+    actual_model = getattr(backend, "model", model)
+    endpoint_id = getattr(backend, "endpoint_id", None)
+    endpoint_type = getattr(backend, "endpoint_type", "")
 
     # Call backend
     backend_result, error, status_code = await backend.chat_completion(
@@ -6639,7 +7300,27 @@ async def completions(request: Request):
     )
 
     if error:
-        return JSONResponse(status_code=status_code, content=error)
+        response = JSONResponse(status_code=status_code, content=error)
+        log_recent_activity(
+            request_id="",
+            method=request.method,
+            path=request.url.path,
+            request_type="completions",
+            virtual_model=virtual_model or "",
+            actual_model=actual_model or "",
+            endpoint_name="",
+            endpoint_id=endpoint_id,
+            endpoint_type=endpoint_type or "",
+            client_ip=client_ip,
+            forwarded_for=forwarded_for,
+            x_source=x_source,
+            user_agent=user_agent,
+            stream=bool(stream),
+            status_code=int(status_code or 500),
+            response_time_ms=int((time_module.time() - start_time) * 1000),
+            error_summary=(error.get("error") if isinstance(error, dict) else str(error)),
+        )
+        return response
 
     # Extract result
     result = backend_result
@@ -6663,17 +7344,37 @@ async def completions(request: Request):
                 yield f"data: {json.dumps({'id': job_id, 'choices': [{'text': content, 'index': 0}], 'model': model})}\n\n"
             yield "data: [DONE]\n\n"
 
-        return StreamingResponse(
+        response = StreamingResponse(
             generate_sse(),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
+        log_recent_activity(
+            request_id=str(job_id),
+            method=request.method,
+            path=request.url.path,
+            request_type="completions",
+            virtual_model=virtual_model or "",
+            actual_model=actual_model or "",
+            endpoint_name="",
+            endpoint_id=endpoint_id,
+            endpoint_type=endpoint_type or "",
+            client_ip=client_ip,
+            forwarded_for=forwarded_for,
+            x_source=x_source,
+            user_agent=user_agent,
+            stream=True,
+            status_code=200,
+            response_time_ms=int((time_module.time() - start_time) * 1000),
+            error_summary="",
+        )
+        return response
 
     # Log usage
     response_time_ms = int((time_module.time() - start_time) * 1000)
     log_completion_usage(model, None, None, usage, response_time_ms)
 
-    return JSONResponse(
+    response = JSONResponse(
         content={
             "id": job_id,
             "object": "text_completion",
@@ -6689,6 +7390,26 @@ async def completions(request: Request):
             "usage": usage,
         }
     )
+    log_recent_activity(
+        request_id=str(job_id),
+        method=request.method,
+        path=request.url.path,
+        request_type="completions",
+        virtual_model=virtual_model or "",
+        actual_model=actual_model or "",
+        endpoint_name="",
+        endpoint_id=endpoint_id,
+        endpoint_type=endpoint_type or "",
+        client_ip=client_ip,
+        forwarded_for=forwarded_for,
+        x_source=x_source,
+        user_agent=user_agent,
+        stream=False,
+        status_code=200,
+        response_time_ms=int((time_module.time() - start_time) * 1000),
+        error_summary="",
+    )
+    return response
 
 
 @app.post("/v1/embeddings")
@@ -6698,6 +7419,9 @@ async def embeddings(request: Request):
     Routes to backend if supported, otherwise returns error.
     """
     start_time = time_module.time()
+    client_ip, forwarded_for = _resolve_activity_client_ip(request)
+    x_source = (request.headers.get("x-source") or "").strip()
+    user_agent = (request.headers.get("user-agent") or "").strip()
     data = await request.json()
 
     input_text = data.get("input", "")
@@ -6706,7 +7430,32 @@ async def embeddings(request: Request):
     # Get backend for this model (checks virtual models first)
     backend = get_backend(model)
     if backend is None:
-        return model_not_found_response(model)
+        response = model_not_found_response(model)
+        log_recent_activity(
+            request_id="",
+            method=request.method,
+            path=request.url.path,
+            request_type="embeddings",
+            virtual_model=model or "",
+            actual_model="",
+            endpoint_name="",
+            endpoint_id=None,
+            endpoint_type="",
+            client_ip=client_ip,
+            forwarded_for=forwarded_for,
+            x_source=x_source,
+            user_agent=user_agent,
+            stream=False,
+            status_code=404,
+            response_time_ms=int((time_module.time() - start_time) * 1000),
+            error_summary=f"model not found: {model}",
+        )
+        return response
+
+    virtual_model = getattr(backend, "virtual_model_name", model)
+    actual_model = getattr(backend, "model", model)
+    endpoint_id = getattr(backend, "endpoint_id", None)
+    endpoint_type = getattr(backend, "endpoint_type", "")
 
     # Check if backend supports embeddings
     if hasattr(backend, "embeddings"):
@@ -6714,7 +7463,27 @@ async def embeddings(request: Request):
             input_text=input_text, model=model
         )
         if error:
-            return JSONResponse(status_code=status_code, content=error)
+            response = JSONResponse(status_code=status_code, content=error)
+            log_recent_activity(
+                request_id="",
+                method=request.method,
+                path=request.url.path,
+                request_type="embeddings",
+                virtual_model=virtual_model or "",
+                actual_model=actual_model or "",
+                endpoint_name="",
+                endpoint_id=endpoint_id,
+                endpoint_type=endpoint_type or "",
+                client_ip=client_ip,
+                forwarded_for=forwarded_for,
+                x_source=x_source,
+                user_agent=user_agent,
+                stream=False,
+                status_code=int(status_code or 500),
+                response_time_ms=int((time_module.time() - start_time) * 1000),
+                error_summary=(error.get("error") if isinstance(error, dict) else str(error)),
+            )
+            return response
 
         # Log usage if backend returns token info
         response_time_ms = int((time_module.time() - start_time) * 1000)
@@ -6734,10 +7503,30 @@ async def embeddings(request: Request):
         except:
             pass  # Embeddings might not return token usage
 
-        return JSONResponse(content=result)
+        response = JSONResponse(content=result)
+        log_recent_activity(
+            request_id="",
+            method=request.method,
+            path=request.url.path,
+            request_type="embeddings",
+            virtual_model=virtual_model or "",
+            actual_model=actual_model or "",
+            endpoint_name="",
+            endpoint_id=endpoint_id,
+            endpoint_type=endpoint_type or "",
+            client_ip=client_ip,
+            forwarded_for=forwarded_for,
+            x_source=x_source,
+            user_agent=user_agent,
+            stream=False,
+            status_code=200,
+            response_time_ms=int((time_module.time() - start_time) * 1000),
+            error_summary="",
+        )
+        return response
 
     # Embeddings not supported - return error with OpenAI format
-    return JSONResponse(
+    response = JSONResponse(
         status_code=501,
         content={
             "error": {
@@ -6747,6 +7536,26 @@ async def embeddings(request: Request):
             }
         },
     )
+    log_recent_activity(
+        request_id="",
+        method=request.method,
+        path=request.url.path,
+        request_type="embeddings",
+        virtual_model=virtual_model or "",
+        actual_model=actual_model or "",
+        endpoint_name="",
+        endpoint_id=endpoint_id,
+        endpoint_type=endpoint_type or "",
+        client_ip=client_ip,
+        forwarded_for=forwarded_for,
+        x_source=x_source,
+        user_agent=user_agent,
+        stream=False,
+        status_code=501,
+        response_time_ms=int((time_module.time() - start_time) * 1000),
+        error_summary="Embeddings not supported by current backend",
+    )
+    return response
 
 
 @app.post("/embeddings")
@@ -6944,6 +7753,7 @@ def update_endpoint(endpoint_id):
         return flask_jsonify({"error": "Unauthorized"}), 401
 
     data = _apply_endpoint_defaults(flask_request.get_json() or {})
+    data = _preserve_endpoint_oauth_secrets_on_update(endpoint_id, data)
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -7332,6 +8142,52 @@ def api_admin_endpoints():
     return flask_jsonify(endpoints)
 
 
+@flask_app.route("/api/admin/activity", methods=["GET"])
+@flask_app.route("/api/admin/endpoints/activity", methods=["GET"])
+def api_admin_activity():
+    """API: recent request activity feed."""
+    auth = validate_session()
+    if not auth.get("valid"):
+        return flask_jsonify({"error": "Unauthorized"}), 401
+
+    try:
+        limit = int((flask_request.args.get("limit") or "100").strip() or 100)
+    except Exception:
+        limit = 100
+    status_filter = (flask_request.args.get("status") or "").strip().lower()
+    model_filter = (flask_request.args.get("model") or "").strip()
+    path_filter = (flask_request.args.get("path") or "").strip()
+    ip_filter = (flask_request.args.get("ip") or "").strip()
+    try:
+        since = int((flask_request.args.get("since") or "0").strip() or 0)
+    except Exception:
+        since = 0
+    include_health = (flask_request.args.get("include_health") or "false").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+    try:
+        sql, params = _build_activity_query(
+            limit=limit,
+            status_filter=status_filter,
+            model_filter=model_filter,
+            path_filter=path_filter,
+            ip_filter=ip_filter,
+            since=since,
+            include_health=include_health,
+        )
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(sql, params)
+            rows = [dict(row) for row in cursor.fetchall()]
+        return flask_jsonify({"items": rows, "count": len(rows)})
+    except Exception as e:
+        return flask_jsonify({"error": str(e)}), 500
+
+
 @flask_app.route("/api/admin/endpoints", methods=["POST"])
 def api_admin_endpoints_create():
     """API: Create new endpoint."""
@@ -7343,6 +8199,7 @@ def api_admin_endpoints_create():
     if not data:
         return flask_jsonify({"error": "No data provided"}), 400
     data = _apply_endpoint_defaults(data)
+    data = _preserve_endpoint_oauth_secrets_on_update(endpoint_id, data)
 
     try:
         with get_db() as conn:
