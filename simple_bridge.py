@@ -2299,7 +2299,7 @@ def _oauth_defaults_for_endpoint_type(endpoint_type: str) -> dict[str, Any]:
     et = (endpoint_type or "").lower()
     if et == "openai_oauth":
         return {
-            "url": "https://api.openai.com",
+            "url": "https://chatgpt.com",
             "oauth_enabled": 1,
             "oauth_grant_type": "refresh_token",
             "oauth_token_url": "https://auth.openai.com/oauth/token",
@@ -2718,6 +2718,210 @@ def _resolve_oauth_callback_base() -> str:
     return f"{scheme}://{host}"
 
 
+def _extract_text_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                if item:
+                    parts.append(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type") or "").lower()
+            if item_type in ("text", "input_text", "output_text"):
+                text_val = item.get("text")
+                if isinstance(text_val, str) and text_val:
+                    parts.append(text_val)
+            elif item_type == "image_url":
+                parts.append("[image]")
+            elif item_type in ("input_image", "image"):
+                parts.append("[image]")
+        return "\n".join([p for p in parts if p])
+    if content is None:
+        return ""
+    return str(content)
+
+
+def _resolve_openai_oauth_response_endpoint(base_url: str) -> str:
+    base = (base_url or "").strip().rstrip("/")
+    if not base:
+        return "https://chatgpt.com/backend-api/codex/responses"
+    if "/backend-api/codex/responses" in base:
+        return base
+    return f"{base}/backend-api/codex/responses"
+
+
+def _openai_chat_to_openai_oauth_payload(
+    messages: list,
+    model: str,
+    stream: bool,
+    temperature: Optional[float],
+    max_tokens: Optional[int],
+    top_p: Optional[float],
+) -> dict[str, Any]:
+    system_parts: list[str] = []
+    input_items: list[dict[str, Any]] = []
+
+    for msg in messages or []:
+        role = str(msg.get("role") or "user").lower()
+        text = _extract_text_content(msg.get("content"))
+        if role == "system":
+            if text:
+                system_parts.append(text)
+            continue
+
+        if role not in ("user", "assistant", "tool"):
+            role = "user"
+        if role == "tool":
+            role = "user"
+        input_items.append({"role": role, "content": text})
+
+    if not input_items:
+        input_items = [{"role": "user", "content": ""}]
+
+    payload: dict[str, Any] = {
+        "model": model,
+        "store": False,
+        "stream": bool(stream),
+        "input": input_items,
+    }
+    if system_parts:
+        payload["instructions"] = "\n\n".join(system_parts)
+    if max_tokens is not None:
+        payload["max_output_tokens"] = max_tokens
+    if temperature is not None:
+        payload["temperature"] = temperature
+    if top_p is not None:
+        payload["top_p"] = top_p
+    return payload
+
+
+def _openai_oauth_response_to_chat_completion(
+    response_obj: dict[str, Any], model_name: str
+) -> dict[str, Any]:
+    if "choices" in response_obj:
+        return response_obj
+
+    output_text = str(response_obj.get("output_text") or "")
+    if not output_text:
+        output_items = response_obj.get("output") or []
+        if isinstance(output_items, list):
+            collected: list[str] = []
+            for item in output_items:
+                if not isinstance(item, dict):
+                    continue
+                content_blocks = item.get("content") or []
+                if not isinstance(content_blocks, list):
+                    continue
+                for block in content_blocks:
+                    if not isinstance(block, dict):
+                        continue
+                    block_type = str(block.get("type") or "").lower()
+                    if block_type in ("output_text", "text", "input_text"):
+                        txt = block.get("text")
+                        if isinstance(txt, str) and txt:
+                            collected.append(txt)
+            output_text = "".join(collected)
+
+    usage = response_obj.get("usage") or {}
+    prompt_tokens = int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
+    completion_tokens = int(
+        usage.get("output_tokens") or usage.get("completion_tokens") or 0
+    )
+    total_tokens = int(
+        usage.get("total_tokens") or (prompt_tokens + completion_tokens)
+    )
+
+    return {
+        "id": response_obj.get("id") or f"chatcmpl_{int(time.time() * 1000)}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model_name,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": output_text},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+        },
+    }
+
+
+def _openai_oauth_sse_to_openai_chat_sse(sse_text: str, model_name: str) -> str:
+    out_lines: list[str] = []
+    for raw in (sse_text or "").splitlines():
+        line = raw.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if not payload:
+            continue
+        if payload == "[DONE]":
+            out_lines.append("data: [DONE]\n")
+            continue
+        try:
+            evt = json.loads(payload)
+        except Exception:
+            continue
+
+        evt_type = str(evt.get("type") or "").lower()
+        delta_text = ""
+        if evt_type in (
+            "response.output_text.delta",
+            "response.output.delta",
+            "output_text.delta",
+        ):
+            delta_text = str(evt.get("delta") or evt.get("text") or "")
+        elif evt_type in (
+            "response.output_item.added",
+            "response.output_text.added",
+        ):
+            item = evt.get("item") or {}
+            if isinstance(item, dict):
+                delta_text = str(item.get("text") or "")
+
+        if delta_text:
+            chunk = {
+                "id": evt.get("response_id") or f"chatcmpl_{int(time.time() * 1000)}",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model_name,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": delta_text},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+            out_lines.append(f"data: {json.dumps(chunk)}\n")
+
+        if evt_type in ("response.completed", "response.done", "completed"):
+            final_chunk = {
+                "id": evt.get("response_id") or f"chatcmpl_{int(time.time() * 1000)}",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model_name,
+                "choices": [
+                    {"index": 0, "delta": {}, "finish_reason": "stop"}
+                ],
+            }
+            out_lines.append(f"data: {json.dumps(final_chunk)}\n")
+            out_lines.append("data: [DONE]\n")
+
+    if not out_lines:
+        return sse_text
+    return "\n".join(out_lines)
+
+
 def _extract_code_and_state_from_redirect_input(raw: str) -> tuple[str, str, str]:
     text = (raw or "").strip()
     if not text:
@@ -2964,6 +3168,16 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
             }
             ollama_openai_payload = None
 
+            if self.endpoint_type == "openai_oauth":
+                payload = _openai_chat_to_openai_oauth_payload(
+                    messages=messages,
+                    model=self.model,
+                    stream=stream,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    top_p=top_p,
+                )
+
             if self.endpoint_type == "ollama":
                 ollama_openai_payload = {
                     "model": self.model,
@@ -3078,6 +3292,8 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
 
             if self.endpoint_type != "ollama":
                 for k, v in kwargs.items():
+                    if self.endpoint_type == "openai_oauth":
+                        continue
                     if v is not None and k not in [
                         "stop",
                         "presence_penalty",
@@ -3096,7 +3312,10 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
                 endpoint = f"https://api.runpod.ai/v2/{endpoint_id}/runsync"
                 payload = {"input": payload}
             elif self.endpoint_type in ("openai", "openai_oauth"):
-                endpoint = f"{self.url}/v1/chat/completions"
+                if self.endpoint_type == "openai_oauth":
+                    endpoint = _resolve_openai_oauth_response_endpoint(self.url)
+                else:
+                    endpoint = f"{self.url}/v1/chat/completions"
             elif self.endpoint_type == "openwebui":
                 endpoint = f"{self.url}/api/chat/completions"
             elif self.endpoint_type == "together":
@@ -3200,12 +3419,21 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
                                 response.text, self.model
                             )
                             return {"_stream_data": sse_data}, None, 200
+                        if self.endpoint_type == "openai_oauth":
+                            sse_data = _openai_oauth_sse_to_openai_chat_sse(
+                                response.text, self.model
+                            )
+                            return {"_stream_data": sse_data}, None, 200
                         debug_log(
                             "info",
                             f"[VM_BACKEND_RESP] request_id={request_id} status={response.status_code} len={len(response.text)} stream=true",
                         )
                         return {"_stream_data": response.text}, None, 200
                     result = response.json()
+                    if self.endpoint_type == "openai_oauth":
+                        result = _openai_oauth_response_to_chat_completion(
+                            result, self.model
+                        )
                     if self.endpoint_type == "ollama" and used_ollama_api_chat:
                         result = _ollama_nonstream_to_openai(result, self.model)
                     # Debug: log response details
@@ -5346,6 +5574,16 @@ async def anthropic_messages(request: Request):
     if tools:
         chat_data["tools"] = tools
 
+    if hasattr(backend, "endpoint_type") and backend.endpoint_type == "openai_oauth":
+        chat_data = _openai_chat_to_openai_oauth_payload(
+            messages=converted_messages,
+            model=actual_model,
+            stream=stream,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+        )
+
     # Check for streaming
     if stream:
         # Handle streaming - similar to chat_completions but return SSE
@@ -5383,6 +5621,8 @@ async def anthropic_messages(request: Request):
         if hasattr(backend, "endpoint_type"):
             if backend.endpoint_type == "deepinfra":
                 endpoint = f"{endpoint}/v1/openai/chat/completions"
+            elif backend.endpoint_type == "openai_oauth":
+                endpoint = _resolve_openai_oauth_response_endpoint(endpoint)
             elif backend.endpoint_type == "openwebui":
                 endpoint = f"{endpoint}/api/chat/completions"
             elif backend.endpoint_type == "queue":
@@ -5412,9 +5652,14 @@ async def anthropic_messages(request: Request):
                                 continue
                             try:
                                 chunk = json_module.loads(data_str)
-                                delta = chunk.get("choices", [{}])[0].get("delta", {})
-                                content = delta.get("content")
-                                finish = delta.get("finish_reason")
+                                content = ""
+                                if hasattr(backend, "endpoint_type") and backend.endpoint_type == "openai_oauth":
+                                    evt_type = str(chunk.get("type") or "").lower()
+                                    if evt_type in ("response.output_text.delta", "response.output.delta", "output_text.delta"):
+                                        content = str(chunk.get("delta") or chunk.get("text") or "")
+                                else:
+                                    delta = chunk.get("choices", [{}])[0].get("delta", {})
+                                    content = delta.get("content")
 
                                 if content:
                                     if not sent_message_start:
@@ -6276,6 +6521,23 @@ def test_endpoint(endpoint_id):
         if auth_header:
             headers["Authorization"] = auth_header
 
+        endpoint_type = (endpoint.get("endpoint_type") or "").lower()
+        if endpoint_type == "openai_oauth":
+            check_paths = ["/backend-api/models", "/backend-api/codex/responses", "/health"]
+            statuses = []
+            for path in check_paths:
+                resp = httpx.get(f"{endpoint['url']}{path}", headers=headers, timeout=10)
+                statuses.append(f"{path}:{resp.status_code}")
+                if resp.status_code in (200, 401, 403):
+                    return flask_jsonify(
+                        {
+                            "status": "ok",
+                            "endpoint_status": resp.status_code,
+                            "checks": statuses,
+                        }
+                    )
+            return flask_jsonify({"error": "OAuth endpoint health check failed", "checks": statuses}), 502
+
         resp = httpx.get(f"{endpoint['url']}/health", headers=headers, timeout=10)
         return flask_jsonify({"status": "ok", "endpoint_status": resp.status_code})
     except Exception as e:
@@ -6307,6 +6569,15 @@ def fetch_endpoint_models(endpoint_id):
         endpoint_type = (endpoint.get("endpoint_type") or "").lower()
         if endpoint_type == "openwebui":
             model_paths = ["/api/models", "/api/v1/models", "/v1/models", "/models"]
+        elif endpoint_type == "openai_oauth":
+            model_paths = [
+                "/backend-api/models",
+                "/backend-api/codex/models",
+                "/v1/models",
+                "/models",
+                "/api/models",
+                "/api/v1/models",
+            ]
         elif endpoint_type == "ollama":
             model_paths = ["/api/tags", "/v1/models", "/models", "/api/models"]
         else:

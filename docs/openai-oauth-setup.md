@@ -44,7 +44,7 @@ Common values you will map into Serverless Proxy:
    - Copy the redirected URL (or just the `code` value)
    - Paste it into **Paste Redirect URL or Auth Code** and click **Complete Web OAuth**
 5. Keep or verify defaults:
-   - URL: `https://api.openai.com`
+   - URL: `https://chatgpt.com`
    - OAuth enabled: `true`
    - Grant type: `refresh_token`
    - Token URL: `https://auth.openai.com/oauth/token`
@@ -56,8 +56,10 @@ Common values you will map into Serverless Proxy:
    - `oauth_client_secret` (if required by your token source)
    - `oauth_scope` (optional)
 7. Save endpoint
-8. Use **Fetch Models** on that endpoint to validate token exchange
+8. Use **Fetch Models** on that endpoint if available for your token scope
 9. Map a virtual model to this endpoint and test with `POST /v1/chat/completions`
+
+By default, `openai_oauth` forwards upstream to `POST /backend-api/codex/responses` and translates OpenAI Chat Completions payloads to the expected OAuth backend format.
 
 ## About web authorization from the dashboard
 

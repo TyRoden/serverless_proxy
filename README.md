@@ -293,7 +293,7 @@ Use `openai_oauth` when your provider requires OAuth instead of a static API key
 
 When selected in the dashboard, the form auto-fills OpenAI-compatible defaults:
 
-- `url`: `https://api.openai.com`
+- `url`: `https://chatgpt.com`
 - `oauth_enabled`: `true`
 - `oauth_grant_type`: `refresh_token`
 - `oauth_token_url`: `https://auth.openai.com/oauth/token`
@@ -332,13 +332,15 @@ For an endpoint, the proxy resolves auth in this order:
 - `oauth_token_expires_at` metadata is persisted
 - Behavior survives container restarts because durable OAuth state is stored in the DB
 
-#### OpenAI-compatible routing behavior
+#### OpenAI OAuth routing behavior
 
-`openai_oauth` uses OpenAI-compatible upstream paths:
+`openai_oauth` is routed to the Codex/ChatGPT-style endpoint and payload by default:
 
-- `POST /v1/chat/completions`
-- `GET /v1/models`
-- `POST /v1/embeddings`
+- `POST /backend-api/codex/responses`
+- Converts incoming OpenAI Chat Completions payload to OAuth-compatible responses payload
+- Converts responses back to OpenAI-style chat completion output for clients
+
+Model listing is best-effort for OAuth backends; some tokens/scopes may not expose `/models` routes.
 
 #### Security and encryption-ready schema
 
@@ -536,7 +538,7 @@ Common OAuth payload fields:
 |------|-------------|
 | `openwebui` | OpenWebUI API (`/api/chat/completions`, `/api/models`, `/api/v1/embeddings`) |
 | `openai` | OpenAI-compatible API (`/v1/chat/completions`, `/v1/models`, `/v1/embeddings`) |
-| `openai_oauth` | OpenAI-compatible API using OAuth token acquisition/refresh (`/v1/chat/completions`, `/v1/models`, `/v1/embeddings`) |
+| `openai_oauth` | OpenAI OAuth/Codex style backend (`/backend-api/codex/responses`) with OpenAI chat-completions request/response translation |
 | `ollama` | Ollama API (native `/api/*` + OpenAI-compatible `/v1/*` bridging) |
 | `vllm` | vLLM API |
 | `together` | Together AI |
