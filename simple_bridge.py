@@ -6313,8 +6313,10 @@ def fetch_endpoint_models(endpoint_id):
             model_paths = ["/v1/models", "/models", "/api/models", "/api/v1/models"]
 
         parse_errors = []
+        attempt_statuses = []
         for path in model_paths:
             resp = httpx.get(f"{endpoint['url']}{path}", headers=headers, timeout=15)
+            attempt_statuses.append(f"{path}:{resp.status_code}")
             if resp.status_code == 200:
                 try:
                     data = resp.json()
@@ -6331,7 +6333,22 @@ def fetch_endpoint_models(endpoint_id):
         if parse_errors:
             return flask_jsonify({"error": "; ".join(parse_errors)}), 502
 
-        return flask_jsonify({"error": f"Status: {resp.status_code}"}), resp.status_code
+        if endpoint_type == "openai_oauth":
+            return (
+                flask_jsonify(
+                    {
+                        "error": (
+                            "No models endpoint returned success for this OAuth-backed endpoint. "
+                            "Some OpenAI/Codex OAuth tokens are scoped to chatgpt/codex backends and do not expose "
+                            "OpenAI-compatible /models routes."
+                        ),
+                        "attempts": attempt_statuses,
+                    }
+                ),
+                404,
+            )
+
+        return flask_jsonify({"error": "No models endpoint returned success", "attempts": attempt_statuses}), 404
     except Exception as e:
         return flask_jsonify({"error": str(e)}), 500
 
