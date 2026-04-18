@@ -3,6 +3,8 @@ version: '3'
 vars:
   PROJECT_NAME: serverless-proxy
   PORT: 8002
+  TEST_MODEL:
+    sh: printf '%s' "${TEST_MODEL:-}"
 
 tasks:
   default:
@@ -43,15 +45,17 @@ tasks:
   test:chat:
     desc: Test chat completions (non-streaming)
     cmds:
+      - test -n "{{.TEST_MODEL}}" || (printf 'Set TEST_MODEL first, e.g. TEST_MODEL=gpt-5.4 task test:chat\n' >&2; exit 1)
       - |
         curl -s -X POST http://localhost:{{.PORT}}/v1/chat/completions \
           -H "Content-Type: application/json" \
-          -d '{"model": "project-system-ai", "messages": [{"role": "user", "content": "Hello!"}]}' | jq .
+          -d '{"model": "{{.TEST_MODEL}}", "messages": [{"role": "user", "content": "Hello!"}]}' | jq .
 
   test:stream:
     desc: Test chat completions (streaming)
     cmds:
+      - test -n "{{.TEST_MODEL}}" || (printf 'Set TEST_MODEL first, e.g. TEST_MODEL=gpt-5.4 task test:stream\n' >&2; exit 1)
       - |
         curl -s -X POST http://localhost:{{.PORT}}/v1/chat/completions \
           -H "Content-Type: application/json" \
-          -d '{"model": "project-system-ai", "messages": [{"role": "user", "content": "Hi"}], "stream": true}'
+          -d '{"model": "{{.TEST_MODEL}}", "messages": [{"role": "user", "content": "Hi"}], "stream": true}'
