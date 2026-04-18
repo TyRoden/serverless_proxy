@@ -2769,6 +2769,8 @@ def _openai_chat_to_openai_oauth_payload(
     max_tokens: Optional[int],
     top_p: Optional[float],
     tools: Optional[list] = None,
+    tool_choice: Any = None,
+    parallel_tool_calls: Optional[bool] = None,
 ) -> dict[str, Any]:
     system_parts: list[str] = []
     input_items: list[dict[str, Any]] = []
@@ -2871,6 +2873,32 @@ def _openai_chat_to_openai_oauth_payload(
 
     if mapped_tools:
         payload["tools"] = mapped_tools
+
+    # Tool choice mapping (OpenAI chat -> responses-style)
+    # - "auto" / "none" map directly
+    # - "required" is best-effort mapped to "auto" (backend-specific semantics)
+    # - {"type":"function","function":{"name":"..."}} -> {"type":"function","name":"..."}
+    if tool_choice is not None:
+        mapped_choice = None
+        if isinstance(tool_choice, str):
+            choice = tool_choice.strip().lower()
+            if choice in ("auto", "none"):
+                mapped_choice = choice
+            elif choice == "required":
+                mapped_choice = "auto"
+        elif isinstance(tool_choice, dict):
+            ctype = str(tool_choice.get("type") or "").strip().lower()
+            if ctype == "function":
+                fn = tool_choice.get("function") or {}
+                if isinstance(fn, dict):
+                    fn_name = str(fn.get("name") or "").strip()
+                    if fn_name:
+                        mapped_choice = {"type": "function", "name": fn_name}
+        if mapped_choice is not None:
+            payload["tool_choice"] = mapped_choice
+
+    if isinstance(parallel_tool_calls, bool):
+        payload["parallel_tool_calls"] = parallel_tool_calls
 
     return payload
 
@@ -3046,8 +3074,8 @@ def _openai_oauth_sse_to_openai_chat_sse(sse_text: str, model_name: str) -> str:
                         }
                         out_lines.append(f"data: {json.dumps(chunk)}\n")
                         saw_tool_call = True
-                else:
-                    delta_text = str(item.get("text") or "")
+                # Intentionally ignore text from output_item.added/output_text.added
+                # to avoid duplicate text chunks; rely on output_text.delta events.
 
         if delta_text:
             chunk = {
@@ -3339,6 +3367,8 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
                     max_tokens=max_tokens,
                     top_p=top_p,
                     tools=tools,
+                    tool_choice=kwargs.get("tool_choice"),
+                    parallel_tool_calls=kwargs.get("parallel_tool_calls"),
                 )
 
             if self.endpoint_type == "ollama":
@@ -5777,6 +5807,8 @@ async def anthropic_messages(request: Request):
             max_tokens=max_tokens,
             top_p=top_p,
             tools=tools,
+            tool_choice=None,
+            parallel_tool_calls=None,
         )
 
     # Check for streaming
