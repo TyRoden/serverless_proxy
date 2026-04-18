@@ -2,6 +2,30 @@
 
 All notable changes to the Serverless Proxy will be documented in this file.
 
+## [2.4.4] - 2026-04-18
+
+### Fixed
+
+- **OpenAI OAuth Required Tool Choice** - Preserved `tool_choice="required"` for `openai_oauth` request mapping instead of downgrading to `auto`, so strict tool-call intent is forwarded to `/backend-api/codex/responses`.
+- **OpenAI OAuth Responses Stream Tool Assembly** - Updated SSE translation for OAuth-backed Responses streams to correctly assemble tool calls from:
+  - `response.output_item.added`
+  - `response.function_call_arguments.delta`
+  - `response.output_item.done`
+- **Tool Call ID Correlation** - Added alias correlation between `item.id` and `call_id` in OAuth stream conversion to prevent duplicate/fragmented tool-call entries when argument deltas reference a different identifier.
+- **Empty Tool Arguments Compatibility** - Normalized empty/blank tool arguments to valid JSON (`{}`) in OpenAI-compatible response shaping paths to improve downstream tool parser compatibility.
+
+### Added
+
+- **OAuth Tool Stream Diagnostics** - Added `[OAUTH_SSE]` debug telemetry for OAuth stream conversion with counters for event volume and tool assembly stages (`tool_added`, `tool_arg_delta`, `tool_done`, `unknown_delta`).
+
+### Validation
+
+- Rebuilt and restarted proxy container (`docker compose up -d --build serverless-proxy`) and validated OAuth endpoint behavior with streaming probes:
+  - baseline chat response (`finish_reason: stop`)
+  - `tool_choice: auto` tool call with valid arguments payload
+  - `tool_choice: required` enforced tool call with `finish_reason: tool_calls`
+  - follow-up turn with tool result replay
+
 ## [2.4.3] - 2026-04-18
 
 ### Added

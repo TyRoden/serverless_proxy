@@ -2876,16 +2876,14 @@ def _openai_chat_to_openai_oauth_payload(
 
     # Tool choice mapping (OpenAI chat -> responses-style)
     # - "auto" / "none" map directly
-    # - "required" is best-effort mapped to "auto" (backend-specific semantics)
+    # - "required" is passed through to preserve strict semantics
     # - {"type":"function","function":{"name":"..."}} -> {"type":"function","name":"..."}
     if tool_choice is not None:
         mapped_choice = None
         if isinstance(tool_choice, str):
             choice = tool_choice.strip().lower()
-            if choice in ("auto", "none"):
+            if choice in ("auto", "none", "required"):
                 mapped_choice = choice
-            elif choice == "required":
-                mapped_choice = "auto"
         elif isinstance(tool_choice, dict):
             ctype = str(tool_choice.get("type") or "").strip().lower()
             if ctype == "function":
@@ -3003,6 +3001,80 @@ def _openai_oauth_response_to_chat_completion(
 def _openai_oauth_sse_to_openai_chat_sse(sse_text: str, model_name: str) -> str:
     out_lines: list[str] = []
     saw_tool_call = False
+    oauth_tool_stats: dict[str, int] = {
+        "events": 0,
+        "tool_added": 0,
+        "tool_arg_delta": 0,
+        "tool_done": 0,
+        "tool_unknown_delta": 0,
+    }
+    tool_calls_by_key: dict[str, dict[str, Any]] = {}
+    tool_order: list[str] = []
+    tool_aliases: dict[str, str] = {}
+    last_tool_key: Optional[str] = None
+
+    def _args_to_str(value: Any) -> str:
+        if isinstance(value, (dict, list)):
+            try:
+                return json.dumps(value)
+            except Exception:
+                return "{}"
+        if value is None:
+            return ""
+        return str(value)
+
+    def _ensure_tool(tool_key: str) -> tuple[dict[str, Any], int]:
+        tool_key = tool_aliases.get(tool_key, tool_key)
+        if tool_key in tool_calls_by_key:
+            return tool_calls_by_key[tool_key], tool_order.index(tool_key)
+        rec = {
+            "id": tool_key,
+            "name": "",
+            "args": "",
+            "emitted_args_len": 0,
+            "emitted_name": False,
+        }
+        tool_calls_by_key[tool_key] = rec
+        tool_order.append(tool_key)
+        return rec, len(tool_order) - 1
+
+    def _emit_tool_delta(
+        evt: dict[str, Any],
+        tc_index: int,
+        call_id: str,
+        fn_name: Optional[str] = None,
+        args_fragment: Optional[str] = None,
+    ) -> None:
+        nonlocal saw_tool_call
+        tool_delta: dict[str, Any] = {
+            "index": tc_index,
+            "id": call_id,
+        }
+        if fn_name is not None or args_fragment is not None:
+            fn_obj: dict[str, Any] = {}
+            if fn_name is not None:
+                fn_obj["name"] = fn_name
+            if args_fragment is not None:
+                fn_obj["arguments"] = args_fragment
+            tool_delta["type"] = "function"
+            tool_delta["function"] = fn_obj
+
+        chunk = {
+            "id": evt.get("response_id") or f"chatcmpl_{int(time.time() * 1000)}",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model_name,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"tool_calls": [tool_delta]},
+                    "finish_reason": None,
+                }
+            ],
+        }
+        out_lines.append(f"data: {json.dumps(chunk)}\n")
+        saw_tool_call = True
+
     for raw in (sse_text or "").splitlines():
         line = raw.strip()
         if not line.startswith("data:"):
@@ -3018,6 +3090,7 @@ def _openai_oauth_sse_to_openai_chat_sse(sse_text: str, model_name: str) -> str:
         except Exception:
             continue
 
+        oauth_tool_stats["events"] += 1
         evt_type = str(evt.get("type") or "").lower()
         delta_text = ""
         if evt_type in (
@@ -3034,48 +3107,121 @@ def _openai_oauth_sse_to_openai_chat_sse(sse_text: str, model_name: str) -> str:
             if isinstance(item, dict):
                 item_type = str(item.get("type") or "").lower()
                 if item_type in ("function_call", "tool_call"):
+                    oauth_tool_stats["tool_added"] += 1
                     fn_name = str(item.get("name") or item.get("tool_name") or "").strip()
-                    fn_args = item.get("arguments")
-                    if isinstance(fn_args, (dict, list)):
-                        fn_args = json.dumps(fn_args)
-                    elif fn_args is None:
-                        fn_args = "{}"
-                    else:
-                        fn_args = str(fn_args)
+                    fn_args = _args_to_str(item.get("arguments"))
                     call_id = str(item.get("call_id") or item.get("id") or "").strip()
                     if not call_id:
                         call_id = f"call_{int(time.time() * 1000)}"
+                    item_id = str(item.get("id") or "").strip()
+                    tool_key = call_id
+                    rec, tc_index = _ensure_tool(tool_key)
+                    if item_id and item_id != tool_key:
+                        tool_aliases[item_id] = tool_key
+                    rec["id"] = call_id
                     if fn_name:
-                        chunk = {
-                            "id": evt.get("response_id")
-                            or f"chatcmpl_{int(time.time() * 1000)}",
-                            "object": "chat.completion.chunk",
-                            "created": int(time.time()),
-                            "model": model_name,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {
-                                        "tool_calls": [
-                                            {
-                                                "index": 0,
-                                                "id": call_id,
-                                                "type": "function",
-                                                "function": {
-                                                    "name": fn_name,
-                                                    "arguments": fn_args,
-                                                },
-                                            }
-                                        ]
-                                    },
-                                    "finish_reason": None,
-                                }
-                            ],
-                        }
-                        out_lines.append(f"data: {json.dumps(chunk)}\n")
-                        saw_tool_call = True
+                        rec["name"] = fn_name
+                    if fn_args:
+                        rec["args"] = str(rec.get("args") or "") + fn_args
+                    last_tool_key = tool_key
+                    if fn_name:
+                        if not bool(rec.get("emitted_name")):
+                            _emit_tool_delta(
+                                evt=evt,
+                                tc_index=tc_index,
+                                call_id=call_id,
+                                fn_name=fn_name,
+                                args_fragment="",
+                            )
+                            rec["emitted_name"] = True
+                        if fn_args:
+                            _emit_tool_delta(
+                                evt=evt,
+                                tc_index=tc_index,
+                                call_id=call_id,
+                                args_fragment=fn_args,
+                            )
+                            rec["emitted_args_len"] = int(rec.get("emitted_args_len") or 0) + len(
+                                fn_args
+                            )
                 # Intentionally ignore text from output_item.added/output_text.added
                 # to avoid duplicate text chunks; rely on output_text.delta events.
+        elif evt_type == "response.function_call_arguments.delta":
+            oauth_tool_stats["tool_arg_delta"] += 1
+            arg_delta = _args_to_str(evt.get("delta"))
+            if arg_delta:
+                tool_key = str(evt.get("call_id") or evt.get("item_id") or "").strip()
+                if not tool_key:
+                    tool_key = last_tool_key or ""
+                tool_key = tool_aliases.get(tool_key, tool_key)
+                if tool_key:
+                    rec, tc_index = _ensure_tool(tool_key)
+                    call_id = str(rec.get("id") or tool_key)
+                    rec["args"] = str(rec.get("args") or "") + arg_delta
+                    _emit_tool_delta(
+                        evt=evt,
+                        tc_index=tc_index,
+                        call_id=call_id,
+                        args_fragment=arg_delta,
+                    )
+                    rec["emitted_args_len"] = int(rec.get("emitted_args_len") or 0) + len(arg_delta)
+                    last_tool_key = tool_key
+                else:
+                    oauth_tool_stats["tool_unknown_delta"] += 1
+        elif evt_type == "response.output_item.done":
+            item = evt.get("item") or {}
+            if isinstance(item, dict):
+                item_type = str(item.get("type") or "").lower()
+                if item_type in ("function_call", "tool_call"):
+                    oauth_tool_stats["tool_done"] += 1
+                    call_id = str(item.get("call_id") or item.get("id") or "").strip()
+                    if not call_id:
+                        call_id = last_tool_key or f"call_{int(time.time() * 1000)}"
+                    item_id = str(item.get("id") or "").strip()
+                    tool_key = call_id
+                    rec, tc_index = _ensure_tool(tool_key)
+                    if item_id and item_id != tool_key:
+                        tool_aliases[item_id] = tool_key
+                    rec["id"] = call_id
+                    fn_name = str(item.get("name") or item.get("tool_name") or "").strip()
+                    if fn_name:
+                        rec["name"] = fn_name
+                        if not bool(rec.get("emitted_name")):
+                            _emit_tool_delta(
+                                evt=evt,
+                                tc_index=tc_index,
+                                call_id=call_id,
+                                fn_name=fn_name,
+                                args_fragment="",
+                            )
+                            rec["emitted_name"] = True
+
+                    full_args = _args_to_str(item.get("arguments"))
+                    if full_args:
+                        emitted_len = int(rec.get("emitted_args_len") or 0)
+                        prev = str(rec.get("args") or "")
+                        rec["args"] = full_args
+                        if emitted_len > 0 and full_args.startswith(prev[:emitted_len]):
+                            missing = full_args[emitted_len:]
+                        else:
+                            missing = full_args
+                        if missing:
+                            _emit_tool_delta(
+                                evt=evt,
+                                tc_index=tc_index,
+                                call_id=call_id,
+                                args_fragment=missing,
+                            )
+                            rec["emitted_args_len"] = emitted_len + len(missing)
+                    elif int(rec.get("emitted_args_len") or 0) == 0:
+                        _emit_tool_delta(
+                            evt=evt,
+                            tc_index=tc_index,
+                            call_id=call_id,
+                            args_fragment="{}",
+                        )
+                        rec["emitted_args_len"] = 2
+                    last_tool_key = tool_key
 
         if delta_text:
             chunk = {
@@ -3106,6 +3252,12 @@ def _openai_oauth_sse_to_openai_chat_sse(sse_text: str, model_name: str) -> str:
             }
             out_lines.append(f"data: {json.dumps(final_chunk)}\n")
             out_lines.append("data: [DONE]\n")
+
+    if oauth_tool_stats["events"] > 0:
+        debug_log(
+            "info",
+            f"[OAUTH_SSE] model={model_name} events={oauth_tool_stats['events']} tool_added={oauth_tool_stats['tool_added']} tool_arg_delta={oauth_tool_stats['tool_arg_delta']} tool_done={oauth_tool_stats['tool_done']} unknown_delta={oauth_tool_stats['tool_unknown_delta']}",
+        )
 
     if not out_lines:
         return sse_text
@@ -5082,9 +5234,11 @@ async def chat_completions(request: Request):
         if isinstance(tc_args, (dict, list)):
             tc_args = json.dumps(tc_args)
         elif tc_args is None:
-            tc_args = ""
+            tc_args = "{}"
         else:
             tc_args = str(tc_args)
+            if not tc_args.strip():
+                tc_args = "{}"
         normalized_tool_calls.append(
             {
                 "id": tc_id,
@@ -5229,9 +5383,11 @@ async def _generate_sse(
             if isinstance(tc_args, (dict, list)):
                 tc_args = json.dumps(tc_args)
             elif tc_args is None:
-                tc_args = ""
+                tc_args = "{}"
             else:
                 tc_args = str(tc_args)
+                if not tc_args.strip():
+                    tc_args = "{}"
             normalized.append(
                 {
                     "id": tc_id,
