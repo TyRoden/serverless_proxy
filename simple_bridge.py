@@ -7068,6 +7068,7 @@ def fetch_endpoint_models(endpoint_id):
             headers["Authorization"] = auth_header
 
         endpoint_type = (endpoint.get("endpoint_type") or "").lower()
+        endpoint_base = str(endpoint.get("url") or "").rstrip("/")
         if endpoint_type == "openwebui":
             model_paths = ["/api/models", "/api/v1/models", "/v1/models", "/models"]
         elif endpoint_type == "openai_oauth":
@@ -7086,26 +7087,71 @@ def fetch_endpoint_models(endpoint_id):
 
         parse_errors = []
         attempt_statuses = []
-        for path in model_paths:
-            resp = httpx.get(f"{endpoint['url']}{path}", headers=headers, timeout=15)
-            attempt_statuses.append(f"{path}:{resp.status_code}")
-            if resp.status_code == 200:
-                try:
-                    data = resp.json()
-                except Exception:
-                    snippet = (resp.text or "")[:180].replace("\n", " ").strip()
-                    parse_errors.append(f"{path}: non-JSON 200 response ({snippet})")
-                    continue
-                models = data.get("models", []) or data.get("data", [])
-                model_list = sorted(
-                    [m.get("id") or m.get("name") or m.get("model") for m in models]
-                )
-                return flask_jsonify({"models": model_list})
+        candidate_bases = [endpoint_base]
+        if endpoint_type == "openai_oauth":
+            try:
+                oauth_response_url = _resolve_openai_oauth_response_endpoint(endpoint_base)
+                oauth_models_base = oauth_response_url.rsplit("/backend-api/codex/responses", 1)[0]
+                oauth_models_base = oauth_models_base.rstrip("/")
+                if oauth_models_base and oauth_models_base not in candidate_bases:
+                    candidate_bases.insert(0, oauth_models_base)
+            except Exception:
+                pass
+
+        for base in candidate_bases:
+            for path in model_paths:
+                url = f"{base}{path}"
+                resp = httpx.get(url, headers=headers, timeout=15)
+                attempt_statuses.append(f"{url}:{resp.status_code}")
+                if resp.status_code == 200:
+                    try:
+                        data = resp.json()
+                    except Exception:
+                        snippet = (resp.text or "")[:180].replace("\n", " ").strip()
+                        parse_errors.append(
+                            f"{url}: non-JSON 200 response ({snippet})"
+                        )
+                        continue
+                    models = data.get("models", []) or data.get("data", [])
+                    model_list = sorted(
+                        [m.get("id") or m.get("name") or m.get("model") for m in models]
+                    )
+                    return flask_jsonify({"models": model_list})
 
         if parse_errors:
             return flask_jsonify({"error": "; ".join(parse_errors)}), 502
 
         if endpoint_type == "openai_oauth":
+            fallback_models = []
+            try:
+                with get_db() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        """
+                        SELECT DISTINCT actual_model
+                        FROM virtual_models
+                        WHERE endpoint_id = ?
+                          AND COALESCE(TRIM(actual_model), '') <> ''
+                        ORDER BY actual_model
+                        """,
+                        (endpoint_id,),
+                    )
+                    fallback_models = [r[0] for r in cursor.fetchall() if r and r[0]]
+            except Exception:
+                fallback_models = []
+
+            if fallback_models:
+                return flask_jsonify(
+                    {
+                        "models": fallback_models,
+                        "warning": (
+                            "Upstream OAuth endpoint does not expose a readable models route for this token. "
+                            "Returning models already configured on this proxy endpoint as a fallback."
+                        ),
+                        "attempts": attempt_statuses,
+                    }
+                )
+
             return (
                 flask_jsonify(
                     {

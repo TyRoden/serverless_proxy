@@ -13,6 +13,7 @@ All notable changes to the Serverless Proxy will be documented in this file.
   - `response.output_item.done`
 - **Tool Call ID Correlation** - Added alias correlation between `item.id` and `call_id` in OAuth stream conversion to prevent duplicate/fragmented tool-call entries when argument deltas reference a different identifier.
 - **Empty Tool Arguments Compatibility** - Normalized empty/blank tool arguments to valid JSON (`{}`) in OpenAI-compatible response shaping paths to improve downstream tool parser compatibility.
+- **OAuth Model Discovery Fallback** - When OAuth-backed upstream model routes return non-success (common with scoped ChatGPT/Codex tokens), `/endpoints/<id>/models` now returns already-configured `virtual_models.actual_model` values for that endpoint so dashboard model selection remains usable.
 
 ### Added
 
