@@ -6656,8 +6656,12 @@ def validate_session_fastapi(request: Request):
 
 def get_menu_login_url():
     """Get the public URL for menu login (handles HTTPS)."""
-    menu_base = os.getenv("AIMENU_PUBLIC_URL", "https://menu.troden.com")
-    return menu_base
+    # Prefer explicit public URL for reverse-proxy/HTTPS setups.
+    # Fallback to AIMENU_URL (local auth service) instead of any external domain.
+    menu_base = os.getenv("AIMENU_PUBLIC_URL", "").strip()
+    if not menu_base:
+        menu_base = os.getenv("AIMENU_URL", "http://localhost:5000").strip()
+    return menu_base.rstrip("/")
 
 
 @flask_app.route("/")
