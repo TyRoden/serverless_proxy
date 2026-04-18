@@ -4125,6 +4125,78 @@ def extract_tool_calls(content):
                             "filePath": args_dict["filePath"],
                             "content": args_dict["content"],
                         }
+                elif tool_name == "todowrite":
+                    # TodoWrite schema requires: {"todos": [ ... ]}
+                    # Some model/tool-call formats omit or reshape this payload.
+                    todos_val = args_dict.get("todos")
+
+                    # Accept alternate keys that occasionally appear.
+                    if todos_val is None:
+                        for key in ("items", "tasks", "todo", "value"):
+                            if key in args_dict:
+                                todos_val = args_dict.get(key)
+                                break
+
+                    # If caller provided a single todo object, wrap it.
+                    if isinstance(todos_val, dict):
+                        todos_val = [todos_val]
+
+                    # If caller provided a string, create a minimal todo entry.
+                    if isinstance(todos_val, str):
+                        text = todos_val.strip()
+                        todos_val = (
+                            [
+                                {
+                                    "content": text,
+                                    "status": "pending",
+                                    "priority": "medium",
+                                }
+                            ]
+                            if text
+                            else []
+                        )
+
+                    # Normalize each todo object to required shape.
+                    normalized_todos = []
+                    if isinstance(todos_val, list):
+                        for item in todos_val:
+                            if isinstance(item, str):
+                                content = item.strip()
+                                if not content:
+                                    continue
+                                normalized_todos.append(
+                                    {
+                                        "content": content,
+                                        "status": "pending",
+                                        "priority": "medium",
+                                    }
+                                )
+                                continue
+                            if not isinstance(item, dict):
+                                continue
+
+                            content = str(item.get("content") or "").strip()
+                            if not content:
+                                continue
+
+                            status = str(item.get("status") or "pending").strip().lower()
+                            if status not in ("pending", "in_progress", "completed", "cancelled"):
+                                status = "pending"
+
+                            priority = str(item.get("priority") or "medium").strip().lower()
+                            if priority not in ("low", "medium", "high"):
+                                priority = "medium"
+
+                            normalized_todos.append(
+                                {
+                                    "content": content,
+                                    "status": status,
+                                    "priority": priority,
+                                }
+                            )
+
+                    # Always provide todos array to satisfy schema.
+                    args_dict = {"todos": normalized_todos}
 
                 args_str = json.dumps(args_dict, ensure_ascii=False)
 
