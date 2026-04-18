@@ -84,6 +84,13 @@ If Serverless Proxy runs in Docker, the app can only read files visible inside t
 - `401/invalid_client`: incorrect client ID/secret or wrong auth method
 - `404` on token URL: wrong token endpoint (verify `https://auth.openai.com/oauth/token`)
 - Works with API key but not OAuth: verify `oauth_enabled` and required OAuth fields are populated
+- OpenAI auth page shows `AuthApiFailure` / `unknown_error` immediately after clicking Start Web OAuth:
+  - This is usually authorize-request compatibility (not URL-encoding on your side)
+  - Verify redirect URI and originator compatibility
+  - You can override defaults with environment variables:
+    - `OPENAI_WEB_OAUTH_DEFAULT_REDIRECT_URI` (default: `http://localhost:1455/auth/callback`)
+    - `OPENAI_WEB_OAUTH_ORIGINATOR` (default: `pi`)
+    - `OPENAI_WEB_OAUTH_CLIENT_ID` (override client id if your flow requires another one)
 
 ## Security notes
 

@@ -2662,8 +2662,9 @@ OPENAI_WEB_OAUTH_TOKEN_URL = os.getenv(
     "OPENAI_WEB_OAUTH_TOKEN_URL", "https://auth.openai.com/oauth/token"
 )
 OPENAI_WEB_OAUTH_DEFAULT_REDIRECT_URI = os.getenv(
-    "OPENAI_WEB_OAUTH_DEFAULT_REDIRECT_URI", "http://127.0.0.1:1455/auth/callback"
+    "OPENAI_WEB_OAUTH_DEFAULT_REDIRECT_URI", "http://localhost:1455/auth/callback"
 )
+OPENAI_WEB_OAUTH_ORIGINATOR = os.getenv("OPENAI_WEB_OAUTH_ORIGINATOR", "pi")
 
 # state -> pending session
 _oauth_web_sessions: dict[str, dict[str, Any]] = {}
@@ -6748,7 +6749,7 @@ def api_admin_openai_oauth_start_web_auth():
         "code_challenge_method": "S256",
         "id_token_add_organizations": "true",
         "codex_cli_simplified_flow": "true",
-        "originator": "serverless-proxy",
+        "originator": OPENAI_WEB_OAUTH_ORIGINATOR,
     }
     auth_url = f"{authorize_url}?{urllib.parse.urlencode(query)}"
     return flask_jsonify(
