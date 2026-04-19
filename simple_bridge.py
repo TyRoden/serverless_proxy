@@ -131,6 +131,42 @@ def debug_log(level, msg):
         print(f"[DEBUG:{level.upper()}] {msg}", flush=True)
 
 
+def _truncate_debug_text(value: Any, max_len: int = 240) -> str:
+    text = str(value or "").replace("\n", " ").replace("\r", " ").strip()
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 1].rstrip() + "…"
+
+
+def _tool_args_preview(args: Any, max_len: int = 240) -> tuple[int, str]:
+    if isinstance(args, (dict, list)):
+        try:
+            raw = json.dumps(args, ensure_ascii=False)
+        except Exception:
+            raw = str(args)
+    elif args is None:
+        raw = ""
+    else:
+        raw = str(args)
+    raw = raw.strip()
+    return len(raw), _truncate_debug_text(raw, max_len=max_len)
+
+
+def _summarize_tool_calls_for_debug(
+    tool_calls: list[dict[str, Any]], max_items: int = 8
+) -> str:
+    entries: list[str] = []
+    for tc in (tool_calls or [])[:max_items]:
+        fn = tc.get("function") or {}
+        name = _truncate_debug_text(fn.get("name") or "", max_len=64)
+        call_id = _truncate_debug_text(tc.get("id") or "", max_len=64)
+        args_len, args_preview = _tool_args_preview(fn.get("arguments"), max_len=200)
+        entries.append(
+            f"id={call_id} name={name} args_len={args_len} args={args_preview}"
+        )
+    return " | ".join(entries)
+
+
 def _ollama_options_from_openai(
     temperature: float,
     max_tokens: int,
@@ -3688,6 +3724,25 @@ def _openai_oauth_sse_to_openai_chat_sse(sse_text: str, model_name: str) -> str:
             "info",
             f"[OAUTH_SSE] model={model_name} events={oauth_tool_stats['events']} tool_added={oauth_tool_stats['tool_added']} tool_arg_delta={oauth_tool_stats['tool_arg_delta']} tool_done={oauth_tool_stats['tool_done']} unknown_delta={oauth_tool_stats['tool_unknown_delta']} usage={'yes' if oauth_usage else 'no'}",
         )
+        if is_debug_mode() == "full" and tool_order:
+            tool_debug_parts: list[str] = []
+            for key in tool_order[:12]:
+                rec = tool_calls_by_key.get(key) or {}
+                args_len, args_preview = _tool_args_preview(rec.get("args"), max_len=220)
+                tool_debug_parts.append(
+                    " ".join(
+                        [
+                            f"id={_truncate_debug_text(rec.get('id') or key, max_len=64)}",
+                            f"name={_truncate_debug_text(rec.get('name') or '', max_len=64)}",
+                            f"args_len={args_len}",
+                            f"args={args_preview}",
+                        ]
+                    )
+                )
+            debug_log(
+                "info",
+                f"[OAUTH_SSE_TOOLS] model={model_name} calls={len(tool_order)} details={' || '.join(tool_debug_parts)}",
+            )
 
     if not out_lines:
         return sse_text
@@ -5126,6 +5181,42 @@ def process_content(content):
     return None, content
 
 
+def _advertised_tool_names(tools: Any) -> set[str]:
+    names: set[str] = set()
+    if not isinstance(tools, list):
+        return names
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function") if isinstance(t.get("function"), dict) else {}
+        name = str(fn.get("name") or "").strip()
+        if name:
+            names.add(name)
+    return names
+
+
+def _filter_tool_calls_by_advertised(
+    tool_calls: list[dict[str, Any]], advertised_names: set[str]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if not tool_calls:
+        return [], []
+    if not advertised_names:
+        return tool_calls, []
+
+    kept: list[dict[str, Any]] = []
+    dropped: list[dict[str, Any]] = []
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            continue
+        fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+        name = str(fn.get("name") or "").strip()
+        if name in advertised_names:
+            kept.append(tc)
+        else:
+            dropped.append(tc)
+    return kept, dropped
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     """OpenAI-compatible chat completions endpoint."""
@@ -5492,6 +5583,10 @@ async def chat_completions(request: Request):
             if isinstance(msg, dict)
             for c in (msg.get("content") or [])
         )
+        is_openai_oauth_backend = (
+            hasattr(backend, "endpoint_type") and backend.endpoint_type == "openai_oauth"
+        )
+        advertised_tool_names = _advertised_tool_names(tools)
 
         if has_vision:
             debug_log(
@@ -5500,11 +5595,31 @@ async def chat_completions(request: Request):
             )
             text_content = full_content
             extracted_tc = stream_tool_calls if stream_tool_calls else []
+        elif is_openai_oauth_backend:
+            # For OAuth-backed responses, trust only protocol-level tool events.
+            # Do not infer tool calls from plain text fallback parsing.
+            text_content = full_content
+            extracted_tc = []
         else:
             extracted_tc, text_content = process_content(full_content)
 
         if stream_tool_calls and not extracted_tc:
             extracted_tc = stream_tool_calls
+
+        if extracted_tc:
+            filtered_tc, dropped_tc = _filter_tool_calls_by_advertised(
+                extracted_tc, advertised_tool_names
+            )
+            if dropped_tc:
+                dropped_names = []
+                for tc in dropped_tc:
+                    fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                    dropped_names.append(str(fn.get("name") or "").strip() or "<empty>")
+                debug_log(
+                    "warn",
+                    f"[TOOL_FILTER] request_id={request_id} dropped={len(dropped_tc)} names={','.join(dropped_names[:8])}",
+                )
+            extracted_tc = filtered_tc
 
         # Check for upstream error in stream data (e.g., validation errors from DeepInfra)
         # Error payloads typically look like: {"error": {"message": "..."}} or {"error_type": "...", "error_message": "..."}
@@ -5588,6 +5703,18 @@ async def chat_completions(request: Request):
             f"[STREAM_PARSE] request_id={request_id} stats={stats} content_ch={content_chars} reasoning_ch={reasoning_chars} tc={tc_count} finish={finish_reason}",
         )
 
+        if endpoint_type == "openai_oauth" and is_debug_mode() == "full":
+            if extracted_tc:
+                debug_log(
+                    "info",
+                    f"[OAUTH_TOOL_PARSE] request_id={request_id} tc={len(extracted_tc)} details={_summarize_tool_calls_for_debug(extracted_tc)}",
+                )
+            if extracted_tc and finish_reason != "tool_calls":
+                debug_log(
+                    "warn",
+                    f"[OAUTH_TOOL_MISMATCH] request_id={request_id} tc={len(extracted_tc)} finish={finish_reason} (tool calls parsed but stream did not end with tool_calls)",
+                )
+
         print(
             f"[DEBUG] Parsed stream: content='{full_content[:50]}...' if full_content else '(empty)', reasoning='{full_reasoning[:50]}...' if full_reasoning else '(empty)', tc={tc_count}, finish={finish_reason}",
             flush=True,
@@ -5612,9 +5739,6 @@ async def chat_completions(request: Request):
 
         # OpenAI OAuth streams frequently omit usage tokens. Keep upstream values when present,
         # and estimate only for OAuth when usage is missing.
-        is_openai_oauth_backend = (
-            hasattr(backend, "endpoint_type") and backend.endpoint_type == "openai_oauth"
-        )
         if is_openai_oauth_backend:
             prompt_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
             completion_tokens = int(
@@ -5710,12 +5834,20 @@ async def chat_completions(request: Request):
         if isinstance(msg, dict)
         for c in (msg.get("content") or [])
     )
+    is_openai_oauth_backend = (
+        hasattr(backend, "endpoint_type") and backend.endpoint_type == "openai_oauth"
+    )
+    advertised_tool_names = _advertised_tool_names(tools)
 
     if has_vision:
         debug_log(
             "info",
             f"[BYPASS_PROCESS] request_id={request_id} skipping process_content for vision request (non-stream)",
         )
+        text_content = content
+        extracted_tc = []
+    elif is_openai_oauth_backend:
+        # For OAuth-backed responses, do not infer tool calls from text.
         text_content = content
         extracted_tc = []
     else:
@@ -5725,6 +5857,21 @@ async def chat_completions(request: Request):
             tool_calls_data = extracted_tc
         elif not tool_calls_data:
             text_content = text_content or content
+
+    if tool_calls_data:
+        filtered_tc, dropped_tc = _filter_tool_calls_by_advertised(
+            tool_calls_data, advertised_tool_names
+        )
+        if dropped_tc:
+            dropped_names = []
+            for tc in dropped_tc:
+                fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                dropped_names.append(str(fn.get("name") or "").strip() or "<empty>")
+            debug_log(
+                "warn",
+                f"[TOOL_FILTER] request_id={request_id} dropped={len(dropped_tc)} names={','.join(dropped_names[:8])}",
+            )
+        tool_calls_data = filtered_tc
 
     job_id = result.get("id", f"chat-{int(time_module.time())}")
 
