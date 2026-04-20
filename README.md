@@ -197,6 +197,112 @@ docker compose up -d
 
 ## Configuration
 
+## Health, Failover, and Cache
+
+The proxy supports optional endpoint health polling, per-virtual-model failover, and non-streaming response cache.
+
+For full operational details (runtime flow, strategy behavior, and every related setting), see:
+
+- `docs/failover-cache-operations.md`
+
+### Endpoint Health Polling
+
+- Health polling runs only when at least one virtual model has failover configured.
+- Polling is per endpoint and optional. Leave `Health Check URL` blank to disable active polling for that endpoint.
+- Polling interval is configured in Settings (`health_check_interval`).
+
+Accepted healthy/unhealthy responses for `health_check_url`:
+
+- HTTP `2xx` with no JSON body → healthy
+- HTTP `2xx` with JSON `{"healthy": true}` or `{"status": "ok"}` → healthy
+- HTTP `2xx` with JSON `{"healthy": false}` or `{"status": "down"|"error"|"unhealthy"}` → unhealthy
+- non-`2xx` response or network timeout/error → unhealthy/failure increment
+
+Example health endpoints:
+
+```bash
+# simple
+https://api.example.com/health
+
+# Kubernetes style
+https://api.example.com/healthz
+
+# custom app route
+https://api.example.com/internal/status
+```
+
+### Failover Configuration
+
+Failover is disabled by default and only applies to virtual models with explicit failover settings.
+
+- `backup`: try primary, then target list in order
+- `rotational`: rotate through targets
+- `duplicate`: automatically try other enabled virtual models with the same `actual_model`
+
+Retry behavior and circuit controls:
+
+- Failover retries only retryable upstream failures (`429`, `500`, `502`, `503`, `504`).
+- Endpoints with open circuits are skipped.
+- Circuit state is tracked per endpoint and updated by failure thresholds/cooldown.
+
+Failover and circuit controls:
+
+- Global defaults from Settings:
+  - `circuit_failure_threshold`
+  - `circuit_failure_window`
+  - `circuit_cooldown_seconds`
+- Per-virtual-model overrides (optional) in the failover form:
+  - max attempts
+  - failure threshold
+  - cooldown seconds
+
+### Non-Streaming Cache
+
+- Cache is applied only to non-stream requests (`chat` + `embeddings`).
+- Per virtual model, `Enable Non-Stream Cache` controls cache participation (`cache_enabled`).
+- Cache is bypassed when request header includes `Cache-Control: no-store`.
+- Tool-call responses are not cached.
+- Error responses are not cached.
+- TTLs are configured in Settings:
+  - `cache_ttl_chat`
+  - `cache_ttl_embeddings`
+
+### Usage and Savings Metrics
+
+Usage dashboard includes cache metrics:
+
+- cache attempts
+- cache hits
+- cache hit rate
+- estimated cache savings
+
+### Settings Reference (Health/Failover/Cache)
+
+| UI Section | Setting | Meaning |
+|---|---|---|
+| Settings | `Chat Cache TTL (seconds)` | TTL for non-stream chat/completions cache entries |
+| Settings | `Embeddings Cache TTL (seconds)` | TTL for non-stream embeddings cache entries |
+| Settings | `Health Check Interval (seconds)` | Poll interval for endpoint health URLs |
+| Settings | `Circuit Failure Threshold` | Retryable failure count before circuit opens |
+| Settings | `Circuit Failure Window (seconds)` | Time window for counting failures |
+| Settings | `Circuit Cooldown (seconds)` | How long a circuit stays open before retry |
+| Endpoint modal | `Health Check URL (optional)` | Optional custom health URL for endpoint polling |
+| Virtual model modal | `Enable Non-Stream Cache` | Enables/disables cache for that model |
+| Virtual model modal | `Enable Failover` | Enables/disables failover for that model |
+| Virtual model modal | `Failover Strategy` | `backup`, `rotational`, or `duplicate` |
+| Virtual model modal | `Failover Targets` | Target virtual models for `backup`/`rotational` |
+| Virtual model modal | `Max Attempts` | Optional per-model cap on failover tries |
+| Virtual model modal | `Failure Threshold` | Optional per-model override for circuit threshold |
+| Virtual model modal | `Cooldown Seconds` | Optional per-model override for circuit cooldown |
+
+### Activity Visibility
+
+When failover substitutes a route, Activity shows:
+
+- virtual model and routed model (`virtual_model -> actual_model`)
+- routed endpoint
+- failover note in the activity details row
+
 ### Environment Variables
 
 | Variable | Description | Default |

@@ -2,6 +2,39 @@
 
 All notable changes to the Serverless Proxy will be documented in this file.
 
+## [2.4.5] - 2026-04-20
+
+### Added
+
+- **Failover Runtime Routing Visibility** - Activity logging now captures routed model/endpoint details after backend selection, including failover substitutions.
+- **Virtual Model Failover Controls (UI/API)** - Added virtual model failover strategy configuration support (`backup`, `rotational`, `duplicate`) with target selection and optional per-model overrides.
+- **Health + Cache Settings in Admin UI** - Added Settings controls for cache TTL and circuit/health tuning:
+  - `cache_ttl_chat`
+  - `cache_ttl_embeddings`
+  - `health_check_interval`
+  - `circuit_failure_threshold`
+  - `circuit_failure_window`
+  - `circuit_cooldown_seconds`
+- **Endpoint Health Check URL** - Added optional endpoint-level `health_check_url` field in endpoint create/edit flows.
+- **Virtual Model Cache Toggle** - Added `cache_enabled` UI/backend support to disable non-stream cache per virtual model.
+
+### Fixed
+
+- **Activity Endpoint Attribution Fallback** - When activity rows are logged without explicit endpoint metadata, endpoint id/name is now resolved from virtual model mapping.
+- **Completions/Embeddings Cache Path Stability** - Fixed cache path issues in legacy completions and embeddings flows so cache lookup/store and usage/activity logging are consistent.
+- **Admin UI Alignment Polish** - Fixed Virtual Models actions cell layout and Settings "Enable AI Queue Integration" checkbox alignment issues.
+
+### Documentation
+
+- **Failover + Cache Operations Guide** - Added `docs/failover-cache-operations.md` with complete behavior documentation, strategy semantics, and setting-by-setting reference.
+- **README Feature Expansion** - Expanded failover/cache/health sections with retry/circuit semantics, settings reference table, activity visibility behavior, and link to operations guide.
+
+### Validation
+
+- Verified Python syntax (`python3 -m py_compile simple_bridge.py`).
+- Rebuilt/restarted container (`docker compose build serverless-proxy && docker compose up -d serverless-proxy`).
+- Ran smoke checks (`task test:models`, `task test:chat`, `task test:stream`).
+
 ## [2.4.4] - 2026-04-18
 
 ### Fixed

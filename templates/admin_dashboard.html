@@ -72,7 +72,10 @@
         }
         .badge-enabled { background: rgba(16, 185, 129, 0.2); color: var(--accent-green); }
         .badge-disabled { background: rgba(239, 68, 68, 0.2); color: var(--accent-red); }
-        .actions { display: flex; gap: 6px; }
+        div.actions { display: flex; gap: 6px; }
+        td.actions { white-space: nowrap; }
+        td.actions .btn { margin-right: 6px; }
+        td.actions .btn:last-child { margin-right: 0; }
         .nav { display: flex; gap: 4px; margin-bottom: 24px; border-bottom: 1px solid var(--border); padding-bottom: 0; }
         .nav a { 
             color: var(--text-secondary); 
@@ -373,16 +376,46 @@
                 <input type="text" id="aimenu-url" value="http://localhost:5000" placeholder="http://localhost:5000">
                 <small>URL for AI Menu authentication service</small>
             </div>
-            <div class="form-group">
-                <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+            <div class="form-group" style="margin-bottom:10px;">
+                <div class="checkbox-row" style="margin-top:0;">
                     <input type="checkbox" id="use-ai-queue" onchange="toggleAiQueueUrl()">
-                    <span>Enable AI Queue Integration</span>
-                </label>
+                    <label for="use-ai-queue">Enable AI Queue Integration</label>
+                </div>
             </div>
             <div class="form-group" id="ai-queue-url-group" style="display:none;">
                 <label for="ai-queue-url">AI Queue URL</label>
                 <input type="text" id="ai-queue-url" value="http://host.docker.internal:8102" placeholder="http://host.docker.internal:8102">
                 <small>AI Queue Master endpoint</small>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="cache-ttl-chat">Chat Cache TTL (seconds)</label>
+                    <input type="number" id="cache-ttl-chat" value="300" min="1">
+                </div>
+                <div class="form-group">
+                    <label for="cache-ttl-embeddings">Embeddings Cache TTL (seconds)</label>
+                    <input type="number" id="cache-ttl-embeddings" value="3600" min="1">
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="health-check-interval">Health Check Interval (seconds)</label>
+                    <input type="number" id="health-check-interval" value="60" min="5">
+                </div>
+                <div class="form-group">
+                    <label for="circuit-failure-threshold">Circuit Failure Threshold</label>
+                    <input type="number" id="circuit-failure-threshold" value="3" min="1">
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="circuit-failure-window">Circuit Failure Window (seconds)</label>
+                    <input type="number" id="circuit-failure-window" value="60" min="1">
+                </div>
+                <div class="form-group">
+                    <label for="circuit-cooldown-seconds">Circuit Cooldown (seconds)</label>
+                    <input type="number" id="circuit-cooldown-seconds" value="300" min="1">
+                </div>
             </div>
             <button class="btn btn-primary" onclick="saveSettings()">Save Settings</button>
         </div>
@@ -424,6 +457,11 @@
                             <label for="ep-key">API Key</label>
                             <input type="password" id="ep-key" name="api_key" placeholder="(leave blank if not needed)">
                             <small>Authorization token, if required by the endpoint</small>
+                        </div>
+                        <div class="form-group">
+                            <label for="ep-health-check-url">Health Check URL (optional)</label>
+                            <input type="text" id="ep-health-check-url" name="health_check_url" placeholder="https://api.example.com/healthz">
+                            <small>Optional custom endpoint used for health polling and circuit state updates</small>
                         </div>
                         <div class="form-row">
                             <div class="form-group">
@@ -641,6 +679,47 @@
                         <div class="checkbox-row">
                             <input type="checkbox" id="vm-enabled" name="enabled" checked>
                             <label for="vm-enabled">Enabled</label>
+                        </div>
+                        <div class="checkbox-row">
+                            <input type="checkbox" id="vm-cache-enabled" name="cache_enabled" checked>
+                            <label for="vm-cache-enabled">Enable Non-Stream Cache</label>
+                        </div>
+                        <div style="border:1px solid var(--border);border-radius:8px;padding:14px;margin-top:12px;">
+                            <div class="checkbox-row" style="margin-bottom:10px;">
+                                <input type="checkbox" id="vm-failover-enabled" onchange="toggleFailoverFields()">
+                                <label for="vm-failover-enabled">Enable Failover</label>
+                            </div>
+                            <div id="vm-failover-fields" class="hidden">
+                                <div class="form-row">
+                                    <div class="form-group">
+                                        <label for="vm-failover-strategy">Failover Strategy</label>
+                                        <select id="vm-failover-strategy" onchange="toggleFailoverFields()">
+                                            <option value="backup">backup</option>
+                                            <option value="rotational">rotational</option>
+                                            <option value="duplicate">duplicate (same actual model)</option>
+                                        </select>
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="vm-failover-max-attempts">Max Attempts (optional)</label>
+                                        <input type="number" id="vm-failover-max-attempts" min="1" placeholder="Use global default">
+                                    </div>
+                                </div>
+                                <div class="form-row">
+                                    <div class="form-group">
+                                        <label for="vm-failover-failure-threshold">Failure Threshold (optional)</label>
+                                        <input type="number" id="vm-failover-failure-threshold" min="1" placeholder="Use global default">
+                                    </div>
+                                    <div class="form-group">
+                                        <label for="vm-failover-cooldown-seconds">Cooldown Seconds (optional)</label>
+                                        <input type="number" id="vm-failover-cooldown-seconds" min="1" placeholder="Use global default">
+                                    </div>
+                                </div>
+                                <div class="form-group" id="vm-failover-targets-group">
+                                    <label for="vm-failover-target-select">Failover Targets</label>
+                                    <select id="vm-failover-target-select" multiple size="6"></select>
+                                    <small>Used for backup/rotational; select one or more virtual models</small>
+                                </div>
+                            </div>
                         </div>
                         <div class="actions" style="margin-top:20px;">
                             <button type="submit" class="btn btn-primary">Save Virtual Model</button>
@@ -880,7 +959,12 @@
             const outcome = esc(it.outcome || 'other');
             const statusColor = status >= 200 && status < 400 ? 'var(--accent-green)' : (status >= 500 ? 'var(--accent-red)' : 'var(--accent-yellow)');
             const route = esc((it.method || 'GET') + ' ' + (it.path || ''));
-            const model = esc(it.virtual_model || it.actual_model || '-');
+            const vm = String(it.virtual_model || '').trim();
+            const am = String(it.actual_model || '').trim();
+            const endpoint = esc(it.endpoint_name || (it.endpoint_id ? ('#' + it.endpoint_id) : '-'));
+            const model = vm && am && vm !== am
+                ? `${esc(vm)} <span style="color:var(--text-secondary);">→</span> <code>${esc(am)}</code>`
+                : esc(vm || am || '-');
             const src = esc(it.x_source || '-');
             const ip = esc(it.client_ip || '-');
             const ua = esc(shortUa(it.user_agent));
@@ -893,19 +977,20 @@
                     <td>${fmtTs(it.created_at)}</td>
                     <td>${route}</td>
                     <td>${model}</td>
+                    <td>${endpoint}</td>
                     <td>${ip}</td>
                     <td>${src}</td>
                     <td title="${esc(it.user_agent || '')}">${ua}</td>
                     <td><span style="color:${statusColor};font-weight:600;">${status}</span> <span style="font-size:11px;color:var(--text-secondary);">${outcome}</span> ${streamBadge}</td>
                     <td>${latencyTxt}</td>
                 </tr>
-                ${err ? `<tr class="model-breakdown-row"><td colspan="8" style="font-size:12px;color:var(--text-secondary);">${err}</td></tr>` : ''}
+                ${err ? `<tr class="model-breakdown-row"><td colspan="9" style="font-size:12px;color:var(--text-secondary);">${err}</td></tr>` : ''}
             `;
         }).join('');
 
         target.innerHTML = `
             <table>
-                <thead><tr><th>Time</th><th>Route</th><th>Model</th><th>IP</th><th>Source</th><th>Client</th><th>Status</th><th>Latency</th></tr></thead>
+                <thead><tr><th>Time</th><th>Route</th><th>Model</th><th>Endpoint</th><th>IP</th><th>Source</th><th>Client</th><th>Status</th><th>Latency</th></tr></thead>
                 <tbody>${rows}</tbody>
             </table>
         `;
@@ -972,10 +1057,14 @@
     
     function renderSummaryCards(summary, hasEstimatedModels) {
         const estimateMark = hasEstimatedModels ? '*' : '';
+        const cacheAttempts = Number(summary.cache_attempts || 0);
+        const cacheHits = Number(summary.cache_hits || 0);
+        const cacheHitRate = cacheAttempts > 0 ? ((cacheHits / cacheAttempts) * 100).toFixed(1) : '0.0';
         const cardsHTML = `
             <div class="card" style="margin-top:0;padding:16px;">
                 <div style="color:var(--text-secondary);font-size:12px;text-transform:uppercase;">Total Requests</div>
                 <div style="font-size:28px;font-weight:bold;color:var(--accent);margin-top:8px;">${summary.request_count}</div>
+                <div style="font-size:11px;margin-top:4px;color:var(--text-secondary);">Cache Attempts: ${formatNumber(cacheAttempts)} | Hits: ${formatNumber(cacheHits)}</div>
             </div>
             <div class="card" style="margin-top:0;padding:16px;">
                 <div style="color:var(--text-secondary);font-size:12px;text-transform:uppercase;">Total Tokens${estimateMark}</div>
@@ -991,6 +1080,7 @@
             <div class="card" style="margin-top:0;padding:16px;">
                 <div style="color:var(--text-secondary);font-size:12px;text-transform:uppercase;">Avg Response</div>
                 <div style="font-size:28px;font-weight:bold;color:var(--accent);margin-top:8px;">${summary.avg_response_time_ms?.toFixed(0) || 0}ms</div>
+                <div style="font-size:11px;margin-top:4px;color:var(--text-secondary);">Cache Hit Rate: ${cacheHitRate}% | Savings: $${Number(summary.cache_savings || 0).toFixed(4)}</div>
             </div>
         `;
         document.getElementById('summary-cards').innerHTML = cardsHTML;
@@ -1019,6 +1109,9 @@
                     <td>$${day.cost_estimate?.toFixed(4) || '0.0000'}</td>
                     <td>$${(day.cached_cost_estimate || 0).toFixed(4)}</td>
                     <td>${formatNumber(day.requests)}</td>
+                    <td>${formatNumber(day.cache_attempts || 0)}</td>
+                    <td>${formatNumber(day.cache_hits || 0)}</td>
+                    <td>$${Number(day.cache_savings || 0).toFixed(4)}</td>
                 </tr>
             `;
 
@@ -1031,6 +1124,9 @@
                     <td>$${model.cost_estimate?.toFixed(4) || '0.0000'}</td>
                     <td>$${(model.cached_cost_estimate || 0).toFixed(4)}</td>
                     <td>${formatNumber(model.requests)}</td>
+                    <td>${formatNumber(model.cache_attempts || 0)}</td>
+                    <td>${formatNumber(model.cache_hits || 0)}</td>
+                    <td>$${Number(model.cache_savings || 0).toFixed(4)}</td>
                 </tr>
             `).join('');
 
@@ -1043,7 +1139,7 @@
         
         document.getElementById('daily-breakdown').innerHTML = `
             <table>
-                <thead><tr><th>Date</th><th>Prompt Tokens</th><th>Cached</th><th>Completion</th><th>Cost</th><th>Cached Cost</th><th>Requests</th></tr></thead>
+                <thead><tr><th>Date</th><th>Prompt Tokens</th><th>Cached</th><th>Completion</th><th>Cost</th><th>Cached Cost</th><th>Requests</th><th>Cache Attempts</th><th>Cache Hits</th><th>Savings</th></tr></thead>
                 <tbody>${rows}</tbody>
             </table>
             ${estimateNote}
@@ -1411,6 +1507,7 @@
         document.getElementById('ep-name').value = data ? data.name : '';
         document.getElementById('ep-url').value = data ? data.url : '';
         document.getElementById('ep-key').value = data ? (data.api_key || '') : '';
+        document.getElementById('ep-health-check-url').value = data ? (data.health_check_url || '') : '';
         document.getElementById('ep-type').value = data ? data.endpoint_type : 'openai';
         document.getElementById('ep-priority').value = data ? data.priority : 0;
         document.getElementById('ep-enabled').checked = data ? data.enabled : true;
@@ -1463,7 +1560,8 @@
             oauth_scope: form.oauth_scope.value,
             oauth_refresh_token: form.oauth_refresh_token.value,
             oauth_token_request_format: form.oauth_token_request_format.value,
-            oauth_client_auth_method: form.oauth_client_auth_method.value
+            oauth_client_auth_method: form.oauth_client_auth_method.value,
+            health_check_url: form.health_check_url.value
         };
         
         const method = id ? 'PUT' : 'POST';
@@ -1576,6 +1674,17 @@
         document.getElementById('vm-force-non-streaming').checked = data ? (data.force_non_streaming === 1) : false;
         document.getElementById('vm-show-reasoning').checked = data ? (data.show_reasoning !== 0) : true;
         document.getElementById('vm-enabled').checked = data ? data.enabled : true;
+        document.getElementById('vm-cache-enabled').checked = data ? (data.cache_enabled !== 0) : true;
+
+        const failoverEnabled = !!(data && data.failover_strategy);
+        document.getElementById('vm-failover-enabled').checked = failoverEnabled;
+        document.getElementById('vm-failover-strategy').value = data && data.failover_strategy ? data.failover_strategy : 'backup';
+        document.getElementById('vm-failover-max-attempts').value = data && data.failover_max_attempts ? data.failover_max_attempts : '';
+        document.getElementById('vm-failover-failure-threshold').value = data && data.failover_failure_threshold ? data.failover_failure_threshold : '';
+        document.getElementById('vm-failover-cooldown-seconds').value = data && data.failover_cooldown_seconds ? data.failover_cooldown_seconds : '';
+        const targetIds = parseFailoverTargets(data && data.failover_targets ? data.failover_targets : '[]');
+        loadFailoverTargetOptions(data ? data.id : null, targetIds);
+        toggleFailoverFields();
         document.getElementById('vm-model-list').classList.add('hidden');
         document.getElementById('vm-fetch-status').innerHTML = '';
         
@@ -1641,6 +1750,64 @@
         document.getElementById('vm-form').reset();
         document.getElementById('vm-model-list').classList.add('hidden');
         document.getElementById('vm-fetch-status').innerHTML = '';
+        document.getElementById('vm-failover-fields').classList.add('hidden');
+    }
+
+    function toggleFailoverFields() {
+        const enabled = document.getElementById('vm-failover-enabled').checked;
+        document.getElementById('vm-failover-fields').classList.toggle('hidden', !enabled);
+        const strategy = document.getElementById('vm-failover-strategy').value;
+        const needsTargets = strategy === 'backup' || strategy === 'rotational';
+        document.getElementById('vm-failover-targets-group').classList.toggle('hidden', !needsTargets);
+    }
+
+    function parseFailoverTargets(rawTargets) {
+        try {
+            const targets = typeof rawTargets === 'string' ? JSON.parse(rawTargets) : rawTargets;
+            if (!Array.isArray(targets)) return [];
+            return targets
+                .map(t => t && Number(t.virtual_model_id || 0))
+                .filter(id => Number.isFinite(id) && id > 0)
+                .sort((a, b) => a - b);
+        } catch {
+            return [];
+        }
+    }
+
+    function getSelectedFailoverTargetIds() {
+        const select = document.getElementById('vm-failover-target-select');
+        if (!select) return [];
+        return Array.from(select.selectedOptions)
+            .map(opt => Number(opt.value))
+            .filter(id => Number.isFinite(id) && id > 0);
+    }
+
+    function loadFailoverTargetOptions(currentVmId, selectedIds) {
+        const select = document.getElementById('vm-failover-target-select');
+        if (!select) return;
+        const selectedSet = new Set((selectedIds || []).map(Number));
+        fetch('/api/admin/virtual-models', { credentials: 'same-origin' })
+            .then(r => r.json())
+            .then(data => {
+                if (!Array.isArray(data)) {
+                    select.innerHTML = '';
+                    return;
+                }
+                const rows = data
+                    .filter(vm => Number(vm.id) > 0)
+                    .filter(vm => !currentVmId || Number(vm.id) !== Number(currentVmId))
+                    .sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
+                select.innerHTML = rows
+                    .map(vm => {
+                        const selected = selectedSet.has(Number(vm.id)) ? ' selected' : '';
+                        const endpoint = vm.endpoint_name ? ` - ${vm.endpoint_name}` : '';
+                        return `<option value="${vm.id}"${selected}>${vm.name} (#${vm.id})${endpoint}</option>`;
+                    })
+                    .join('');
+            })
+            .catch(() => {
+                select.innerHTML = '';
+            });
     }
     
     function loadEndpointDropdown(selectedId) {
@@ -1724,7 +1891,20 @@
             disable_streaming: form.disable_streaming.checked ? 1 : 0,
             force_non_streaming: form.force_non_streaming.checked ? 1 : 0,
             show_reasoning: form.show_reasoning.checked ? 1 : 0,
+            cache_enabled: form.cache_enabled.checked,
             enabled: form.enabled.checked
+        };
+
+        const failoverEnabled = document.getElementById('vm-failover-enabled').checked;
+        const failoverStrategy = document.getElementById('vm-failover-strategy').value;
+        const failoverTargetIds = getSelectedFailoverTargetIds();
+        data.failover = {
+            enabled: failoverEnabled,
+            strategy: failoverStrategy,
+            targets: failoverTargetIds.map(id => ({ virtual_model_id: id })),
+            max_attempts: parseInt(document.getElementById('vm-failover-max-attempts').value, 10) || null,
+            failure_threshold: parseInt(document.getElementById('vm-failover-failure-threshold').value, 10) || null,
+            cooldown_seconds: parseInt(document.getElementById('vm-failover-cooldown-seconds').value, 10) || null,
         };
         
         const method = id ? 'PUT' : 'POST';
@@ -1764,7 +1944,7 @@
             .then(data => {
                 const html = data.length ? `
                     <table>
-                        <thead><tr><th>Virtual Name</th><th>Endpoint</th><th>Actual Model</th><th>Cost In/Out ($/1M)</th><th>Cost Cached ($/1M)</th><th>Actions</th></tr></thead>
+                        <thead><tr><th>Virtual Name</th><th>Endpoint</th><th>Actual Model</th><th>Cost In/Out ($/1M)</th><th>Cost Cached ($/1M)</th><th>Cache</th><th>Failover</th><th>Actions</th></tr></thead>
                         <tbody>
                             ${data.map(vm => `
                                 <tr>
@@ -1773,6 +1953,8 @@
                                     <td><code>${vm.actual_model}</code></td>
                                     <td>${(vm.cost_per_1m_tokens_in || 0)} / ${(vm.cost_per_1m_tokens_out || 0)}</td>
                                     <td>${(vm.cost_per_1m_tokens_in_cached || 0)} / ${(vm.cost_per_1m_tokens_out_cached || 0)}</td>
+                                    <td>${vm.cache_enabled === 0 ? 'Disabled' : 'Enabled'}</td>
+                                    <td>${vm.failover_strategy || '-'}</td>
                                     <td class="actions">
                                         <button class="btn btn-secondary btn-sm" onclick="editVM(${vm.id})">Edit</button>
                                         <button class="btn btn-danger btn-sm" onclick="deleteVirtualModel(${vm.id})">Delete</button>
@@ -1799,6 +1981,12 @@
                 document.getElementById('aimenu-url').value = data.aimenu_url || 'http://localhost:5000';
                 document.getElementById('use-ai-queue').checked = data.use_ai_queue === 'true';
                 document.getElementById('ai-queue-url').value = data.ai_queue_url || 'http://host.docker.internal:8102';
+                document.getElementById('cache-ttl-chat').value = data.cache_ttl_chat || '300';
+                document.getElementById('cache-ttl-embeddings').value = data.cache_ttl_embeddings || '3600';
+                document.getElementById('health-check-interval').value = data.health_check_interval || '60';
+                document.getElementById('circuit-failure-threshold').value = data.circuit_failure_threshold || '3';
+                document.getElementById('circuit-failure-window').value = data.circuit_failure_window || '60';
+                document.getElementById('circuit-cooldown-seconds').value = data.circuit_cooldown_seconds || '300';
                 toggleAiQueueUrl();
             })
             .catch(err => console.error('Error loading settings:', err));
@@ -1816,6 +2004,12 @@
             aimenu_url: document.getElementById('aimenu-url').value,
             use_ai_queue: document.getElementById('use-ai-queue').checked ? 'true' : 'false',
             ai_queue_url: document.getElementById('ai-queue-url').value,
+            cache_ttl_chat: document.getElementById('cache-ttl-chat').value,
+            cache_ttl_embeddings: document.getElementById('cache-ttl-embeddings').value,
+            health_check_interval: document.getElementById('health-check-interval').value,
+            circuit_failure_threshold: document.getElementById('circuit-failure-threshold').value,
+            circuit_failure_window: document.getElementById('circuit-failure-window').value,
+            circuit_cooldown_seconds: document.getElementById('circuit-cooldown-seconds').value,
         };
 
         fetch('/api/admin/settings', {

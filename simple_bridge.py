@@ -167,6 +167,207 @@ def _summarize_tool_calls_for_debug(
     return " | ".join(entries)
 
 
+# ============================================================================
+# Endpoint Health Helpers
+# ============================================================================
+
+health_cache: dict[int, dict[str, Any]] = {}
+health_runner_task: Optional[asyncio.Task] = None
+
+
+def load_health_cache() -> None:
+    """Load endpoint health records from DB into memory."""
+    global health_cache
+    health_cache = {}
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM endpoint_health")
+            for row in cursor.fetchall():
+                rec = dict(row)
+                endpoint_id = int(rec.get("endpoint_id") or 0)
+                if endpoint_id > 0:
+                    health_cache[endpoint_id] = rec
+    except Exception as e:
+        debug_log("warn", f"[HEALTH] failed to load health cache: {e}")
+
+
+def _persist_health_record(endpoint_id: int, rec: dict[str, Any]) -> None:
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO endpoint_health
+            (endpoint_id, status, failure_count, last_error, last_failure_at, circuit_until, rate_limit_info)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(endpoint_id) DO UPDATE SET
+                status = excluded.status,
+                failure_count = excluded.failure_count,
+                last_error = excluded.last_error,
+                last_failure_at = excluded.last_failure_at,
+                circuit_until = excluded.circuit_until,
+                rate_limit_info = excluded.rate_limit_info
+            """,
+            (
+                endpoint_id,
+                str(rec.get("status") or "healthy"),
+                int(rec.get("failure_count") or 0),
+                str(rec.get("last_error") or "") or None,
+                int(rec.get("last_failure_at") or 0) or None,
+                int(rec.get("circuit_until") or 0) or None,
+                rec.get("rate_limit_info"),
+            ),
+        )
+        conn.commit()
+
+
+def update_health(endpoint_id: int, status: str, error: Optional[str] = None) -> None:
+    """Set endpoint health state and persist."""
+    now = int(time.time())
+    rec = health_cache.get(endpoint_id, {})
+    rec["status"] = status
+    if status == "healthy":
+        rec["failure_count"] = 0
+        rec["last_error"] = None
+        rec["circuit_until"] = None
+    else:
+        rec["failure_count"] = int(rec.get("failure_count") or 0)
+        rec["last_error"] = _sanitize_activity_error_summary(error or "")
+        rec["last_failure_at"] = now
+    health_cache[endpoint_id] = rec
+    try:
+        _persist_health_record(endpoint_id, rec)
+    except Exception as e:
+        debug_log("warn", f"[HEALTH] persist failed endpoint_id={endpoint_id}: {e}")
+
+
+def increment_health_failure(
+    endpoint_id: int,
+    error: str,
+    threshold_override: Optional[int] = None,
+    cooldown_override: Optional[int] = None,
+) -> None:
+    """Increment failure count and open circuit when threshold is reached."""
+    now = int(time.time())
+    threshold = int(threshold_override or get_setting("circuit_failure_threshold", "3") or 3)
+    cooldown = int(cooldown_override or get_setting("circuit_cooldown_seconds", "300") or 300)
+
+    rec = health_cache.get(
+        endpoint_id,
+        {
+            "status": "healthy",
+            "failure_count": 0,
+            "last_error": None,
+            "last_failure_at": None,
+            "circuit_until": None,
+            "rate_limit_info": None,
+        },
+    )
+    rec["failure_count"] = int(rec.get("failure_count") or 0) + 1
+    rec["last_error"] = _sanitize_activity_error_summary(error)
+    rec["last_failure_at"] = now
+
+    if rec["failure_count"] >= max(1, threshold):
+        rec["status"] = "circuit_open"
+        rec["circuit_until"] = now + max(30, cooldown)
+        debug_log(
+            "warn",
+            f"[HEALTH] circuit opened endpoint_id={endpoint_id} failures={rec['failure_count']} cooldown={cooldown}s",
+        )
+    else:
+        rec["status"] = "unhealthy"
+
+    health_cache[endpoint_id] = rec
+    try:
+        _persist_health_record(endpoint_id, rec)
+    except Exception as e:
+        debug_log("warn", f"[HEALTH] persist failed endpoint_id={endpoint_id}: {e}")
+
+
+def is_endpoint_circuit_open(endpoint_id: Any) -> bool:
+    try:
+        eid = int(endpoint_id or 0)
+    except Exception:
+        return False
+    if eid <= 0:
+        return False
+    rec = health_cache.get(eid) or {}
+    circuit_until = int(rec.get("circuit_until") or 0)
+    if circuit_until > int(time.time()):
+        return True
+    if rec.get("status") == "circuit_open" and circuit_until <= int(time.time()):
+        update_health(eid, "healthy")
+    return False
+
+
+async def health_check_runner() -> None:
+    """Poll configured health endpoints while failover is enabled."""
+    interval = int(get_setting("health_check_interval", "60") or 60)
+    if interval <= 0:
+        return
+
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1 FROM virtual_model_failover LIMIT 1")
+            if not cursor.fetchone():
+                debug_log(
+                    "info",
+                    "[HEALTH] skipping runner start - no virtual models with failover",
+                )
+                return
+    except Exception:
+        return
+
+    debug_log("info", f"[HEALTH] runner started interval={interval}s")
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            with get_db() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT id, health_check_url FROM endpoints WHERE enabled=1 AND COALESCE(TRIM(health_check_url), '') <> ''"
+                )
+                endpoints = cursor.fetchall()
+
+            for row in endpoints:
+                endpoint_id = int(row[0])
+                url = str(row[1] or "").strip()
+                if not url:
+                    continue
+                try:
+                    async with httpx.AsyncClient(timeout=5.0) as client:
+                        resp = await client.get(url)
+
+                    healthy = 200 <= resp.status_code < 300
+                    if healthy:
+                        try:
+                            data = resp.json()
+                            if isinstance(data, dict):
+                                if data.get("healthy") is False:
+                                    healthy = False
+                                if str(data.get("status") or "").lower() in (
+                                    "error",
+                                    "down",
+                                    "unhealthy",
+                                ):
+                                    healthy = False
+                        except Exception:
+                            pass
+
+                    if healthy:
+                        update_health(endpoint_id, "healthy")
+                    else:
+                        increment_health_failure(
+                            endpoint_id,
+                            f"Health check returned HTTP {resp.status_code}",
+                        )
+                except Exception as e:
+                    increment_health_failure(endpoint_id, str(e))
+        except Exception as e:
+            debug_log("warn", f"[HEALTH] runner iteration failed: {e}")
+
+
 def _ollama_options_from_openai(
     temperature: float,
     max_tokens: int,
@@ -923,6 +1124,47 @@ def init_database():
             )
         """)
 
+        # Endpoint health table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS endpoint_health (
+                endpoint_id INTEGER PRIMARY KEY,
+                status TEXT NOT NULL DEFAULT 'healthy',
+                failure_count INTEGER DEFAULT 0,
+                last_error TEXT,
+                last_failure_at INTEGER,
+                circuit_until INTEGER,
+                rate_limit_info TEXT,
+                FOREIGN KEY (endpoint_id) REFERENCES endpoints(id)
+            )
+        """)
+
+        # Virtual model failover config table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS virtual_model_failover (
+                virtual_model_id INTEGER PRIMARY KEY,
+                strategy TEXT NOT NULL,
+                targets TEXT NOT NULL,
+                max_attempts INTEGER,
+                cooldown_seconds INTEGER,
+                failure_threshold INTEGER,
+                FOREIGN KEY (virtual_model_id) REFERENCES virtual_models(id)
+            )
+        """)
+
+        # Response cache table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS response_cache (
+                cache_key TEXT PRIMARY KEY,
+                response_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                hit_count INTEGER DEFAULT 0,
+                model TEXT NOT NULL,
+                cost_in REAL DEFAULT 0,
+                cost_out REAL DEFAULT 0
+            )
+        """)
+
         # Settings table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS settings (
@@ -1133,6 +1375,24 @@ def init_database():
         cursor.execute(
             "INSERT OR IGNORE INTO settings (key, value) VALUES ('auth_enabled', 'false')"
         )
+        cursor.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('cache_ttl_chat', '300')"
+        )
+        cursor.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('cache_ttl_embeddings', '3600')"
+        )
+        cursor.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('health_check_interval', '60')"
+        )
+        cursor.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('circuit_failure_threshold', '3')"
+        )
+        cursor.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('circuit_failure_window', '60')"
+        )
+        cursor.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('circuit_cooldown_seconds', '300')"
+        )
 
         conn.commit()
 
@@ -1142,6 +1402,16 @@ def init_database():
         except:
             try:
                 cursor.execute("ALTER TABLE endpoints ADD COLUMN custom_headers TEXT")
+            except:
+                pass
+
+        try:
+            cursor.execute("SELECT health_check_url FROM endpoints LIMIT 1")
+        except:
+            try:
+                cursor.execute(
+                    "ALTER TABLE endpoints ADD COLUMN health_check_url TEXT DEFAULT ''"
+                )
             except:
                 pass
 
@@ -1250,6 +1520,16 @@ def init_database():
                 pass
 
         try:
+            cursor.execute("SELECT cache_enabled FROM virtual_models LIMIT 1")
+        except:
+            try:
+                cursor.execute(
+                    "ALTER TABLE virtual_models ADD COLUMN cache_enabled INTEGER DEFAULT 1"
+                )
+            except:
+                pass
+
+        try:
             cursor.execute("SELECT cost_in FROM request_usage LIMIT 1")
         except:
             try:
@@ -1299,6 +1579,22 @@ def init_database():
             try:
                 cursor.execute(
                     "ALTER TABLE embedding_usage ADD COLUMN cost_out REAL DEFAULT 0"
+                )
+            except:
+                pass
+
+        try:
+            cursor.execute("SELECT cache_attempted FROM request_usage LIMIT 1")
+        except:
+            try:
+                cursor.execute(
+                    "ALTER TABLE request_usage ADD COLUMN cache_attempted INTEGER DEFAULT 0"
+                )
+            except:
+                pass
+            try:
+                cursor.execute(
+                    "ALTER TABLE request_usage ADD COLUMN cache_hit INTEGER DEFAULT 0"
                 )
             except:
                 pass
@@ -1355,6 +1651,15 @@ def init_database():
         )
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_recent_activity_client_ip ON recent_activity(client_ip)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_endpoint_health_endpoint_id ON endpoint_health(endpoint_id)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_response_cache_expires_at ON response_cache(expires_at)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_response_cache_model ON response_cache(model)"
         )
 
         # Migration: ensure nested tool_call XML pattern exists
@@ -1544,7 +1849,15 @@ def get_virtual_model_cost_cached(virtual_model_name):
         return 0.0, 0.0
 
 
-def log_chat_usage(virtual_model, endpoint_name, endpoint_id, usage, response_time_ms):
+def log_chat_usage(
+    virtual_model,
+    endpoint_name,
+    endpoint_id,
+    usage,
+    response_time_ms,
+    cache_attempted: int = 0,
+    cache_hit: int = 0,
+):
     """Log chat completion usage to request_usage table."""
     try:
         prompt_tokens = usage.get("prompt_tokens", 0) or 0
@@ -1595,8 +1908,9 @@ def log_chat_usage(virtual_model, endpoint_name, endpoint_id, usage, response_ti
                 (virtual_model, endpoint_name, endpoint_id, request_type, 
                  prompt_tokens, completion_tokens, total_tokens, 
                  cached_input_tokens, cache_creation_tokens,
-                 cost_estimate, cost_in, cost_out, cached_cost_estimate, response_time_ms)
-                VALUES (?, ?, ?, 'chat', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 cost_estimate, cost_in, cost_out, cached_cost_estimate, response_time_ms,
+                 cache_attempted, cache_hit)
+                VALUES (?, ?, ?, 'chat', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
                 (
                     virtual_model,
@@ -1612,6 +1926,8 @@ def log_chat_usage(virtual_model, endpoint_name, endpoint_id, usage, response_ti
                     completion_tokens / 1000000 * cost_out,
                     cached_cost_estimate,
                     response_time_ms,
+                    int(cache_attempted or 0),
+                    int(cache_hit or 0),
                 ),
             )
             conn.commit()
@@ -1703,6 +2019,134 @@ def _estimate_openai_oauth_usage(
         "is_estimated": True,
         "estimate_source": "openai_oauth",
     }
+
+
+def is_virtual_model_cache_enabled(model_name: str) -> bool:
+    """Return True when cache is enabled for a virtual model."""
+    vm = get_virtual_model(model_name)
+    if not vm:
+        return False
+    return int(vm.get("cache_enabled") or 1) == 1
+
+
+def _normalize_content_for_cache(content: Any) -> Any:
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        normalized = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = str(block.get("type") or "")
+            if btype in ("text", "input_text", "output_text"):
+                normalized.append(
+                    {"type": btype, "text": str(block.get("text") or "").strip()}
+                )
+            elif btype in ("image_url", "image", "input_image"):
+                normalized.append({"type": "image"})
+        return normalized
+    return content
+
+
+def normalize_request_for_cache(payload: dict[str, Any]) -> str:
+    """Create deterministic cache key for non-streaming requests."""
+    messages = payload.get("messages") or []
+    tools = payload.get("tools") or []
+
+    normalized_messages = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        normalized_messages.append(
+            {
+                "role": str(msg.get("role") or "user"),
+                "content": _normalize_content_for_cache(msg.get("content")),
+                "name": msg.get("name"),
+                "tool_calls": msg.get("tool_calls"),
+            }
+        )
+
+    normalized_tools = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function") if isinstance(tool.get("function"), dict) else {}
+        normalized_tools.append(
+            {
+                "type": str(tool.get("type") or "function"),
+                "name": str(fn.get("name") or ""),
+                "description": str(fn.get("description") or ""),
+                "parameters": fn.get("parameters") if isinstance(fn.get("parameters"), dict) else {},
+            }
+        )
+    normalized_tools = sorted(normalized_tools, key=lambda t: t.get("name") or "")
+
+    key_obj = {
+        "model": payload.get("model"),
+        "messages": normalized_messages,
+        "tools": normalized_tools,
+        "temperature": payload.get("temperature"),
+        "top_p": payload.get("top_p"),
+        "max_tokens": payload.get("max_tokens"),
+        "stop": payload.get("stop"),
+        "presence_penalty": payload.get("presence_penalty"),
+        "frequency_penalty": payload.get("frequency_penalty"),
+    }
+    key_json = json.dumps(key_obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(key_json.encode("utf-8")).hexdigest()
+
+
+def get_cached_response(cache_key: str) -> Optional[dict[str, Any]]:
+    """Fetch cached response by key if unexpired; increments hit count on hit."""
+    now = int(time.time())
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT response_json FROM response_cache WHERE cache_key = ? AND expires_at > ?",
+                (cache_key, now),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            cursor.execute(
+                "UPDATE response_cache SET hit_count = hit_count + 1 WHERE cache_key = ?",
+                (cache_key,),
+            )
+            conn.commit()
+            return json.loads(row[0])
+    except Exception:
+        return None
+
+
+def store_cached_response(cache_key: str, response: dict[str, Any], ttl: int, virtual_model: str) -> None:
+    """Persist cache entry for non-streaming response."""
+    now = int(time.time())
+    expires_at = now + max(1, int(ttl or 1))
+    cost_in, cost_out = get_virtual_model_cost(virtual_model)
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT OR REPLACE INTO response_cache
+                (cache_key, response_json, created_at, expires_at, hit_count, model, cost_in, cost_out)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    cache_key,
+                    json.dumps(response),
+                    now,
+                    expires_at,
+                    0,
+                    virtual_model,
+                    float(cost_in or 0),
+                    float(cost_out or 0),
+                ),
+            )
+            conn.commit()
+    except Exception as e:
+        debug_log("warn", f"[CACHE] store failed key={cache_key[:12]} err={e}")
 
 
 def log_completion_usage(
@@ -1925,6 +2369,34 @@ def log_recent_activity(
             eid = None
 
         endpoint_name_value = (endpoint_name or "").strip()
+        vm_name = str(virtual_model or "").strip()
+
+        if (not endpoint_name_value or not eid) and vm_name:
+            try:
+                with get_db() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        """
+                        SELECT e.id, e.name
+                        FROM virtual_models vm
+                        JOIN endpoints e ON vm.endpoint_id = e.id
+                        WHERE vm.name = ?
+                        LIMIT 1
+                        """,
+                        (vm_name,),
+                    )
+                    route_row = cursor.fetchone()
+                if route_row:
+                    if not eid:
+                        try:
+                            eid = int(route_row[0]) if route_row[0] is not None else None
+                        except Exception:
+                            eid = eid
+                    if not endpoint_name_value:
+                        endpoint_name_value = str(route_row[1] or "")
+            except Exception:
+                pass
+
         if not endpoint_name_value and eid:
             endpoint_name_value = _resolve_endpoint_name(eid)
 
@@ -2075,6 +2547,28 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+async def startup_health_runner():
+    """Initialize health cache and start optional health polling runner."""
+    global health_runner_task
+    load_health_cache()
+    if health_runner_task is None or health_runner_task.done():
+        health_runner_task = asyncio.create_task(health_check_runner())
+
+
+@app.on_event("shutdown")
+async def shutdown_health_runner():
+    """Stop health polling runner on shutdown."""
+    global health_runner_task
+    if health_runner_task is not None and not health_runner_task.done():
+        health_runner_task.cancel()
+        try:
+            await health_runner_task
+        except Exception:
+            pass
+    health_runner_task = None
 
 
 @app.middleware("http")
@@ -2674,6 +3168,8 @@ def _apply_endpoint_defaults(data: dict[str, Any]) -> dict[str, Any]:
         current = out.get(key)
         if current is None or current == "":
             out[key] = value
+    if out.get("health_check_url") is None:
+        out["health_check_url"] = ""
     return out
 
 
@@ -3904,6 +4400,7 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
 
     class VirtualModelBackend(LLMBackend):
         def __init__(self):
+            self.virtual_model_id = vm.get("id")
             self.endpoint_id = vm.get("endpoint_id")
             self.url = vm["endpoint_url"]
             self.api_key = vm.get("endpoint_api_key", "")
@@ -4404,6 +4901,327 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
     return VirtualModelBackend()
 
 
+def get_virtual_model_by_id(vm_id: int) -> Optional[dict]:
+    """Return enabled virtual model row joined with endpoint metadata by id."""
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT vm.*, e.url as endpoint_url, e.api_key as endpoint_api_key,
+                       e.endpoint_type as endpoint_type,
+                       e.oauth_enabled as oauth_enabled,
+                       e.oauth_grant_type as oauth_grant_type,
+                       e.oauth_token_url as oauth_token_url,
+                       e.oauth_client_id as oauth_client_id,
+                       e.oauth_client_secret as oauth_client_secret,
+                       e.oauth_scope as oauth_scope,
+                       e.oauth_refresh_token as oauth_refresh_token,
+                       e.oauth_token_expires_at as oauth_token_expires_at,
+                       e.oauth_token_request_format as oauth_token_request_format,
+                       e.oauth_client_auth_method as oauth_client_auth_method
+                FROM virtual_models vm
+                JOIN endpoints e ON vm.endpoint_id = e.id
+                WHERE vm.id = ? AND vm.enabled = 1 AND e.enabled = 1
+                """,
+                (vm_id,),
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+    except Exception:
+        return None
+
+
+def get_failover_config(vm_id: int) -> Optional[dict]:
+    """Return failover config row for a virtual model."""
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM virtual_model_failover WHERE virtual_model_id = ?",
+                (vm_id,),
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+    except Exception:
+        return None
+
+
+def _normalize_failover_config(payload: Any) -> Optional[dict[str, Any]]:
+    """Validate and normalize failover payload for DB storage."""
+    if not isinstance(payload, dict):
+        return None
+
+    enabled = _coerce_bool(payload.get("enabled", True))
+    strategy = str(payload.get("strategy") or "").strip().lower()
+    if not enabled or strategy in ("", "none"):
+        return None
+    if strategy not in ("backup", "rotational", "duplicate"):
+        return None
+
+    raw_targets = payload.get("targets") or []
+    if isinstance(raw_targets, str):
+        try:
+            raw_targets = json.loads(raw_targets)
+        except Exception:
+            raw_targets = []
+
+    targets: list[dict[str, Any]] = []
+    if isinstance(raw_targets, list):
+        for item in raw_targets:
+            if not isinstance(item, dict):
+                continue
+            try:
+                target_vm_id = int(item.get("virtual_model_id") or 0)
+            except Exception:
+                target_vm_id = 0
+            if target_vm_id <= 0:
+                continue
+            targets.append({"virtual_model_id": target_vm_id})
+
+    if strategy in ("backup", "rotational") and not targets:
+        return None
+
+    def _to_optional_int(value: Any) -> Optional[int]:
+        if value is None or value == "":
+            return None
+        try:
+            ivalue = int(value)
+            return ivalue if ivalue > 0 else None
+        except Exception:
+            return None
+
+    return {
+        "strategy": strategy,
+        "targets": targets,
+        "max_attempts": _to_optional_int(payload.get("max_attempts")),
+        "cooldown_seconds": _to_optional_int(payload.get("cooldown_seconds")),
+        "failure_threshold": _to_optional_int(payload.get("failure_threshold")),
+    }
+
+
+def save_virtual_model_failover(vm_id: int, payload: Any) -> None:
+    """Create/update/delete failover config for a virtual model."""
+    cfg = _normalize_failover_config(payload)
+    with get_db() as conn:
+        cursor = conn.cursor()
+        if not cfg:
+            cursor.execute(
+                "DELETE FROM virtual_model_failover WHERE virtual_model_id = ?",
+                (vm_id,),
+            )
+            conn.commit()
+            return
+
+        cursor.execute(
+            """
+            INSERT OR REPLACE INTO virtual_model_failover
+            (virtual_model_id, strategy, targets, max_attempts, cooldown_seconds, failure_threshold)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                vm_id,
+                cfg["strategy"],
+                json.dumps(cfg["targets"]),
+                cfg["max_attempts"],
+                cfg["cooldown_seconds"],
+                cfg["failure_threshold"],
+            ),
+        )
+        conn.commit()
+
+
+class FailoverBackend(LLMBackend):
+    """Wrapper backend that applies per-virtual-model failover strategy."""
+
+    def __init__(self, primary_backend: LLMBackend, primary_vm: dict, config: dict):
+        self.primary = primary_backend
+        self.primary_vm = primary_vm
+        self.config = config
+        self.strategy = str(config.get("strategy") or "").strip().lower()
+        self.targets = []
+        try:
+            self.targets = (
+                json.loads(config.get("targets") or "[]")
+                if isinstance(config.get("targets"), str)
+                else (config.get("targets") or [])
+            )
+            if not isinstance(self.targets, list):
+                self.targets = []
+        except Exception:
+            self.targets = []
+
+        self.max_attempts = int(
+            config.get("max_attempts")
+            or get_setting("circuit_failure_threshold", "3")
+            or 3
+        )
+        self.failure_threshold = int(
+            config.get("failure_threshold")
+            or get_setting("circuit_failure_threshold", "3")
+            or 3
+        )
+        self.cooldown_seconds = int(
+            config.get("cooldown_seconds")
+            or get_setting("circuit_cooldown_seconds", "300")
+            or 300
+        )
+        self._rr_index = 0
+        # Runtime route metadata exposed to activity logging.
+        self.virtual_model_name = getattr(primary_backend, "virtual_model_name", primary_vm.get("name"))
+        self.model = getattr(primary_backend, "model", primary_vm.get("actual_model"))
+        self.endpoint_id = getattr(primary_backend, "endpoint_id", primary_vm.get("endpoint_id"))
+        self.endpoint_type = getattr(primary_backend, "endpoint_type", primary_vm.get("endpoint_type", ""))
+        self.failover_used = False
+        self.failover_strategy = self.strategy
+        self.routed_virtual_model_name = self.virtual_model_name
+
+    def _set_runtime_route_meta(self, backend: LLMBackend, vm: dict, used_failover: bool) -> None:
+        self.model = getattr(backend, "model", vm.get("actual_model"))
+        self.endpoint_id = getattr(backend, "endpoint_id", vm.get("endpoint_id"))
+        self.endpoint_type = getattr(backend, "endpoint_type", vm.get("endpoint_type", ""))
+        self.failover_used = bool(used_failover)
+        self.routed_virtual_model_name = str(vm.get("name") or "")
+
+    def _build_candidates(self) -> list[tuple[LLMBackend, dict]]:
+        candidates: list[tuple[LLMBackend, dict]] = [(self.primary, self.primary_vm)]
+
+        if self.strategy in ("backup", "rotational"):
+            ordered_vms: list[dict] = []
+            for target in self.targets:
+                if not isinstance(target, dict):
+                    continue
+                try:
+                    vm_id = int(target.get("virtual_model_id") or 0)
+                except Exception:
+                    vm_id = 0
+                if vm_id <= 0:
+                    continue
+                vm = get_virtual_model_by_id(vm_id)
+                if vm:
+                    ordered_vms.append(vm)
+
+            if self.strategy == "rotational" and ordered_vms:
+                offset = self._rr_index % len(ordered_vms)
+                ordered_vms = ordered_vms[offset:] + ordered_vms[:offset]
+                self._rr_index = (self._rr_index + 1) % len(ordered_vms)
+
+            for vm in ordered_vms:
+                candidates.append((create_backend_from_virtual_model(vm), vm))
+
+        elif self.strategy == "duplicate":
+            current_vm_id = int(self.primary_vm.get("id") or 0)
+            actual_model = str(self.primary_vm.get("actual_model") or "").strip()
+            if actual_model:
+                with get_db() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        """
+                        SELECT vm.id
+                        FROM virtual_models vm
+                        JOIN endpoints e ON vm.endpoint_id = e.id
+                        WHERE vm.enabled = 1
+                          AND e.enabled = 1
+                          AND vm.actual_model = ?
+                          AND vm.id != ?
+                        ORDER BY vm.id ASC
+                        """,
+                        (actual_model, current_vm_id),
+                    )
+                    rows = cursor.fetchall()
+                duplicate_vms = []
+                for row in rows:
+                    vm = get_virtual_model_by_id(int(row[0]))
+                    if vm:
+                        duplicate_vms.append(vm)
+                if duplicate_vms:
+                    offset = self._rr_index % len(duplicate_vms)
+                    duplicate_vms = duplicate_vms[offset:] + duplicate_vms[:offset]
+                    self._rr_index = (self._rr_index + 1) % len(duplicate_vms)
+                    for vm in duplicate_vms:
+                        candidates.append((create_backend_from_virtual_model(vm), vm))
+
+        return candidates
+
+    async def chat_completion(
+        self,
+        messages: list,
+        model: str,
+        temperature: float = 0.7,
+        max_tokens: int = 256,
+        top_p: float = 1.0,
+        stream: bool = False,
+        tools: Optional[list] = None,
+        **kwargs,
+    ) -> tuple[Optional[dict], Optional[dict], int]:
+        candidates = self._build_candidates()
+        max_tries = max(1, min(self.max_attempts, len(candidates)))
+        last_err = None
+        last_status = 500
+
+        for idx in range(max_tries):
+            backend, vm = candidates[idx]
+            endpoint_id = int(vm.get("endpoint_id") or 0)
+
+            if endpoint_id > 0 and is_endpoint_circuit_open(endpoint_id):
+                debug_log(
+                    "info",
+                    f"[FAILOVER] skipping endpoint_id={endpoint_id} vm={vm.get('name')} circuit=open",
+                )
+                continue
+
+            result, error, status = await backend.chat_completion(
+                messages=messages,
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                top_p=top_p,
+                stream=stream,
+                tools=tools,
+                **kwargs,
+            )
+
+            if status == 200 and error is None:
+                self._set_runtime_route_meta(backend, vm, used_failover=(idx > 0))
+                if endpoint_id > 0:
+                    update_health(endpoint_id, "healthy")
+                if idx > 0:
+                    debug_log(
+                        "warn",
+                        f"[FAILOVER] switched_to endpoint_id={endpoint_id} vm={vm.get('name')} strategy={self.strategy}",
+                    )
+                return result, error, status
+
+            retryable = status in (429, 500, 502, 503, 504)
+            if endpoint_id > 0 and retryable:
+                increment_health_failure(
+                    endpoint_id,
+                    f"status={status} error={error}",
+                    threshold_override=self.failure_threshold,
+                    cooldown_override=self.cooldown_seconds,
+                )
+
+            last_err = error
+            last_status = int(status or 500)
+            if not retryable:
+                break
+
+        return None, last_err, last_status
+
+    async def embeddings(
+        self,
+        input_text: str,
+        model: str,
+    ) -> tuple[Optional[dict], Optional[dict], int]:
+        return await self.primary.embeddings(input_text=input_text, model=model)
+
+    async def health_check(self) -> bool:
+        endpoint_id = int(getattr(self.primary, "endpoint_id", 0) or 0)
+        if endpoint_id > 0 and is_endpoint_circuit_open(endpoint_id):
+            return False
+        return await self.primary.health_check()
+
+
 def get_backend(model_name: str = None) -> Optional[LLMBackend]:
     """Get backend for a configured virtual model only."""
 
@@ -4417,7 +5235,11 @@ def get_backend(model_name: str = None) -> Optional[LLMBackend]:
             "info",
             f"[BACKEND] Using virtual model backend: {model_name} -> {vm.get('endpoint_type')}",
         )
-        return create_backend_from_virtual_model(vm)
+        primary = create_backend_from_virtual_model(vm)
+        config = get_failover_config(int(vm.get("id") or 0))
+        if config:
+            return FailoverBackend(primary_backend=primary, primary_vm=vm, config=config)
+        return primary
 
     debug_log("warn", f"[BACKEND] Model not found in virtual_models: {model_name}")
     return None
@@ -5368,17 +6190,47 @@ async def chat_completions(request: Request):
     endpoint_type = getattr(backend, "endpoint_type", "")
     actual_model = getattr(backend, "model", model)
 
+    def _current_route_meta() -> tuple[Any, str, str, bool, str, str]:
+        current_endpoint_id = getattr(backend, "endpoint_id", endpoint_id)
+        current_endpoint_type = getattr(backend, "endpoint_type", endpoint_type)
+        current_actual_model = getattr(backend, "model", actual_model)
+        failover_used = bool(getattr(backend, "failover_used", False))
+        failover_strategy = str(getattr(backend, "failover_strategy", "") or "")
+        routed_vm_name = str(getattr(backend, "routed_virtual_model_name", "") or "")
+        return (
+            current_endpoint_id,
+            current_endpoint_type,
+            current_actual_model,
+            failover_used,
+            failover_strategy,
+            routed_vm_name,
+        )
+
     def _log_chat_activity(status_code: int, error_summary: str = "", stream_flag: Optional[bool] = None):
+        (
+            current_endpoint_id,
+            current_endpoint_type,
+            current_actual_model,
+            failover_used,
+            failover_strategy,
+            routed_vm_name,
+        ) = _current_route_meta()
+        summary = str(error_summary or "")
+        if failover_used:
+            route_note = f"failover:{failover_strategy or 'configured'}"
+            if routed_vm_name:
+                route_note += f" -> {routed_vm_name}"
+            summary = f"{summary} | {route_note}" if summary else route_note
         log_recent_activity(
             request_id=request_id,
             method=request.method,
             path=request.url.path,
             request_type="chat",
             virtual_model=virtual_model or "",
-            actual_model=actual_model or "",
+            actual_model=current_actual_model or "",
             endpoint_name="",
-            endpoint_id=endpoint_id,
-            endpoint_type=endpoint_type or "",
+            endpoint_id=current_endpoint_id,
+            endpoint_type=current_endpoint_type or "",
             client_ip=client_ip,
             forwarded_for=forwarded_for,
             x_source=incoming_source,
@@ -5386,7 +6238,7 @@ async def chat_completions(request: Request):
             stream=bool(stream if stream_flag is None else stream_flag),
             status_code=int(status_code or 0),
             response_time_ms=int((time_module.time() - start_time) * 1000),
-            error_summary=error_summary,
+            error_summary=summary,
         )
 
     # Additional OpenAI parameters (include request_id for correlation)
@@ -5408,6 +6260,10 @@ async def chat_completions(request: Request):
 
     # Preserve original stream request from client (before any modifications)
     original_stream = stream
+
+    cache_attempted = 0
+    cache_hit = 0
+    cache_key = None
 
     # Compat mode: if client asks for stream but doesn't accept SSE, force non-streaming
     # BUT still track original request to return proper response format to client
@@ -5431,6 +6287,50 @@ async def chat_completions(request: Request):
             flush=True,
         )
         stream = False
+
+    # Non-stream cache lookup (virtual-model gated)
+    cache_control_req = (request.headers.get("cache-control") or "").lower()
+    if not stream and "no-store" not in cache_control_req and is_virtual_model_cache_enabled(model):
+        cache_attempted = 1
+        try:
+            cache_key = normalize_request_for_cache(
+                {
+                    "model": model,
+                    "messages": messages,
+                    "tools": tools,
+                    "temperature": temperature,
+                    "top_p": top_p,
+                    "max_tokens": max_tokens,
+                    "stop": data.get("stop"),
+                    "presence_penalty": data.get("presence_penalty"),
+                    "frequency_penalty": data.get("frequency_penalty"),
+                }
+            )
+            cached_resp = get_cached_response(cache_key)
+            if cached_resp:
+                cache_hit = 1
+                debug_log("info", f"[CACHE] hit model={model} key={cache_key[:12]}")
+                cached_usage = cached_resp.get("usage") if isinstance(cached_resp, dict) else {}
+                if not isinstance(cached_usage, dict):
+                    cached_usage = {}
+                response_time_ms = int((time_module.time() - start_time) * 1000)
+                log_chat_usage(
+                    virtual_model,
+                    None,
+                    endpoint_id,
+                    cached_usage,
+                    response_time_ms,
+                    cache_attempted=1,
+                    cache_hit=1,
+                )
+                response = JSONResponse(content=cached_resp)
+                response.headers["X-Cache"] = "HIT"
+                _log_chat_activity(200, "", stream_flag=False)
+                return response
+            else:
+                debug_log("info", f"[CACHE] miss model={model} key={cache_key[:12]}")
+        except Exception as e:
+            debug_log("warn", f"[CACHE] lookup failed model={model}: {e}")
 
     # Call backend (handles both AI Queue and RunPod)
     backend_result, error, status_code = await backend.chat_completion(
@@ -5770,7 +6670,15 @@ async def chat_completions(request: Request):
 
         # Log usage for streaming requests BEFORE returning
         response_time_ms = int((time_module.time() - start_time) * 1000)
-        log_chat_usage(model, None, None, usage, response_time_ms)
+        log_chat_usage(
+            model,
+            None,
+            None,
+            usage,
+            response_time_ms,
+            cache_attempted=0,
+            cache_hit=0,
+        )
 
         async def stream_generator():
             async for chunk_data in _generate_sse(
@@ -5986,7 +6894,35 @@ async def chat_completions(request: Request):
                 endpoint_id = cursor.fetchone()[0]
     except:
         pass
-    log_chat_usage(virtual_model, endpoint_name, endpoint_id, usage, response_time_ms)
+    log_chat_usage(
+        virtual_model,
+        endpoint_name,
+        endpoint_id,
+        usage,
+        response_time_ms,
+        cache_attempted=cache_attempted,
+        cache_hit=cache_hit,
+    )
+
+    # Store non-stream cache after successful response when safe
+    if (
+        not stream
+        and cache_attempted == 1
+        and cache_hit == 0
+        and cache_key
+        and is_virtual_model_cache_enabled(model)
+    ):
+        has_tools_resp = bool(tool_calls_data)
+        if not has_tools_resp:
+            ttl = int(get_setting("cache_ttl_chat", "300") or 300)
+            try:
+                store_cached_response(cache_key, response_content, ttl, virtual_model)
+                debug_log(
+                    "info",
+                    f"[CACHE] store model={model} key={cache_key[:12]} ttl={ttl}",
+                )
+            except Exception as e:
+                debug_log("warn", f"[CACHE] store failed model={model}: {e}")
 
     # Build and return response
     response_content = {
@@ -6246,6 +7182,33 @@ async def get_activity_feed(request: Request):
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
+@app.get("/api/admin/health")
+async def get_endpoint_health(request: Request):
+    """Return endpoint health status for admin UI."""
+    auth = validate_session_fastapi(request)
+    if not auth.get("valid"):
+        return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT e.id, e.name, e.endpoint_type,
+                       eh.status, eh.failure_count, eh.last_error, eh.last_failure_at,
+                       eh.circuit_until, eh.rate_limit_info
+                FROM endpoints e
+                LEFT JOIN endpoint_health eh ON eh.endpoint_id = e.id
+                WHERE e.enabled = 1
+                ORDER BY e.name ASC
+                """
+            )
+            rows = [dict(r) for r in cursor.fetchall()]
+        return JSONResponse(content={"endpoints": rows})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
 @app.get("/api/admin/usage")
 async def get_usage_summary(request: Request):
     """Get usage summary with date filtering."""
@@ -6279,7 +7242,10 @@ async def get_usage_summary(request: Request):
                     SUM(cache_creation_tokens) as total_cache_creation_tokens,
                     SUM(cached_cost_estimate) as total_cached_cost,
                     COUNT(*) as request_count,
-                    AVG(response_time_ms) as avg_response_time_ms
+                    AVG(response_time_ms) as avg_response_time_ms,
+                    SUM(cache_attempted) as cache_attempts,
+                    SUM(cache_hit) as cache_hits,
+                    SUM(CASE WHEN cache_hit = 1 THEN cost_estimate ELSE 0 END) as cache_savings
                 FROM request_usage
                 WHERE created_at >= ? AND created_at <= ?
             """
@@ -6303,7 +7269,10 @@ async def get_usage_summary(request: Request):
                     SUM(cache_creation_tokens) as cache_creation_tokens,
                     SUM(cached_cost_estimate) as cached_cost_estimate,
                     SUM(cost_estimate) as cost_estimate,
-                    COUNT(*) as requests
+                    COUNT(*) as requests,
+                    SUM(cache_attempted) as cache_attempts,
+                    SUM(cache_hit) as cache_hits,
+                    SUM(CASE WHEN cache_hit = 1 THEN cost_estimate ELSE 0 END) as cache_savings
                 FROM request_usage
                 WHERE created_at >= ? AND created_at <= ?
             """
@@ -6326,7 +7295,10 @@ async def get_usage_summary(request: Request):
                     SUM(cache_creation_tokens) as cache_creation_tokens,
                     SUM(cached_cost_estimate) as cached_cost_estimate,
                     SUM(cost_estimate) as cost_estimate,
-                    COUNT(*) as requests
+                    COUNT(*) as requests,
+                    SUM(cache_attempted) as cache_attempts,
+                    SUM(cache_hit) as cache_hits,
+                    SUM(CASE WHEN cache_hit = 1 THEN cost_estimate ELSE 0 END) as cache_savings
                 FROM request_usage
                 WHERE created_at >= ? AND created_at <= ?
             """
@@ -6354,6 +7326,9 @@ async def get_usage_summary(request: Request):
                         "cached_cost_estimate": round(mrow[6] or 0, 4),
                         "cost_estimate": round(mrow[7] or 0, 4),
                         "requests": mrow[8] or 0,
+                        "cache_attempts": mrow[9] or 0,
+                        "cache_hits": mrow[10] or 0,
+                        "cache_savings": round(mrow[11] or 0, 4),
                     }
                 )
 
@@ -6370,6 +7345,9 @@ async def get_usage_summary(request: Request):
                         "cached_cost_estimate": round(row[5] or 0, 4),
                         "cost_estimate": round(row[6] or 0, 4),
                         "requests": row[7] or 0,
+                        "cache_attempts": row[8] or 0,
+                        "cache_hits": row[9] or 0,
+                        "cache_savings": round(row[10] or 0, 4),
                         "models": models_by_date.get(row[0], []),
                     }
                 )
@@ -6404,6 +7382,15 @@ async def get_usage_summary(request: Request):
                         "total_cached_cost": round(summary[6] or 0, 4),
                         "request_count": summary[7] or 0,
                         "avg_response_time_ms": round(summary[8] or 0, 2),
+                        "cache_attempts": summary[9] or 0,
+                        "cache_hits": summary[10] or 0,
+                        "cache_hit_rate": round(
+                            (float(summary[10] or 0) / float(summary[9] or 1))
+                            if (summary[9] or 0) > 0
+                            else 0,
+                            4,
+                        ),
+                        "cache_savings": round(summary[11] or 0, 4),
                     },
                     "daily_breakdown": daily_breakdown,
                     "estimated_models": estimated_models,
@@ -7435,6 +8422,50 @@ async def completions(request: Request):
     endpoint_id = getattr(backend, "endpoint_id", None)
     endpoint_type = getattr(backend, "endpoint_type", "")
 
+    cache_enabled = is_virtual_model_cache_enabled(model)
+    cache_control_req = (request.headers.get("cache-control") or "").lower()
+    cache_key = None
+
+    if cache_enabled and "no-store" not in cache_control_req:
+        try:
+            cache_key = normalize_request_for_cache(
+                {
+                    "model": model,
+                    "messages": messages,
+                    "tools": [],
+                    "temperature": temperature,
+                    "top_p": top_p,
+                    "max_tokens": max_tokens,
+                    "stop": stop,
+                }
+            )
+            cached_resp = get_cached_response(cache_key)
+            if cached_resp:
+                response = JSONResponse(content=cached_resp)
+                response.headers["X-Cache"] = "HIT"
+                log_recent_activity(
+                    request_id="",
+                    method=request.method,
+                    path=request.url.path,
+                    request_type="completions",
+                    virtual_model=virtual_model or "",
+                    actual_model=actual_model or "",
+                    endpoint_name="",
+                    endpoint_id=endpoint_id,
+                    endpoint_type=endpoint_type or "",
+                    client_ip=client_ip,
+                    forwarded_for=forwarded_for,
+                    x_source=x_source,
+                    user_agent=user_agent,
+                    stream=False,
+                    status_code=200,
+                    response_time_ms=int((time_module.time() - start_time) * 1000),
+                    error_summary="",
+                )
+                return response
+        except Exception as e:
+            debug_log("warn", f"[CACHE] embeddings lookup failed model={model}: {e}")
+
     # Call backend
     backend_result, error, status_code = await backend.chat_completion(
         messages=messages,
@@ -7521,22 +8552,27 @@ async def completions(request: Request):
     response_time_ms = int((time_module.time() - start_time) * 1000)
     log_completion_usage(model, None, None, usage, response_time_ms)
 
-    response = JSONResponse(
-        content={
-            "id": job_id,
-            "object": "text_completion",
-            "created": int(time_module.time()),
-            "model": model,
-            "choices": [
-                {
-                    "text": content,
-                    "index": 0,
-                    "finish_reason": "stop",
-                }
-            ],
-            "usage": usage,
-        }
-    )
+    response_content = {
+        "id": job_id,
+        "object": "text_completion",
+        "created": int(time_module.time()),
+        "model": model,
+        "choices": [
+            {
+                "text": content,
+                "index": 0,
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": usage,
+    }
+    response = JSONResponse(content=response_content)
+    if cache_enabled and cache_key:
+        try:
+            ttl = int(get_setting("cache_ttl_chat", "300") or 300)
+            store_cached_response(cache_key, response_content, ttl, virtual_model)
+        except Exception as e:
+            debug_log("warn", f"[CACHE] completions store failed model={model}: {e}")
     log_recent_activity(
         request_id=str(job_id),
         method=request.method,
@@ -7603,6 +8639,48 @@ async def embeddings(request: Request):
     actual_model = getattr(backend, "model", model)
     endpoint_id = getattr(backend, "endpoint_id", None)
     endpoint_type = getattr(backend, "endpoint_type", "")
+    cache_enabled = is_virtual_model_cache_enabled(model)
+    cache_control_req = (request.headers.get("cache-control") or "").lower()
+    cache_key = None
+
+    if cache_enabled and "no-store" not in cache_control_req:
+        try:
+            cache_key = normalize_request_for_cache(
+                {
+                    "model": model,
+                    "messages": [{"role": "user", "content": input_text}],
+                    "tools": [],
+                    "temperature": None,
+                    "top_p": None,
+                    "max_tokens": None,
+                }
+            )
+            cached_resp = get_cached_response(cache_key)
+            if cached_resp:
+                response = JSONResponse(content=cached_resp)
+                response.headers["X-Cache"] = "HIT"
+                log_recent_activity(
+                    request_id="",
+                    method=request.method,
+                    path=request.url.path,
+                    request_type="embeddings",
+                    virtual_model=virtual_model or "",
+                    actual_model=actual_model or "",
+                    endpoint_name="",
+                    endpoint_id=endpoint_id,
+                    endpoint_type=endpoint_type or "",
+                    client_ip=client_ip,
+                    forwarded_for=forwarded_for,
+                    x_source=x_source,
+                    user_agent=user_agent,
+                    stream=False,
+                    status_code=200,
+                    response_time_ms=int((time_module.time() - start_time) * 1000),
+                    error_summary="",
+                )
+                return response
+        except Exception as e:
+            debug_log("warn", f"[CACHE] embeddings lookup failed model={model}: {e}")
 
     # Check if backend supports embeddings
     if hasattr(backend, "embeddings"):
@@ -7651,6 +8729,12 @@ async def embeddings(request: Request):
             pass  # Embeddings might not return token usage
 
         response = JSONResponse(content=result)
+        if cache_enabled and cache_key:
+            try:
+                ttl = int(get_setting("cache_ttl_embeddings", "3600") or 3600)
+                store_cached_response(cache_key, result, ttl, virtual_model)
+            except Exception as e:
+                debug_log("warn", f"[CACHE] embeddings store failed model={model}: {e}")
         log_recent_activity(
             request_id="",
             method=request.method,
@@ -7858,9 +8942,10 @@ def admin_endpoints():
                         oauth_enabled, oauth_grant_type, oauth_token_url,
                         oauth_client_id, oauth_client_secret, oauth_scope,
                         oauth_refresh_token, oauth_token_expires_at,
-                        oauth_token_request_format, oauth_client_auth_method
+                        oauth_token_request_format, oauth_client_auth_method,
+                        health_check_url
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                     (
                         data.get("name"),
@@ -7879,6 +8964,7 @@ def admin_endpoints():
                         int(data.get("oauth_token_expires_at", 0) or 0),
                         data.get("oauth_token_request_format", "json"),
                         data.get("oauth_client_auth_method", "client_secret_post"),
+                        data.get("health_check_url", ""),
                     ),
                 )
                 conn.commit()
@@ -7910,7 +8996,7 @@ def update_endpoint(endpoint_id):
                 oauth_enabled = ?, oauth_grant_type = ?, oauth_token_url = ?,
                 oauth_client_id = ?, oauth_client_secret = ?, oauth_scope = ?,
                 oauth_refresh_token = ?, oauth_token_expires_at = ?,
-                oauth_token_request_format = ?, oauth_client_auth_method = ?,
+                oauth_token_request_format = ?, oauth_client_auth_method = ?, health_check_url = ?,
                 updated_at = strftime('%s', 'now')
             WHERE id = ?
         """,
@@ -7931,6 +9017,7 @@ def update_endpoint(endpoint_id):
                 int(data.get("oauth_token_expires_at", 0) or 0),
                 data.get("oauth_token_request_format", "json"),
                 data.get("oauth_client_auth_method", "client_secret_post"),
+                data.get("health_check_url", ""),
                 endpoint_id,
             ),
         )
@@ -8145,7 +9232,7 @@ def update_virtual_model(vm_id):
                 cost_per_1m_tokens_in = ?, cost_per_1m_tokens_out = ?,
                 cost_per_1m_tokens_in_cached = ?, cost_per_1m_tokens_out_cached = ?,
                 disable_streaming = ?, force_non_streaming = ?, custom_headers = ?,
-                enabled = ?, max_tokens = ?, temperature = ?, top_p = ?, system_prompt = ?,
+                enabled = ?, cache_enabled = ?, max_tokens = ?, temperature = ?, top_p = ?, system_prompt = ?,
                 show_reasoning = ?,
                 updated_at = strftime('%s', 'now')
             WHERE id = ?
@@ -8163,6 +9250,7 @@ def update_virtual_model(vm_id):
                 1 if data.get("force_non_streaming") else 0,
                 data.get("custom_headers") or "",
                 1 if data.get("enabled", True) else 0,
+                1 if data.get("cache_enabled", True) else 0,
                 data.get("max_tokens") or 0,
                 data.get("temperature") or 0,
                 data.get("top_p") or 1.0,
@@ -8172,6 +9260,9 @@ def update_virtual_model(vm_id):
             ),
         )
         conn.commit()
+
+    if isinstance(data, dict) and "failover" in data:
+        save_virtual_model_failover(vm_id, data.get("failover"))
 
     return flask_jsonify({"status": "ok"})
 
@@ -8193,8 +9284,8 @@ def create_virtual_model():
                 cost_per_1m_tokens_in, cost_per_1m_tokens_out,
                 cost_per_1m_tokens_in_cached, cost_per_1m_tokens_out_cached,
                 disable_streaming, force_non_streaming, custom_headers,
-                enabled, max_tokens, temperature, top_p, system_prompt, show_reasoning
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                enabled, cache_enabled, max_tokens, temperature, top_p, system_prompt, show_reasoning
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
             (
                 data.get("name"),
@@ -8209,6 +9300,7 @@ def create_virtual_model():
                 1 if data.get("force_non_streaming") else 0,
                 data.get("custom_headers") or "",
                 1 if data.get("enabled", True) else 0,
+                1 if data.get("cache_enabled", True) else 0,
                 data.get("max_tokens") or 0,
                 data.get("temperature") or 0,
                 data.get("top_p") or 1.0,
@@ -8216,7 +9308,11 @@ def create_virtual_model():
                 1 if data.get("show_reasoning", True) else 0,
             ),
         )
+        new_vm_id = cursor.lastrowid
         conn.commit()
+
+    if isinstance(data, dict) and "failover" in data and new_vm_id:
+        save_virtual_model_failover(new_vm_id, data.get("failover"))
 
     return flask_jsonify({"status": "ok"})
 
@@ -8264,9 +9360,15 @@ def api_list_virtual_models():
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT vm.*, e.name as endpoint_name, e.url as endpoint_url
+            SELECT vm.*, e.name as endpoint_name, e.url as endpoint_url,
+                   vf.strategy as failover_strategy,
+                   vf.targets as failover_targets,
+                   vf.max_attempts as failover_max_attempts,
+                   vf.cooldown_seconds as failover_cooldown_seconds,
+                   vf.failure_threshold as failover_failure_threshold
             FROM virtual_models vm
             LEFT JOIN endpoints e ON vm.endpoint_id = e.id
+            LEFT JOIN virtual_model_failover vf ON vf.virtual_model_id = vm.id
             ORDER BY vm.name
         """)
         vms = [dict(row) for row in cursor.fetchall()]
@@ -8287,6 +9389,34 @@ def api_admin_endpoints():
         endpoints = [dict(row) for row in cursor.fetchall()]
 
     return flask_jsonify(endpoints)
+
+
+@flask_app.route("/api/admin/endpoints/health", methods=["GET"])
+@flask_app.route("/api/admin/health", methods=["GET"])
+def api_admin_health():
+    """API: endpoint health status."""
+    auth = validate_session()
+    if not auth.get("valid"):
+        return flask_jsonify({"error": "Unauthorized"}), 401
+
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT e.id, e.name, e.endpoint_type,
+                       eh.status, eh.failure_count, eh.last_error, eh.last_failure_at,
+                       eh.circuit_until, eh.rate_limit_info
+                FROM endpoints e
+                LEFT JOIN endpoint_health eh ON eh.endpoint_id = e.id
+                WHERE e.enabled = 1
+                ORDER BY e.name ASC
+                """
+            )
+            rows = [dict(r) for r in cursor.fetchall()]
+        return flask_jsonify({"endpoints": rows})
+    except Exception as e:
+        return flask_jsonify({"error": str(e)}), 500
 
 
 @flask_app.route("/api/admin/activity", methods=["GET"])
@@ -8346,7 +9476,6 @@ def api_admin_endpoints_create():
     if not data:
         return flask_jsonify({"error": "No data provided"}), 400
     data = _apply_endpoint_defaults(data)
-    data = _preserve_endpoint_oauth_secrets_on_update(endpoint_id, data)
 
     try:
         with get_db() as conn:
@@ -8358,9 +9487,10 @@ def api_admin_endpoints_create():
                     oauth_enabled, oauth_grant_type, oauth_token_url,
                     oauth_client_id, oauth_client_secret, oauth_scope,
                     oauth_refresh_token, oauth_token_expires_at,
-                    oauth_token_request_format, oauth_client_auth_method
+                    oauth_token_request_format, oauth_client_auth_method,
+                    health_check_url
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
                 (
                     data.get("name"),
@@ -8379,6 +9509,7 @@ def api_admin_endpoints_create():
                     int(data.get("oauth_token_expires_at", 0) or 0),
                     data.get("oauth_token_request_format", "json"),
                     data.get("oauth_client_auth_method", "client_secret_post"),
+                    data.get("health_check_url", ""),
                 ),
             )
             conn.commit()
@@ -8400,6 +9531,7 @@ def api_admin_endpoints_update(endpoint_id):
     if not data:
         return flask_jsonify({"error": "No data provided"}), 400
     data = _apply_endpoint_defaults(data)
+    data = _preserve_endpoint_oauth_secrets_on_update(endpoint_id, data)
 
     try:
         with get_db() as conn:
@@ -8411,7 +9543,7 @@ def api_admin_endpoints_update(endpoint_id):
                     oauth_enabled = ?, oauth_grant_type = ?, oauth_token_url = ?,
                     oauth_client_id = ?, oauth_client_secret = ?, oauth_scope = ?,
                     oauth_refresh_token = ?, oauth_token_expires_at = ?,
-                    oauth_token_request_format = ?, oauth_client_auth_method = ?,
+                    oauth_token_request_format = ?, oauth_client_auth_method = ?, health_check_url = ?,
                     updated_at = strftime('%s', 'now')
                 WHERE id = ?
             """,
@@ -8432,6 +9564,7 @@ def api_admin_endpoints_update(endpoint_id):
                     int(data.get("oauth_token_expires_at", 0) or 0),
                     data.get("oauth_token_request_format", "json"),
                     data.get("oauth_client_auth_method", "client_secret_post"),
+                    data.get("health_check_url", ""),
                     endpoint_id,
                 ),
             )
@@ -8806,14 +9939,81 @@ def api_admin_virtual_models():
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT vm.*, e.name as endpoint_name, e.url as endpoint_url
+            SELECT vm.*, e.name as endpoint_name, e.url as endpoint_url,
+                   vf.strategy as failover_strategy,
+                   vf.targets as failover_targets,
+                   vf.max_attempts as failover_max_attempts,
+                   vf.cooldown_seconds as failover_cooldown_seconds,
+                   vf.failure_threshold as failover_failure_threshold
             FROM virtual_models vm
             LEFT JOIN endpoints e ON vm.endpoint_id = e.id
+            LEFT JOIN virtual_model_failover vf ON vf.virtual_model_id = vm.id
             ORDER BY vm.name
         """)
         vms = [dict(row) for row in cursor.fetchall()]
 
     return flask_jsonify(vms)
+
+
+@flask_app.route("/api/admin/virtual-models/<int:vm_id>/failover", methods=["GET"])
+def api_admin_virtual_model_failover_get(vm_id):
+    """API: Get failover config for a virtual model."""
+    auth = validate_session()
+    if not auth.get("valid"):
+        return flask_jsonify({"error": "Unauthorized"}), 401
+
+    config = get_failover_config(vm_id)
+    if not config:
+        return flask_jsonify({"virtual_model_id": vm_id, "enabled": False})
+
+    targets = []
+    try:
+        targets = json.loads(config.get("targets") or "[]")
+        if not isinstance(targets, list):
+            targets = []
+    except Exception:
+        targets = []
+
+    return flask_jsonify(
+        {
+            "virtual_model_id": vm_id,
+            "enabled": True,
+            "strategy": config.get("strategy"),
+            "targets": targets,
+            "max_attempts": config.get("max_attempts"),
+            "cooldown_seconds": config.get("cooldown_seconds"),
+            "failure_threshold": config.get("failure_threshold"),
+        }
+    )
+
+
+@flask_app.route("/api/admin/virtual-models/<int:vm_id>/failover", methods=["PUT", "POST"])
+def api_admin_virtual_model_failover_upsert(vm_id):
+    """API: Create or update failover config for a virtual model."""
+    auth = validate_session()
+    if not auth.get("valid"):
+        return flask_jsonify({"error": "Unauthorized"}), 401
+
+    data = flask_request.json or {}
+    try:
+        save_virtual_model_failover(vm_id, data)
+        return flask_jsonify({"status": "ok"})
+    except Exception as e:
+        return flask_jsonify({"error": str(e)}), 400
+
+
+@flask_app.route("/api/admin/virtual-models/<int:vm_id>/failover", methods=["DELETE"])
+def api_admin_virtual_model_failover_delete(vm_id):
+    """API: Delete failover config for a virtual model."""
+    auth = validate_session()
+    if not auth.get("valid"):
+        return flask_jsonify({"error": "Unauthorized"}), 401
+
+    try:
+        save_virtual_model_failover(vm_id, {"enabled": False})
+        return flask_jsonify({"status": "ok"})
+    except Exception as e:
+        return flask_jsonify({"error": str(e)}), 400
 
 
 def save_setting(key, value):
