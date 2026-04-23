@@ -15,7 +15,7 @@ All notable changes to the Serverless Proxy will be documented in this file.
 ### Changed
 
 - **Default Product Posture** - Preserved `internal_only` as the intended default mode so fresh installs remain easy for private/local users.
-- **Public Runtime Hostname Guidance** - Documented the recommended dedicated hostname approach (for example `api.completeupdates.com`) instead of overloading an existing UI hostname/path space.
+- **Public Runtime Hostname Guidance** - Documented the recommended dedicated hostname approach (for example `api.yourdomain.com`) instead of overloading an existing UI hostname/path space.
 - **Admin Routing Requirements** - Extended Caddy routing documentation to include `/api/admin/inbound-api-keys*` so the new admin API reaches the correct backend.
 - **Production Safety Settings** - Reduced live deployment debug posture to `debug_mode=basic` and `payload_audit_enabled=false` for safer internet-facing use.
 

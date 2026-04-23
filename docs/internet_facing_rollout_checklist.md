@@ -32,9 +32,9 @@ The design goal is:
 
 ### Hostnames
 
-- `ai.completeupdates.com`
+- `ai.yourdomain.com`
   - Existing UI and current routing remain unchanged.
-- `api.completeupdates.com`
+- `api.yourdomain.com`
   - Public runtime API hostname.
   - Explicit Caddy path allowlist only.
 
@@ -155,10 +155,10 @@ Implication:
 
 Verified behavior during rollout:
 
-- Public/internal traffic should use `https://api.completeupdates.com`, not direct `host.docker.internal:8002` access.
+- Public/internal traffic should use `https://api.yourdomain.com`, not direct `host.docker.internal:8002` access.
 - Requests arriving through Caddy come from the Docker peer `172.21.0.1` and must be treated as trusted proxy traffic.
 - Direct `host.docker.internal:8002` calls do not carry the forwarded client IP and will be evaluated as non-internal in `internet_facing` mode.
-- Once internal tools were switched to `https://api.completeupdates.com`, internal access worked correctly without an inbound API key.
+- Once internal tools were switched to `https://api.yourdomain.com`, internal access worked correctly without an inbound API key.
 
 Likely deployment-specific trusted internal CIDR candidates:
 
@@ -186,8 +186,8 @@ These are deployment-specific compatibility candidates, not generic project defa
 - [x] Allowed values are `internal_only` and `internet_facing`
 - [x] Default is `internal_only`
 - [x] `internal_only` preserves current behavior exactly
-- [x] `api.completeupdates.com` is the public runtime hostname
-- [x] `ai.completeupdates.com` remains unchanged
+- [x] `api.yourdomain.com` is the public runtime hostname
+- [x] `ai.yourdomain.com` remains unchanged
 - [x] `/health` remains private-only
 - [x] Public routing uses explicit path allowlists only
 - [x] Lifecycle Ollama routes are LAN-only in `internet_facing`
@@ -288,7 +288,7 @@ These are deployment-specific compatibility candidates, not generic project defa
 
 ### 9. Caddy and Edge Routing
 
-- [x] Add dedicated Caddy site block for `api.completeupdates.com`
+- [x] Add dedicated Caddy site block for `api.yourdomain.com`
 - [x] Use explicit path allowlists only
 - [x] Add explicit public runtime route matchers
 - [x] Add explicit LAN-only lifecycle route matchers
@@ -306,7 +306,7 @@ These are deployment-specific compatibility candidates, not generic project defa
 - [ ] Block public direct access to `:8002`
 - [ ] Block public direct access to `:5001`
 - [ ] Decide whether raw LAN `:8002` remains temporarily allowed
-- [ ] Plan migration of LAN clients to `https://api.completeupdates.com` if needed
+- [ ] Plan migration of LAN clients to `https://api.yourdomain.com` if needed
 
 ### 11. Hardening Before Public Rollout
 
@@ -326,7 +326,7 @@ These are deployment-specific compatibility candidates, not generic project defa
 - [ ] Confirm no unexpected LAN auth failures in `internal_only`
 - [ ] Confirm expected LAN bypass works in `internet_facing`
 - [x] Confirm Docker-based internal callers using `host.docker.internal` do not carry forwarded client identity directly in `internet_facing`
-- [x] Confirm internal callers work when switched to `https://api.completeupdates.com`
+- [x] Confirm internal callers work when switched to `https://api.yourdomain.com`
 - [x] Confirm exact Docker/internal gateway CIDRs needed for compatibility
 
 ### 13. External Validation
@@ -344,7 +344,7 @@ These are deployment-specific compatibility candidates, not generic project defa
 - [ ] Test Anthropic-compatible clients
 - [ ] Test Ollama-compatible clients
 - [ ] Verify explicit path allowlist covers real client methods and aliases
-- [x] Verify internal tools work when targeting `https://api.completeupdates.com` without an explicit port
+- [x] Verify internal tools work when targeting `https://api.yourdomain.com` without an explicit port
 
 ### 15. Documentation
 
@@ -353,7 +353,7 @@ These are deployment-specific compatibility candidates, not generic project defa
 - [ ] Document `deployment_mode`
 - [ ] Document `trusted_internal_cidrs`
 - [ ] Document optional exact Docker subnet addition
-- [ ] Document `api.completeupdates.com`
+- [ ] Document `api.yourdomain.com`
 - [ ] Document same-IP multi-hostname behavior
 - [ ] Document private-only `/health`
 - [ ] Document internal-only lifecycle routes
@@ -391,7 +391,7 @@ These are deployment-specific compatibility candidates, not generic project defa
 
 ### Phase 5: Caddy public hostname
 
-- [x] Add `api.completeupdates.com`
+- [x] Add `api.yourdomain.com`
 - [x] Add explicit public matchers
 - [x] Add explicit LAN-only lifecycle matchers
 - [x] Verify non-allowed paths return `404`
@@ -418,7 +418,7 @@ These are deployment-specific compatibility candidates, not generic project defa
 - [ ] Lifecycle routes are LAN-only in `internet_facing`
 - [ ] `/health` is private-only
 - [ ] Admin routes remain private
-- [ ] `api.completeupdates.com` uses explicit allowlisting only
+- [ ] `api.yourdomain.com` uses explicit allowlisting only
 - [ ] Raw `:8002` is not publicly reachable
 - [ ] Raw `:5001` is not publicly reachable
 - [ ] Effective client IP handling is validated with real LAN traffic

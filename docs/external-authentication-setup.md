@@ -53,15 +53,15 @@ Behavior:
 
 Recommended hostnames:
 
-- `ai.completeupdates.com`
+- `ai.yourdomain.com`
   - existing UI/admin environment
-- `api.completeupdates.com`
+- `api.yourdomain.com`
   - public runtime API hostname
 
 Recommended public entrypoint:
 
 - public traffic should enter through Caddy on `443`
-- internal tools should also use `https://api.completeupdates.com`
+- internal tools should also use `https://api.yourdomain.com`
 - avoid direct use of raw `:8002` in internet-facing mode
 
 Why:
@@ -97,7 +97,7 @@ Practical example:
 
 1. configure an OAuth-backed upstream endpoint in the dashboard
 2. create one or more virtual models
-3. point your coding tools, automations, or private apps at `https://api.completeupdates.com`
+3. point your coding tools, automations, or private apps at `https://api.yourdomain.com`
 4. use dashboard-generated inbound API keys for external systems
 
 That lets you centralize model routing, OAuth, compatibility, and access control in one place.
@@ -175,7 +175,7 @@ Do not blindly trust all `172.16.0.0/12` space. Use exact ranges that you have v
 In internet-facing mode, internal tools should use:
 
 ```text
-https://api.completeupdates.com
+https://api.yourdomain.com
 ```
 
 Do not prefer:
@@ -193,7 +193,7 @@ Why:
 No explicit port is needed for HTTPS access:
 
 ```text
-https://api.completeupdates.com/v1/chat/completions
+https://api.yourdomain.com/v1/chat/completions
 ```
 
 ## 8. Public and Private Route Policy
@@ -295,7 +295,7 @@ Example verified value:
 Create a dedicated public hostname such as:
 
 ```text
-api.completeupdates.com
+api.yourdomain.com
 ```
 
 Use explicit route allowlisting only.
@@ -321,22 +321,22 @@ Important:
 
 Internal tools:
 
-- use `https://api.completeupdates.com`
+- use `https://api.yourdomain.com`
 - no key needed if they come from trusted internal CIDRs
 
 External tools:
 
-- use `https://api.completeupdates.com`
+- use `https://api.yourdomain.com`
 - provide the generated inbound API key
 
 ## 10. Recommended Caddy Configuration
 
-Below is the recommended runtime site block shape for `api.completeupdates.com`.
+Below is the recommended runtime site block shape for `api.yourdomain.com`.
 
 ### Example
 
 ```caddy
-api.completeupdates.com {
+api.yourdomain.com {
     encode gzip zstd
 
     log {
@@ -417,7 +417,7 @@ This prevents accidental exposure of newly added routes.
 Base URL:
 
 ```text
-https://api.completeupdates.com/v1
+https://api.yourdomain.com/v1
 ```
 
 Headers:
@@ -429,12 +429,12 @@ Authorization: Bearer spk_...
 ### Curl example
 
 ```bash
-curl https://api.completeupdates.com/v1/models \
+curl https://api.yourdomain.com/v1/models \
   -H "Authorization: Bearer spk_your_generated_key"
 ```
 
 ```bash
-curl -X POST https://api.completeupdates.com/v1/chat/completions \
+curl -X POST https://api.yourdomain.com/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer spk_your_generated_key" \
   -d '{
@@ -448,14 +448,14 @@ curl -X POST https://api.completeupdates.com/v1/chat/completions \
 Internal tools on trusted internal networks can use the same hostname without a key:
 
 ```bash
-curl https://api.completeupdates.com/v1/models
+curl https://api.yourdomain.com/v1/models
 ```
 
 ## 12. Recommended Validation Checklist
 
 ### Internal validation
 
-- internal tools using `https://api.completeupdates.com` succeed without a key
+- internal tools using `https://api.yourdomain.com` succeed without a key
 - internal tools no longer rely on direct `host.docker.internal:8002`
 - internal-only lifecycle routes remain available only to internal callers
 
@@ -485,7 +485,7 @@ Recommended defaults for the project:
 
 Recommended configuration for internet-facing deployments:
 
-- use `api.completeupdates.com`
+- use `api.yourdomain.com`
 - use explicit Caddy route allowlists
 - use dashboard-generated inbound API keys
 - keep trusted proxy CIDRs separate from trusted internal CIDRs

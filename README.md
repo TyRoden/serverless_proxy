@@ -129,7 +129,7 @@ Use cases:
 Recommended public hostname example:
 
 ```text
-https://api.completeupdates.com
+https://api.yourdomain.com
 ```
 
 Important:
@@ -144,12 +144,12 @@ Full step-by-step guide:
 ### Example external usage
 
 ```bash
-curl https://api.completeupdates.com/v1/models \
+curl https://api.yourdomain.com/v1/models \
   -H "Authorization: Bearer spk_your_generated_key"
 ```
 
 ```bash
-curl -X POST https://api.completeupdates.com/v1/chat/completions \
+curl -X POST https://api.yourdomain.com/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer spk_your_generated_key" \
   -d '{
@@ -161,7 +161,7 @@ curl -X POST https://api.completeupdates.com/v1/chat/completions \
 ### Example internal usage in internet-facing mode
 
 ```bash
-curl https://api.completeupdates.com/v1/models
+curl https://api.yourdomain.com/v1/models
 ```
 
 This works without an inbound API key only when the caller is inside the configured trusted internal CIDR ranges.
