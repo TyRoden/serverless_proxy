@@ -3946,6 +3946,11 @@ def _openai_chat_to_openai_oauth_payload(
     }
     if system_parts:
         payload["instructions"] = "\n\n".join(system_parts)
+    else:
+        # Some Responses-compatible OAuth backends reject requests unless
+        # an instructions field is present, even when the caller provides
+        # only user messages.
+        payload["instructions"] = "You are a helpful assistant."
     # NOTE: Codex/ChatGPT OAuth backend may reject max_output_tokens.
     # Keep payload minimal/compatible by omitting token-limit fields here.
     # NOTE: Codex/ChatGPT OAuth backend may reject OpenAI-style sampling params.
