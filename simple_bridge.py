@@ -36,6 +36,7 @@ from pathlib import Path
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 from contextlib import contextmanager
+import ipaddress
 
 # Flask for admin UI
 from flask import (
@@ -120,6 +121,152 @@ def is_payload_audit_enabled() -> bool:
         "payload_audit_enabled", os.getenv("PAYLOAD_AUDIT_ENABLED", "false")
     )
     return str(value).lower() in ("1", "true", "yes", "on")
+
+
+def get_deployment_mode() -> str:
+    """Return deployment mode. Defaults to internal_only for compatibility."""
+    value = str(get_setting("deployment_mode", "internal_only") or "internal_only")
+    value = value.strip().lower()
+    if value not in ("internal_only", "internet_facing"):
+        return "internal_only"
+    return value
+
+
+def _parse_cidr_list(raw_value: Any, fallback: Optional[list[str]] = None) -> list[ipaddress._BaseNetwork]:
+    networks: list[ipaddress._BaseNetwork] = []
+    entries = [part.strip() for part in str(raw_value or "").split(",") if part.strip()]
+    for entry in entries:
+        try:
+            networks.append(ipaddress.ip_network(entry, strict=False))
+        except ValueError:
+            debug_log("warn", f"[TRUSTED_CIDR] ignoring invalid CIDR '{entry}'")
+    if networks:
+        return networks
+    fallback = fallback or ["127.0.0.1/32"]
+    parsed_fallback: list[ipaddress._BaseNetwork] = []
+    for entry in fallback:
+        try:
+            parsed_fallback.append(ipaddress.ip_network(entry, strict=False))
+        except ValueError:
+            continue
+    return parsed_fallback
+
+
+def get_trusted_internal_networks() -> list[ipaddress._BaseNetwork]:
+    return _parse_cidr_list(
+        get_setting("trusted_internal_cidrs", "127.0.0.1/32"),
+        fallback=["127.0.0.1/32"],
+    )
+
+
+def get_trusted_proxy_networks() -> list[ipaddress._BaseNetwork]:
+    raw = os.getenv("TRUSTED_PROXY_CIDRS", "127.0.0.1/32,172.21.0.0/16")
+    return _parse_cidr_list(raw, fallback=["127.0.0.1/32"])
+
+
+def _ip_in_networks(ip_text: str, networks: list[ipaddress._BaseNetwork]) -> bool:
+    try:
+        ip_obj = ipaddress.ip_address((ip_text or "").strip())
+    except ValueError:
+        return False
+    return any(ip_obj in network for network in networks)
+
+
+def _extract_forwarded_client_ip(forwarded_for: str) -> str:
+    parts = [part.strip() for part in str(forwarded_for or "").split(",") if part.strip()]
+    return parts[0] if parts else ""
+
+
+def resolve_effective_client_ip(request: Request) -> tuple[str, str, str]:
+    direct_client_ip = (getattr(getattr(request, "client", None), "host", "") or "").strip()
+    forwarded_for = (request.headers.get("x-forwarded-for") or "").strip()
+    effective_client_ip = direct_client_ip
+    if direct_client_ip and _ip_in_networks(direct_client_ip, get_trusted_proxy_networks()):
+        forwarded_client_ip = _extract_forwarded_client_ip(forwarded_for)
+        if forwarded_client_ip:
+            effective_client_ip = forwarded_client_ip
+    return (effective_client_ip or "-"), forwarded_for, (direct_client_ip or "-")
+
+
+def is_trusted_internal_request(request: Request) -> bool:
+    effective_client_ip, _, _ = resolve_effective_client_ip(request)
+    return _ip_in_networks(effective_client_ip, get_trusted_internal_networks())
+
+
+def extract_inbound_api_key(request: Request) -> str:
+    auth_header = (request.headers.get("authorization") or "").strip()
+    if auth_header.lower().startswith("bearer "):
+        return auth_header[7:].strip()
+    return (request.headers.get("x-api-key") or "").strip()
+
+
+def verify_inbound_api_key(api_key: str) -> Optional[dict[str, Any]]:
+    if not api_key:
+        return None
+    key_hash = _hash_inbound_api_key(api_key)
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT id, label, key_prefix, enabled, notes, created_at, updated_at,
+                   last_used_at, last_used_ip, last_used_user_agent, revoked_at, key_hash
+            FROM inbound_api_keys
+            WHERE enabled = 1 AND key_hash = ?
+            LIMIT 1
+            """,
+            (key_hash,),
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+
+def mark_inbound_api_key_used(key_id: int, client_ip: str, user_agent: str) -> None:
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE inbound_api_keys
+                SET last_used_at = strftime('%s', 'now'),
+                    last_used_ip = ?,
+                    last_used_user_agent = ?,
+                    updated_at = strftime('%s', 'now')
+                WHERE id = ?
+                """,
+                (client_ip, user_agent[:255], key_id),
+            )
+            conn.commit()
+    except Exception as e:
+        debug_log("warn", f"[INBOUND_KEY] failed to update last-used metadata: {e}")
+
+
+def enforce_runtime_access(request: Request, internal_only: bool = False) -> Optional[JSONResponse]:
+    if get_deployment_mode() == "internal_only":
+        return None
+
+    effective_client_ip, forwarded_for, direct_client_ip = resolve_effective_client_ip(request)
+    debug_log(
+        "info",
+        f"[INGRESS_AUTH] path={request.url.path} direct_ip={direct_client_ip} effective_ip={effective_client_ip} forwarded_for={forwarded_for or '-'} mode={get_deployment_mode()} internal_only={internal_only}",
+    )
+
+    if is_trusted_internal_request(request):
+        return None
+
+    if internal_only:
+        return JSONResponse(status_code=404, content={"error": "Not found"})
+
+    api_key = extract_inbound_api_key(request)
+    key_record = verify_inbound_api_key(api_key)
+    if not key_record:
+        return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+
+    mark_inbound_api_key_used(
+        int(key_record.get("id") or 0),
+        effective_client_ip,
+        (request.headers.get("user-agent") or ""),
+    )
+    return None
 
 
 def debug_log(level, msg):
@@ -1174,6 +1321,23 @@ def init_database():
             )
         """)
 
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS inbound_api_keys (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                label TEXT NOT NULL UNIQUE,
+                key_prefix TEXT NOT NULL,
+                key_hash TEXT NOT NULL,
+                enabled INTEGER DEFAULT 1,
+                notes TEXT DEFAULT '',
+                created_at INTEGER DEFAULT (strftime('%s', 'now')),
+                updated_at INTEGER DEFAULT (strftime('%s', 'now')),
+                last_used_at INTEGER,
+                last_used_ip TEXT,
+                last_used_user_agent TEXT,
+                revoked_at INTEGER
+            )
+        """)
+
         # Tool patterns table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS tool_patterns (
@@ -1374,6 +1538,12 @@ def init_database():
         )
         cursor.execute(
             "INSERT OR IGNORE INTO settings (key, value) VALUES ('auth_enabled', 'false')"
+        )
+        cursor.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('deployment_mode', 'internal_only')"
+        )
+        cursor.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('trusted_internal_cidrs', '127.0.0.1/32')"
         )
         cursor.execute(
             "INSERT OR IGNORE INTO settings (key, value) VALUES ('cache_ttl_chat', '300')"
@@ -1660,6 +1830,12 @@ def init_database():
         )
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_response_cache_model ON response_cache(model)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_inbound_api_keys_enabled ON inbound_api_keys(enabled)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_inbound_api_keys_last_used_at ON inbound_api_keys(last_used_at)"
         )
 
         # Migration: ensure nested tool_call XML pattern exists
@@ -2276,13 +2452,8 @@ ACTIVITY_MAX_AGE_DAYS = int(os.getenv("ACTIVITY_MAX_AGE_DAYS", "30"))
 
 
 def _resolve_activity_client_ip(request: Request) -> tuple[str, str]:
-    forwarded_for = (request.headers.get("x-forwarded-for") or "").strip()
-    client_ip = ""
-    if forwarded_for:
-        client_ip = (forwarded_for.split(",")[0] or "").strip()
-    if not client_ip:
-        client_ip = (getattr(getattr(request, "client", None), "host", "") or "").strip()
-    return (client_ip or "-"), forwarded_for
+    client_ip, forwarded_for, _ = resolve_effective_client_ip(request)
+    return client_ip, forwarded_for
 
 
 def _normalize_activity_request_type(path: str) -> str:
@@ -6042,6 +6213,9 @@ def _filter_tool_calls_by_advertised(
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     """OpenAI-compatible chat completions endpoint."""
+    auth_response = enforce_runtime_access(request)
+    if auth_response is not None:
+        return auth_response
     import time as time_module
     import uuid
 
@@ -7646,6 +7820,9 @@ async def head_v1():
 @app.post("/v1/messages")
 async def anthropic_messages(request: Request):
     """Anthropic API compatible /v1/messages endpoint."""
+    auth_response = enforce_runtime_access(request)
+    if auth_response is not None:
+        return auth_response
     import json as json_module
     import time as time_module
 
@@ -8001,6 +8178,9 @@ async def anthropic_messages(request: Request):
 
 @app.get("/v1/models")
 async def list_models(request: Request):
+    auth_response = enforce_runtime_access(request)
+    if auth_response is not None:
+        return auth_response
     started_at = time_module.time()
     client_ip, forwarded_for = _resolve_activity_client_ip(request)
     x_source = (request.headers.get("x-source") or "").strip()
@@ -8065,12 +8245,18 @@ async def list_models_api_v1_alias(request: Request):
 
 
 @app.get("/api/version")
-async def ollama_version():
+async def ollama_version(request: Request):
+    auth_response = enforce_runtime_access(request)
+    if auth_response is not None:
+        return auth_response
     return {"version": "serverless-proxy"}
 
 
 @app.get("/api/tags")
-async def ollama_tags():
+async def ollama_tags(request: Request):
+    auth_response = enforce_runtime_access(request)
+    if auth_response is not None:
+        return auth_response
     virtual_models = get_enabled_virtual_models()
     models = []
     for vm in virtual_models:
@@ -8093,6 +8279,9 @@ async def ollama_tags():
 
 @app.post("/api/chat")
 async def ollama_chat(request: Request):
+    auth_response = enforce_runtime_access(request)
+    if auth_response is not None:
+        return auth_response
     data = await request.json()
     model = data.get("model")
     if not model:
@@ -8159,6 +8348,9 @@ async def ollama_chat(request: Request):
 
 @app.post("/api/generate")
 async def ollama_generate(request: Request):
+    auth_response = enforce_runtime_access(request)
+    if auth_response is not None:
+        return auth_response
     data = await request.json()
     model = data.get("model")
     if not model:
@@ -8266,6 +8458,9 @@ async def ollama_generate(request: Request):
 @app.post("/api/embed")
 @app.post("/api/embeddings")
 async def ollama_embed(request: Request):
+    auth_response = enforce_runtime_access(request)
+    if auth_response is not None:
+        return auth_response
     data = await request.json()
     model = data.get("model")
     if not model:
@@ -8290,45 +8485,69 @@ async def ollama_embed(request: Request):
 
 @app.post("/api/show")
 async def ollama_show(request: Request):
+    auth_response = enforce_runtime_access(request)
+    if auth_response is not None:
+        return auth_response
     return await _ollama_passthrough(request, "/api/show", method="POST")
 
 
 @app.get("/api/ps")
 @app.post("/api/ps")
 async def ollama_ps(request: Request):
+    auth_response = enforce_runtime_access(request)
+    if auth_response is not None:
+        return auth_response
     method = request.method.upper()
     return await _ollama_passthrough(request, "/api/ps", method=method)
 
 
 @app.post("/api/pull")
 async def ollama_pull(request: Request):
+    auth_response = enforce_runtime_access(request, internal_only=True)
+    if auth_response is not None:
+        return auth_response
     return await _ollama_passthrough(request, "/api/pull", method="POST")
 
 
 @app.post("/api/push")
 async def ollama_push(request: Request):
+    auth_response = enforce_runtime_access(request, internal_only=True)
+    if auth_response is not None:
+        return auth_response
     return await _ollama_passthrough(request, "/api/push", method="POST")
 
 
 @app.post("/api/create")
 async def ollama_create(request: Request):
+    auth_response = enforce_runtime_access(request, internal_only=True)
+    if auth_response is not None:
+        return auth_response
     return await _ollama_passthrough(request, "/api/create", method="POST")
 
 
 @app.post("/api/copy")
 async def ollama_copy(request: Request):
+    auth_response = enforce_runtime_access(request, internal_only=True)
+    if auth_response is not None:
+        return auth_response
     return await _ollama_passthrough(request, "/api/copy", method="POST")
 
 
 @app.delete("/api/delete")
 @app.post("/api/delete")
 async def ollama_delete(request: Request):
+    auth_response = enforce_runtime_access(request, internal_only=True)
+    if auth_response is not None:
+        return auth_response
     method = request.method.upper()
     return await _ollama_passthrough(request, "/api/delete", method=method)
 
 
 @app.head("/api/blobs/{digest}")
 async def ollama_blob_head(request: Request, digest: str):
+    auth_response = enforce_runtime_access(request, internal_only=True)
+    if auth_response is not None:
+        return auth_response
     url, api_key = _resolve_ollama_target_for_request(None)
     if not url:
         return JSONResponse(
@@ -8345,6 +8564,9 @@ async def ollama_blob_head(request: Request, digest: str):
 
 @app.post("/api/blobs/{digest}")
 async def ollama_blob_post(request: Request, digest: str):
+    auth_response = enforce_runtime_access(request, internal_only=True)
+    if auth_response is not None:
+        return auth_response
     url, api_key = _resolve_ollama_target_for_request(None)
     if not url:
         return JSONResponse(
@@ -8375,6 +8597,9 @@ async def completions(request: Request):
     Legacy completions endpoint - converts to chat completions format.
     Many tools still use this for text-only completions.
     """
+    auth_response = enforce_runtime_access(request)
+    if auth_response is not None:
+        return auth_response
     start_time = time_module.time()
     client_ip, forwarded_for = _resolve_activity_client_ip(request)
     x_source = (request.headers.get("x-source") or "").strip()
@@ -8601,6 +8826,9 @@ async def embeddings(request: Request):
     Embeddings endpoint for vector representations.
     Routes to backend if supported, otherwise returns error.
     """
+    auth_response = enforce_runtime_access(request)
+    if auth_response is not None:
+        return auth_response
     start_time = time_module.time()
     client_ip, forwarded_for = _resolve_activity_client_ip(request)
     x_source = (request.headers.get("x-source") or "").strip()
@@ -10030,6 +10258,134 @@ def save_setting(key, value):
     except Exception as e:
         print(f"Error saving setting {key}: {e}")
         return False
+
+
+def _generate_inbound_api_key() -> tuple[str, str]:
+    raw = secrets.token_urlsafe(32)
+    full_key = f"spk_{raw}"
+    return full_key, full_key[:12]
+
+
+def _hash_inbound_api_key(api_key: str) -> str:
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+
+
+def _list_inbound_api_keys() -> list[dict[str, Any]]:
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT id, label, key_prefix, enabled, notes, created_at, updated_at,
+                   last_used_at, last_used_ip, last_used_user_agent, revoked_at
+            FROM inbound_api_keys
+            ORDER BY created_at DESC, id DESC
+            """
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+
+@flask_app.route("/api/admin/inbound-api-keys", methods=["GET"])
+def api_admin_inbound_api_keys_list():
+    auth = validate_session()
+    if not auth.get("valid"):
+        return flask_jsonify({"error": "Unauthorized"}), 401
+
+    try:
+        return flask_jsonify({"items": _list_inbound_api_keys()})
+    except Exception as e:
+        return flask_jsonify({"error": str(e)}), 500
+
+
+@flask_app.route("/api/admin/inbound-api-keys", methods=["POST"])
+def api_admin_inbound_api_keys_create():
+    auth = validate_session()
+    if not auth.get("valid"):
+        return flask_jsonify({"error": "Unauthorized"}), 401
+
+    data = flask_request.json or {}
+    label = str(data.get("label") or "").strip()
+    notes = str(data.get("notes") or "").strip()
+    if not label:
+        return flask_jsonify({"error": "Label is required"}), 400
+
+    full_key, key_prefix = _generate_inbound_api_key()
+    key_hash = _hash_inbound_api_key(full_key)
+
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO inbound_api_keys (label, key_prefix, key_hash, enabled, notes)
+                VALUES (?, ?, ?, 1, ?)
+                """,
+                (label, key_prefix, key_hash, notes),
+            )
+            conn.commit()
+            new_id = cursor.lastrowid
+        return flask_jsonify(
+            {
+                "id": new_id,
+                "label": label,
+                "key_prefix": key_prefix,
+                "api_key": full_key,
+            }
+        )
+    except sqlite3.IntegrityError:
+        return flask_jsonify({"error": "Label already exists"}), 400
+    except Exception as e:
+        return flask_jsonify({"error": str(e)}), 500
+
+
+@flask_app.route("/api/admin/inbound-api-keys/<int:key_id>", methods=["PUT"])
+def api_admin_inbound_api_keys_update(key_id):
+    auth = validate_session()
+    if not auth.get("valid"):
+        return flask_jsonify({"error": "Unauthorized"}), 401
+
+    data = flask_request.json or {}
+    updates = []
+    params = []
+    if "enabled" in data:
+        updates.append("enabled = ?")
+        params.append(1 if data.get("enabled") else 0)
+        updates.append("updated_at = strftime('%s', 'now')")
+    if "notes" in data:
+        updates.append("notes = ?")
+        params.append(str(data.get("notes") or "").strip())
+        if "updated_at = strftime('%s', 'now')" not in updates:
+            updates.append("updated_at = strftime('%s', 'now')")
+    if not updates:
+        return flask_jsonify({"error": "No updates provided"}), 400
+
+    params.append(key_id)
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"UPDATE inbound_api_keys SET {', '.join(updates)} WHERE id = ?",
+                tuple(params),
+            )
+            conn.commit()
+        return flask_jsonify({"status": "ok"})
+    except Exception as e:
+        return flask_jsonify({"error": str(e)}), 500
+
+
+@flask_app.route("/api/admin/inbound-api-keys/<int:key_id>", methods=["DELETE"])
+def api_admin_inbound_api_keys_delete(key_id):
+    auth = validate_session()
+    if not auth.get("valid"):
+        return flask_jsonify({"error": "Unauthorized"}), 401
+
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM inbound_api_keys WHERE id = ?", (key_id,))
+            conn.commit()
+        return flask_jsonify({"status": "ok"})
+    except Exception as e:
+        return flask_jsonify({"error": str(e)}), 500
 
 
 @flask_app.route("/session/validate", methods=["GET"])

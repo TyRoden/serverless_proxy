@@ -1,6 +1,6 @@
 # Serverless Proxy - Universal LLM Gateway
 
-A universal OpenAI-compatible API proxy that bridges standard API requests to multiple backend providers (RunPod, Ollama, OpenAI-compatible APIs, Together AI, etc.). Configure endpoints through a web admin UI and map virtual model names to actual backend models.
+A universal internal and external LLM gateway that bridges standard API requests to multiple backend providers (RunPod, Ollama, OpenAI-compatible APIs, Together AI, OAuth-backed providers, and more). Configure endpoints through the web admin UI, map virtual model names to actual backend models, and optionally expose the proxy safely to other tools with inbound API key generation.
 
 ## Overview
 
@@ -11,8 +11,28 @@ Client (OpenAI format) → Serverless Proxy (port 8002) → Configured Backends
 - **Universal**: Connect to any LLM backend (RunPod, Ollama, OpenAI, OAuth-based OpenAI-compatible providers, Together AI, etc.)
 - **Virtual Models**: Map user-facing model names to actual backend models
 - **Admin UI**: Configure endpoints and virtual models via web interface
+- **Deployment Modes**: Keep installs simple with default `internal_only`, or switch to `internet_facing` when you want secure external access
+- **Inbound API Keys**: Generate labeled API keys for external tools and systems
 - **Tool-Call Compatibility**: Normalize misformatted model tool calls with DB-driven regex patterns
 - **OpenAI-compatible**: Works with any OpenAI client library
+
+## Internal-Only by Default
+
+The proxy should remain easy to install and use for normal users.
+
+Default behavior is:
+
+- `deployment_mode = internal_only`
+- no new inbound runtime API key requirement
+- local and LAN installs continue to work simply
+
+This default should remain in the repo so fresh installs stay easy.
+
+If you want to expose the proxy publicly, you can switch to `internet_facing` mode later in the dashboard.
+
+Detailed guide:
+
+- `docs/external-authentication-setup.md`
 
 ## Quick Start
 
@@ -95,6 +115,56 @@ Base URL: http://localhost:8002/v1
 API Key: any-key-works (or your endpoint's key)
 Model: the-virtual-model-name-you-created
 ```
+
+## Internet-Facing Usage
+
+When you want the proxy to act as a full internal and external gateway for your tools, switch to `internet_facing` mode and place it behind a reverse proxy such as Caddy.
+
+Use cases:
+
+- configure OAuth-backed upstreams once, then let multiple tools consume them through one proxy
+- expose OpenAI-compatible, Anthropic-compatible, and Ollama-compatible routes from one hostname
+- generate inbound API keys for external systems while keeping internal tools easy to use
+
+Recommended public hostname example:
+
+```text
+https://api.completeupdates.com
+```
+
+Important:
+
+- internal tools should also use the hostname through Caddy in internet-facing mode
+- do not rely on raw `host.docker.internal:8002` as the preferred path in internet-facing mode
+
+Full step-by-step guide:
+
+- `docs/external-authentication-setup.md`
+
+### Example external usage
+
+```bash
+curl https://api.completeupdates.com/v1/models \
+  -H "Authorization: Bearer spk_your_generated_key"
+```
+
+```bash
+curl -X POST https://api.completeupdates.com/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer spk_your_generated_key" \
+  -d '{
+    "model": "your-virtual-model-name",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
+```
+
+### Example internal usage in internet-facing mode
+
+```bash
+curl https://api.completeupdates.com/v1/models
+```
+
+This works without an inbound API key only when the caller is inside the configured trusted internal CIDR ranges.
 
 **Example - Test with curl:**
 
@@ -370,6 +440,8 @@ The proxy supports these via DB-backed `tool_patterns` records (not hardcoded), 
 | `8002` | OpenAI-compatible API |
 | `5001` | Admin UI API |
 
+In internet-facing mode, the recommended public path is HTTPS through your reverse proxy hostname instead of direct raw port access.
+
 ## Admin Dashboard
 
 Access the admin dashboard at `/proxy-dashboard`. Authentication is handled by the AI Menu System.
@@ -378,6 +450,8 @@ Access the admin dashboard at `/proxy-dashboard`. Authentication is handled by t
 
 - **Endpoint Management**: Add, edit, delete backend endpoints
 - **Virtual Model Mapping**: Map virtual model names to actual backend models
+- **API Keys Tab**: Generate labeled inbound API keys for external clients
+- **Deployment Mode Setting**: Switch between `internal_only` and `internet_facing`
 - **Activity Tab**: Recent request feed (route/model/IP/source/status/latency) with filters and auto-refresh
 - **Patterns Tab**: Manage tool-call translation patterns in the UI
 - **Model Discovery**: Fetch available models from endpoints
@@ -640,6 +714,8 @@ OLLAMA_RUN_MUTATING=1 ./scripts/ollama_full_surface_conformance.sh
 | `/api/admin/oauth/openai/import-codex` | POST | Import OAuth fields from Codex `auth.json` |
 | `/api/admin/oauth/openai/auth-result` | GET | Poll OAuth popup result by state |
 | `/api/admin/oauth/openai/callback` | GET | OAuth callback handler |
+| `/api/admin/inbound-api-keys` | GET, POST | List/create inbound API keys |
+| `/api/admin/inbound-api-keys/<id>` | PUT, DELETE | Update/delete inbound API keys |
 | `/api/admin/virtual-models` | GET | List virtual models |
 | `/virtual-models` | POST | Create virtual model |
 | `/virtual-models/<id>` | PUT | Update virtual model |
@@ -667,6 +743,7 @@ If you front the dashboard with Caddy (or another reverse proxy), route admin pa
 
 - `127.0.0.1:5001` (Flask/admin):
   - `/api/admin/endpoints*`
+  - `/api/admin/inbound-api-keys*`
   - `/api/admin/virtual-models*`
   - `/api/admin/oauth/*`
   - `/api/admin/endpoints/activity`
@@ -688,11 +765,15 @@ handle @proxy-api-oauth {
     reverse_proxy 127.0.0.1:5001
 }
 
-@proxy-api path /api/admin/endpoints* /api/admin/virtual-models* /api/admin/endpoints/activity /endpoints* /virtual-models*
+@proxy-api path /api/admin/endpoints* /api/admin/inbound-api-keys* /api/admin/virtual-models* /api/admin/endpoints/activity /endpoints* /virtual-models*
 handle @proxy-api {
     reverse_proxy 127.0.0.1:5001
 }
 ```
+
+For a full public-runtime Caddy example with route-by-route explanations, see:
+
+- `docs/external-authentication-setup.md`
 
 ## Backend Types
 
@@ -727,6 +808,8 @@ AI_QUEUE_PRIORITY=NORMAL
 - **Streaming & non-streaming** — Full SSE streaming support
 - **Job polling** — Automatically polls for queued job completion
 - **Session-based auth** — Uses AI Menu System for admin authentication
+- **Inbound API keys** — Generate labeled API keys for external tools and automations
+- **Secure external mode** — Optional public runtime mode with trusted internal bypass and external authentication
 - **Claude Code / OpenCode support** — Compatible with AI coding assistants
 
 ## Supporting AI Coding Assistants (Claude Code, OpenCode, Cursor, etc.)

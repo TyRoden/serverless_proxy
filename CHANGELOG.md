@@ -2,6 +2,42 @@
 
 All notable changes to the Serverless Proxy will be documented in this file.
 
+## [2.4.6] - 2026-04-23
+
+### Added
+
+- **Deployment Modes** - Added `deployment_mode` with `internal_only` and `internet_facing` behavior so the proxy can stay simple by default while supporting secure public exposure when explicitly enabled.
+- **Trusted Internal CIDR Setting** - Added `trusted_internal_cidrs` setting in the dashboard so operators can configure trusted internal networks without code edits.
+- **Inbound API Key Management** - Added dashboard-managed inbound API key support with labeled key generation, one-time secret display, enable/disable, and delete actions.
+- **Dedicated API Keys Admin UI** - Added `API Keys` tab to the dashboard for managing inbound client access.
+- **External Authentication Setup Guide** - Added `docs/external-authentication-setup.md` with step-by-step internet-facing setup, Caddy examples, trusted CIDR guidance, API key usage, and deployment recommendations.
+
+### Changed
+
+- **Default Product Posture** - Preserved `internal_only` as the intended default mode so fresh installs remain easy for private/local users.
+- **Public Runtime Hostname Guidance** - Documented the recommended dedicated hostname approach (for example `api.completeupdates.com`) instead of overloading an existing UI hostname/path space.
+- **Admin Routing Requirements** - Extended Caddy routing documentation to include `/api/admin/inbound-api-keys*` so the new admin API reaches the correct backend.
+- **Production Safety Settings** - Reduced live deployment debug posture to `debug_mode=basic` and `payload_audit_enabled=false` for safer internet-facing use.
+
+### Fixed
+
+- **Public/Internal Trust Separation** - Separated trusted proxy CIDRs from trusted internal client CIDRs so external traffic forwarded by Caddy is not incorrectly treated as internal.
+- **Docker Internal Caller Compatibility** - Documented and validated the distinction between Docker gateway/proxy traffic and Docker-based internal client traffic when using `host.docker.internal`.
+- **API Keys Page Routing** - Fixed admin API routing omission so `/api/admin/inbound-api-keys*` is served by the Flask/admin backend instead of falling through to HTML responses.
+
+### Documentation
+
+- **README Deployment Guidance** - Expanded README to explain default internal-only behavior, internet-facing usage, inbound API keys, reverse-proxy routing, and the new external authentication guide.
+- **Rollout Checklist Updates** - Updated `docs/internet_facing_rollout_checklist.md` with verified Docker/Caddy behavior and rollout findings.
+
+### Validation
+
+- Verified Python syntax (`python3 -m py_compile simple_bridge.py`).
+- Rebuilt and restarted the proxy container repeatedly during staged validation.
+- Validated Caddy syntax for staged and live configs.
+- Verified internal hostname-based access without inbound API key from trusted internal ranges.
+- Verified public hostname routing, private `/health`, and dashboard API key generation/use flow.
+
 ## [2.4.5] - 2026-04-20
 
 ### Added
