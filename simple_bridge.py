@@ -9114,6 +9114,7 @@ def admin_index():
         virtual_models=virtual_models,
         auth_enabled=is_auth_enabled(),
         use_ai_queue=get_setting("use_ai_queue", "false") == "true",
+        initial_settings_json=json.dumps(_get_all_settings()),
     )
 
 
@@ -9143,6 +9144,7 @@ def proxy_dashboard():
         virtual_models=virtual_models,
         auth_enabled=is_auth_enabled(),
         use_ai_queue=get_setting("use_ai_queue", "false") == "true",
+        initial_settings_json=json.dumps(_get_all_settings()),
     )
 
 
@@ -10284,6 +10286,16 @@ def _list_inbound_api_keys() -> list[dict[str, Any]]:
         return [dict(row) for row in cursor.fetchall()]
 
 
+def _get_all_settings() -> dict[str, str]:
+    settings: dict[str, str] = {}
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT key, value FROM settings")
+        for row in cursor.fetchall():
+            settings[row["key"]] = row["value"]
+    return settings
+
+
 @flask_app.route("/api/admin/inbound-api-keys", methods=["GET"])
 def api_admin_inbound_api_keys_list():
     auth = validate_session()
@@ -10423,14 +10435,7 @@ def api_admin_settings_get():
     if not auth.get("valid"):
         return flask_jsonify({"error": "Unauthorized"}), 401
 
-    settings = {}
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT key, value FROM settings")
-        for row in cursor.fetchall():
-            settings[row["key"]] = row["value"]
-
-    return flask_jsonify(settings)
+    return flask_jsonify(_get_all_settings())
 
 
 ENV_KEY_MAP = {

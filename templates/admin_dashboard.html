@@ -169,6 +169,9 @@
             padding-left: 32px;
         }
     </style>
+    <script>
+        window.initialSettings = JSON.parse({{ (initial_settings_json or '{}') | tojson }});
+    </script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
@@ -2028,26 +2031,61 @@
 
     // Settings tab
     function loadSettings() {
-        fetch('/api/admin/settings', { credentials: 'same-origin' })
-            .then(resp => resp.json())
-            .then(data => {
-                document.getElementById('deployment-mode').value = data.deployment_mode || 'internal_only';
-                document.getElementById('trusted-internal-cidrs').value = data.trusted_internal_cidrs || '127.0.0.1/32';
-                document.getElementById('api-port').value = data.api_port || '8002';
-                document.getElementById('flask-port').value = data.flask_port || '5001';
-                document.getElementById('aimenu-url').value = data.aimenu_url || 'http://localhost:5000';
-                document.getElementById('use-ai-queue').checked = data.use_ai_queue === 'true';
-                document.getElementById('ai-queue-url').value = data.ai_queue_url || 'http://host.docker.internal:8102';
-                document.getElementById('cache-ttl-chat').value = data.cache_ttl_chat || '300';
-                document.getElementById('cache-ttl-embeddings').value = data.cache_ttl_embeddings || '3600';
-                document.getElementById('health-check-interval').value = data.health_check_interval || '60';
-                document.getElementById('circuit-failure-threshold').value = data.circuit_failure_threshold || '3';
-                document.getElementById('circuit-failure-window').value = data.circuit_failure_window || '60';
-                document.getElementById('circuit-cooldown-seconds').value = data.circuit_cooldown_seconds || '300';
-                toggleAiQueueUrl();
-                toggleDeploymentModeHelp();
+        if (window.initialSettings && typeof window.initialSettings === 'object' && Object.prototype.hasOwnProperty.call(window.initialSettings, 'deployment_mode')) {
+            applySettings(window.initialSettings);
+            return;
+        }
+        const settingsUrl = new URL('/api/admin/settings', window.location.origin).toString();
+        fetch(settingsUrl, {
+            credentials: 'include',
+            headers: {
+                'Accept': 'application/json'
+            }
+        })
+            .then(resp => {
+                if (!resp.ok) {
+                    throw new Error('Settings request failed with status ' + resp.status);
+                }
+                return resp.text().then(text => {
+                    try {
+                        return JSON.parse(text);
+                    } catch (err) {
+                        const preview = text.slice(0, 80);
+                        throw new Error('Settings endpoint did not return JSON. URL=' + resp.url + ' redirected=' + resp.redirected + ' contentType=' + (resp.headers.get('content-type') || '-') + ' firstBytes=' + preview);
+                    }
+                });
             })
-            .catch(err => console.error('Error loading settings:', err));
+            .then(data => {
+                applySettings(data);
+            })
+            .catch(err => {
+                console.error('Error loading settings:', err);
+                alert('Error loading settings: ' + err.message + '. The displayed values may be stale defaults.');
+            });
+    }
+
+    function applySettings(data) {
+        if (!data || typeof data !== 'object') {
+            throw new Error('Settings response was not valid JSON data');
+        }
+        if (!Object.prototype.hasOwnProperty.call(data, 'deployment_mode')) {
+            throw new Error('Settings response did not include deployment_mode');
+        }
+        document.getElementById('deployment-mode').value = data.deployment_mode || 'internal_only';
+        document.getElementById('trusted-internal-cidrs').value = data.trusted_internal_cidrs || '127.0.0.1/32';
+        document.getElementById('api-port').value = data.api_port || '8002';
+        document.getElementById('flask-port').value = data.flask_port || '5001';
+        document.getElementById('aimenu-url').value = data.aimenu_url || 'http://localhost:5000';
+        document.getElementById('use-ai-queue').checked = data.use_ai_queue === 'true';
+        document.getElementById('ai-queue-url').value = data.ai_queue_url || 'http://host.docker.internal:8102';
+        document.getElementById('cache-ttl-chat').value = data.cache_ttl_chat || '300';
+        document.getElementById('cache-ttl-embeddings').value = data.cache_ttl_embeddings || '3600';
+        document.getElementById('health-check-interval').value = data.health_check_interval || '60';
+        document.getElementById('circuit-failure-threshold').value = data.circuit_failure_threshold || '3';
+        document.getElementById('circuit-failure-window').value = data.circuit_failure_window || '60';
+        document.getElementById('circuit-cooldown-seconds').value = data.circuit_cooldown_seconds || '300';
+        toggleAiQueueUrl();
+        toggleDeploymentModeHelp();
     }
 
     function toggleAiQueueUrl() {
@@ -2084,11 +2122,14 @@
             circuit_cooldown_seconds: document.getElementById('circuit-cooldown-seconds').value,
         };
 
-        fetch('/api/admin/settings', {
+        fetch(new URL('/api/admin/settings', window.location.origin).toString(), {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json'
+            },
             body: JSON.stringify(settings),
-            credentials: 'same-origin'
+            credentials: 'include'
         })
         .then(resp => resp.json())
         .then(data => {
@@ -2129,7 +2170,12 @@
     }
 
     function loadApiKeys() {
-        fetch('/api/admin/inbound-api-keys', { credentials: 'same-origin' })
+        fetch(new URL('/api/admin/inbound-api-keys', window.location.origin).toString(), {
+            credentials: 'include',
+            headers: {
+                'Accept': 'application/json'
+            }
+        })
             .then(r => r.json())
             .then(data => {
                 const items = Array.isArray(data.items) ? data.items : [];
@@ -2165,10 +2211,13 @@
         event.preventDefault();
         const label = document.getElementById('api-key-label').value.trim();
         const notes = document.getElementById('api-key-notes').value.trim();
-        fetch('/api/admin/inbound-api-keys', {
+        fetch(new URL('/api/admin/inbound-api-keys', window.location.origin).toString(), {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            credentials: 'same-origin',
+            headers: {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json'
+            },
+            credentials: 'include',
             body: JSON.stringify({ label, notes })
         })
         .then(r => r.json())
@@ -2185,10 +2234,13 @@
     }
 
     function toggleApiKeyEnabled(id, enabled) {
-        fetch('/api/admin/inbound-api-keys/' + id, {
+        fetch(new URL('/api/admin/inbound-api-keys/' + id, window.location.origin).toString(), {
             method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            credentials: 'same-origin',
+            headers: {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json'
+            },
+            credentials: 'include',
             body: JSON.stringify({ enabled: enabled === 'true' })
         })
         .then(r => r.json())
@@ -2201,9 +2253,12 @@
 
     function deleteApiKey(id) {
         if (!confirm('Delete this inbound API key?')) return;
-        fetch('/api/admin/inbound-api-keys/' + id, {
+        fetch(new URL('/api/admin/inbound-api-keys/' + id, window.location.origin).toString(), {
             method: 'DELETE',
-            credentials: 'same-origin'
+            headers: {
+                'Accept': 'application/json'
+            },
+            credentials: 'include'
         })
         .then(r => r.json())
         .then(data => {
