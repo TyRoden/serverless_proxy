@@ -11,6 +11,7 @@ All notable changes to the Serverless Proxy will be documented in this file.
 - **Inbound API Key Management** - Added dashboard-managed inbound API key support with labeled key generation, one-time secret display, enable/disable, and delete actions.
 - **Dedicated API Keys Admin UI** - Added `API Keys` tab to the dashboard for managing inbound client access.
 - **External Authentication Setup Guide** - Added `docs/external-authentication-setup.md` with step-by-step internet-facing setup, Caddy examples, trusted CIDR guidance, API key usage, and deployment recommendations.
+- **Configurable Dashboard Timezone Setting** - Added a `Display Timezone` setting with `Server Local Time` default plus common world timezone options for dashboard/reporting views.
 
 ### Changed
 
@@ -24,10 +25,12 @@ All notable changes to the Serverless Proxy will be documented in this file.
 - **Public/Internal Trust Separation** - Separated trusted proxy CIDRs from trusted internal client CIDRs so external traffic forwarded by Caddy is not incorrectly treated as internal.
 - **Docker Internal Caller Compatibility** - Documented and validated the distinction between Docker gateway/proxy traffic and Docker-based internal client traffic when using `host.docker.internal`.
 - **API Keys Page Routing** - Fixed admin API routing omission so `/api/admin/inbound-api-keys*` is served by the Flask/admin backend instead of falling through to HTML responses.
+- **Timezone Rendering Consistency** - Fixed dashboard settings/activity timezone helpers and usage export formatting so the selected timezone is applied consistently without hardcoded EST offsets.
 
 ### Documentation
 
 - **README Deployment Guidance** - Expanded README to explain default internal-only behavior, internet-facing usage, inbound API keys, reverse-proxy routing, and the new external authentication guide.
+- **README Timezone Notes** - Documented the new configurable dashboard/reporting timezone behavior and `Server Local Time` default.
 - **Rollout Checklist Updates** - Updated `docs/internet_facing_rollout_checklist.md` with verified Docker/Caddy behavior and rollout findings.
 
 ### Validation

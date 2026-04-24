@@ -393,6 +393,11 @@
                 <input type="text" id="aimenu-url" value="http://localhost:5000" placeholder="http://localhost:5000">
                 <small>URL for AI Menu authentication service</small>
             </div>
+            <div class="form-group">
+                <label for="display-timezone">Display Timezone</label>
+                <select id="display-timezone"></select>
+                <small id="display-timezone-help">Controls dashboard and reporting timestamps. Default uses server local time.</small>
+            </div>
             <div class="form-group" style="margin-bottom:10px;">
                 <div class="checkbox-row" style="margin-top:0;">
                     <input type="checkbox" id="use-ai-queue" onchange="toggleAiQueueUrl()">
@@ -1001,11 +1006,6 @@
             .replace(/>/g, '&gt;')
             .replace(/"/g, '&quot;')
             .replace(/'/g, '&#39;');
-        const fmtTs = (s) => {
-            const n = Number(s || 0) * 1000;
-            if (!n) return '-';
-            return new Date(n).toLocaleString();
-        };
         const shortUa = (ua) => {
             const t = String(ua || '').trim();
             if (!t) return '-';
@@ -2064,6 +2064,38 @@
             });
     }
 
+    let configuredTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+    function fmtConfiguredTs(ms) {
+        return new Intl.DateTimeFormat('en-US', {
+            timeZone: configuredTimeZone,
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+            hour12: true,
+            timeZoneName: 'short'
+        }).format(new Date(ms));
+    }
+
+    function fmtTs(s) {
+        const n = Number(s || 0) * 1000;
+        if (!n) return '-';
+        return fmtConfiguredTs(n);
+    }
+
+    function populateTimezoneOptions(data) {
+        const select = document.getElementById('display-timezone');
+        const options = Array.isArray(data.common_timezones) && data.common_timezones.length
+            ? data.common_timezones
+            : ['Server Local Time', 'UTC', 'America/New_York'];
+        select.innerHTML = options.map(tz => `<option value="${tz}">${tz}</option>`).join('');
+        select.value = data.display_timezone || 'Server Local Time';
+        configuredTimeZone = data.display_timezone_effective || data.server_timezone || 'UTC';
+        document.getElementById('display-timezone-help').textContent = `Controls dashboard and reporting timestamps. Default uses server local time. Server timezone: ${data.server_timezone || 'UTC'}. Effective timezone: ${configuredTimeZone}.`;
+    }
+
     function applySettings(data) {
         if (!data || typeof data !== 'object') {
             throw new Error('Settings response was not valid JSON data');
@@ -2076,6 +2108,7 @@
         document.getElementById('api-port').value = data.api_port || '8002';
         document.getElementById('flask-port').value = data.flask_port || '5001';
         document.getElementById('aimenu-url').value = data.aimenu_url || 'http://localhost:5000';
+        populateTimezoneOptions(data);
         document.getElementById('use-ai-queue').checked = data.use_ai_queue === 'true';
         document.getElementById('ai-queue-url').value = data.ai_queue_url || 'http://host.docker.internal:8102';
         document.getElementById('cache-ttl-chat').value = data.cache_ttl_chat || '300';
@@ -2112,6 +2145,7 @@
             api_port: document.getElementById('api-port').value,
             flask_port: document.getElementById('flask-port').value,
             aimenu_url: document.getElementById('aimenu-url').value,
+            display_timezone: document.getElementById('display-timezone').value,
             use_ai_queue: document.getElementById('use-ai-queue').checked ? 'true' : 'false',
             ai_queue_url: document.getElementById('ai-queue-url').value,
             cache_ttl_chat: document.getElementById('cache-ttl-chat').value,
@@ -2154,7 +2188,7 @@
     function fmtApiKeyTs(value) {
         const n = Number(value || 0);
         if (!n) return '-';
-        return new Date(n * 1000).toLocaleString();
+        return fmtConfiguredTs(n * 1000);
     }
 
     function openApiKeyModal() {

@@ -452,10 +452,19 @@ Access the admin dashboard at `/proxy-dashboard`. Authentication is handled by t
 - **Virtual Model Mapping**: Map virtual model names to actual backend models
 - **API Keys Tab**: Generate labeled inbound API keys for external clients
 - **Deployment Mode Setting**: Switch between `internal_only` and `internet_facing`
+- **Configurable Dashboard Timezone**: Choose `Server Local Time` or a common IANA timezone for dashboard/report exports
 - **Activity Tab**: Recent request feed (route/model/IP/source/status/latency) with filters and auto-refresh
 - **Patterns Tab**: Manage tool-call translation patterns in the UI
 - **Model Discovery**: Fetch available models from endpoints
 - **Enable/Disable**: Toggle endpoints and virtual models
+
+### Settings Notes
+
+- **Display Timezone** defaults to `Server Local Time`
+- You can switch to common world timezones like `America/New_York`, `UTC`, `Europe/London`, or `Asia/Tokyo`
+- Dashboard activity timestamps, API key timestamps, and usage CSV export timestamps use the selected timezone
+- Usage/day grouping is based on the configured display timezone, so DST-aware zones like `America/New_York` are handled correctly
+- Raw Unix timestamps stored in SQLite are unchanged
 
 ### Endpoint Configuration
 

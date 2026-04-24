@@ -32,6 +32,8 @@ import re
 import hashlib
 import sqlite3
 import urllib.parse
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from abc import ABC, abstractmethod
 from typing import Any, Optional
@@ -68,6 +70,39 @@ AUTH_ENABLED = is_auth_enabled()
 DATABASE_PATH = os.getenv("DATABASE_PATH", "/data/proxy.db")
 
 
+def _get_server_timezone_name() -> str:
+    tzinfo = datetime.now().astimezone().tzinfo
+    if isinstance(tzinfo, ZoneInfo):
+        return tzinfo.key
+    name = str(tzinfo or "").strip()
+    return name or "UTC"
+
+
+COMMON_TIMEZONES = [
+    "Server Local Time",
+    "UTC",
+    "America/New_York",
+    "America/Chicago",
+    "America/Denver",
+    "America/Los_Angeles",
+    "America/Phoenix",
+    "America/Anchorage",
+    "Pacific/Honolulu",
+    "Europe/London",
+    "Europe/Paris",
+    "Europe/Berlin",
+    "Europe/Athens",
+    "Asia/Dubai",
+    "Asia/Kolkata",
+    "Asia/Bangkok",
+    "Asia/Singapore",
+    "Asia/Tokyo",
+    "Asia/Seoul",
+    "Australia/Sydney",
+    "Pacific/Auckland",
+]
+
+
 def get_db_connection():
     """Get database connection."""
     os.makedirs(os.path.dirname(DATABASE_PATH), exist_ok=True)
@@ -98,6 +133,41 @@ def get_setting(key, default=None):
     except Exception as e:
         print(f"Error getting setting {key}: {e}")
     return default
+
+
+def get_display_timezone_name() -> str:
+    raw_value = str(
+        get_setting("display_timezone", "Server Local Time") or "Server Local Time"
+    ).strip()
+    if not raw_value or raw_value == "Server Local Time":
+        return _get_server_timezone_name()
+    try:
+        ZoneInfo(raw_value)
+        return raw_value
+    except Exception:
+        return _get_server_timezone_name()
+
+
+def _get_display_timezone() -> ZoneInfo:
+    return ZoneInfo(get_display_timezone_name())
+
+
+def _display_date_key(ts: Any) -> str:
+    try:
+        return datetime.fromtimestamp(int(ts), tz=_get_display_timezone()).strftime(
+            "%Y-%m-%d"
+        )
+    except Exception:
+        return "1970-01-01"
+
+
+def _display_datetime_string(ts: Any) -> str:
+    try:
+        return datetime.fromtimestamp(int(ts), tz=_get_display_timezone()).strftime(
+            "%Y-%m-%d %H:%M:%S %Z"
+        )
+    except Exception:
+        return "1970-01-01 00:00:00 UTC"
 
 
 def get_api_port():
@@ -7441,7 +7511,7 @@ async def get_usage_summary(request: Request):
             # Daily breakdown
             daily_query = """
                 SELECT 
-                    strftime('%Y-%m-%d', datetime(created_at, 'unixepoch')) as date,
+                    strftime('%Y-%m-%d', datetime(created_at, 'unixepoch', '-5 hours')) as date,
                     SUM(prompt_tokens) as prompt_tokens,
                     SUM(completion_tokens) as completion_tokens,
                     SUM(cached_input_tokens) as cached_input_tokens,
@@ -7466,7 +7536,7 @@ async def get_usage_summary(request: Request):
 
             daily_model_query = """
                 SELECT
-                    strftime('%Y-%m-%d', datetime(created_at, 'unixepoch')) as date,
+                    strftime('%Y-%m-%d', datetime(created_at, 'unixepoch', '-5 hours')) as date,
                     virtual_model,
                     SUM(prompt_tokens) as prompt_tokens,
                     SUM(completion_tokens) as completion_tokens,
@@ -7688,7 +7758,7 @@ async def export_usage_csv(request: Request):
 
             base_query = """
                 SELECT 
-                    datetime(created_at, 'unixepoch', 'localtime') as date,
+                    created_at,
                     virtual_model,
                     COALESCE(endpoint_name, 'N/A') as endpoint,
                     request_type,
@@ -7717,7 +7787,7 @@ async def export_usage_csv(request: Request):
             ]
             for row in rows:
                 csv_lines.append(
-                    f"{row[0]},{row[1]},{row[2]},{row[3]},{row[4]},{row[5]},{row[6]},{row[7]:.4f},{row[8]}"
+                    f"{_eastern_datetime_string(row[0])},{row[1]},{row[2]},{row[3]},{row[4]},{row[5]},{row[6]},{row[7]:.4f},{row[8]}"
                 )
 
             csv_content = "\n".join(csv_lines)
@@ -10298,6 +10368,10 @@ def _get_all_settings() -> dict[str, str]:
         cursor.execute("SELECT key, value FROM settings")
         for row in cursor.fetchall():
             settings[row["key"]] = row["value"]
+    settings.setdefault("display_timezone", "Server Local Time")
+    settings["server_timezone"] = _get_server_timezone_name()
+    settings["display_timezone_effective"] = get_display_timezone_name()
+    settings["common_timezones"] = COMMON_TIMEZONES
     return settings
 
 
