@@ -1,6 +1,6 @@
 # Serverless Proxy - Universal LLM Gateway
 
-A universal internal and external LLM gateway that bridges standard API requests to multiple backend providers (RunPod, Ollama, OpenAI-compatible APIs, Together AI, OAuth-backed providers, and more). Configure endpoints through the web admin UI, map virtual model names to actual backend models, and optionally expose the proxy safely to other tools with inbound API key generation.
+A universal internal and external LLM gateway that bridges standard API requests to multiple backend providers (RunPod, Ollama, OpenAI-compatible APIs, Together AI, OAuth-backed providers, and more). Configure endpoints through the web admin UI, map virtual model names to actual backend models, and optionally expose the proxy safely to other tools with inbound API key generation. This does allow you to share OAuth connections with multiple tools at the same time, and removes their need to renew tokens, the endpoint handles it.
 
 ## Overview
 
