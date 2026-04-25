@@ -1,6 +1,6 @@
 # Serverless Proxy - Universal LLM Gateway
 
-A universal internal and external LLM gateway that bridges standard API requests to multiple backend providers (RunPod, Ollama, OpenAI-compatible APIs, Together AI, OAuth-backed providers, and more). Configure endpoints through the web admin UI, map virtual model names to actual backend models, and optionally expose the proxy safely to other tools with inbound API key generation. This does allow you to share OAuth connections with multiple tools at the same time, and removes their need to renew tokens, the endpoint handles it.
+A universal internal and external LLM gateway that bridges standard API requests to multiple backend providers (RunPod, Ollama, OpenAI-compatible APIs, Together AI, OAuth-backed providers, and more). Configure endpoints through the web admin UI, map virtual model names to actual backend models, and optionally expose the proxy safely to other tools with inbound API key generation. OAuth-backed endpoints can be shared across multiple tools, and the proxy handles token refresh centrally.
 
 ## Overview
 
@@ -80,7 +80,7 @@ docker compose exec serverless-proxy sh -c "ps aux | grep uvicorn" || echo "WARN
 ### Step 4: Configure in the Admin UI
 
 1. Open your browser and go to: **http://localhost:5001/proxy-dashboard**
-2. You'll see the admin dashboard (no login needed since AUTH_ENABLED=false)
+2. With `AUTH_ENABLED=false` for first-time setup, you'll see the admin dashboard without a login prompt.
 
 #### Add an Endpoint
 3. Click **+ Add Endpoint** under Endpoints
@@ -113,7 +113,7 @@ Your AI tools can now connect to the proxy:
 
 ```
 Base URL: http://localhost:8002/v1
-API Key: any-key-works (or your endpoint's key)
+API Key: any non-empty value for local/default internal-only setups, or the configured inbound API key in internet-facing mode
 Model: the-virtual-model-name-you-created
 ```
 
@@ -329,7 +329,7 @@ Failover and circuit controls:
 
 ### Non-Streaming Cache
 
-- Cache is applied only to non-stream requests (`chat` + `embeddings`).
+- Cache is applied only to non-stream requests (`chat`, `completions`, and `embeddings`).
 - Per virtual model, `Enable Non-Stream Cache` controls cache participation (`cache_enabled`).
 - Cache is bypassed when request header includes `Cache-Control: no-store`.
 - Tool-call responses are not cached.
@@ -711,7 +711,9 @@ OLLAMA_TEST_MODEL=gemma4:26b \
 OLLAMA_RUN_MUTATING=1 ./scripts/ollama_full_surface_conformance.sh
 ```
 
-### Admin API (port 5001)
+### Admin API
+
+Admin endpoints are split between the Flask admin service on `5001` and FastAPI on `8002`. The table below lists the routes, and the reverse-proxy section later in this README shows which backend serves each path.
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
@@ -814,17 +816,6 @@ AI_QUEUE_URL=http://host.docker.internal:8102
 AI_QUEUE_API_KEY=your_queue_api_key
 AI_QUEUE_PRIORITY=NORMAL
 ```
-
-## Features
-
-- **Tool call parsing** — Automatically extracts tool calls from model output
-- **Chain-of-thought stripping** — Removes reasoning prefixes
-- **Streaming & non-streaming** — Full SSE streaming support
-- **Job polling** — Automatically polls for queued job completion
-- **Session-based auth** — Uses AI Menu System for admin authentication
-- **Inbound API keys** — Generate labeled API keys for external tools and automations
-- **Secure external mode** — Optional public runtime mode with trusted internal bypass and external authentication
-- **Claude Code / OpenCode support** — Compatible with AI coding assistants
 
 ## Supporting AI Coding Assistants (Claude Code, OpenCode, Cursor, etc.)
 
