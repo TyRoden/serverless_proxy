@@ -310,6 +310,16 @@ def mark_inbound_api_key_used(key_id: int, client_ip: str, user_agent: str) -> N
         debug_log("warn", f"[INBOUND_KEY] failed to update last-used metadata: {e}")
 
 
+def _get_request_inbound_key_meta(request: Request) -> tuple[Optional[int], str]:
+    key_id = getattr(request.state, "inbound_api_key_id", None)
+    try:
+        key_id = int(key_id) if key_id is not None else None
+    except Exception:
+        key_id = None
+    label = str(getattr(request.state, "inbound_api_key_label", "") or "").strip()
+    return key_id, label
+
+
 def enforce_runtime_access(request: Request, internal_only: bool = False) -> Optional[JSONResponse]:
     if get_deployment_mode() == "internal_only":
         return None
@@ -336,6 +346,8 @@ def enforce_runtime_access(request: Request, internal_only: bool = False) -> Opt
         effective_client_ip,
         (request.headers.get("user-agent") or ""),
     )
+    request.state.inbound_api_key_id = int(key_record.get("id") or 0) or None
+    request.state.inbound_api_key_label = str(key_record.get("label") or "").strip()
     return None
 
 
@@ -1282,6 +1294,8 @@ def init_database():
                 virtual_model TEXT NOT NULL,
                 endpoint_name TEXT,
                 endpoint_id INTEGER,
+                inbound_api_key_id INTEGER,
+                inbound_api_key_label TEXT,
                 request_type TEXT DEFAULT 'chat',
                 prompt_tokens INTEGER DEFAULT 0,
                 completion_tokens INTEGER DEFAULT 0,
@@ -1305,6 +1319,8 @@ def init_database():
                 virtual_model TEXT NOT NULL,
                 endpoint_name TEXT,
                 endpoint_id INTEGER,
+                inbound_api_key_id INTEGER,
+                inbound_api_key_label TEXT,
                 input_tokens INTEGER DEFAULT 0,
                 output_tokens INTEGER DEFAULT 0,
                 total_tokens INTEGER DEFAULT 0,
@@ -1329,6 +1345,8 @@ def init_database():
                 endpoint_name TEXT,
                 endpoint_id INTEGER,
                 endpoint_type TEXT,
+                inbound_api_key_id INTEGER,
+                inbound_api_key_label TEXT,
                 client_ip TEXT,
                 forwarded_for TEXT,
                 x_source TEXT,
@@ -1839,6 +1857,54 @@ def init_database():
             except:
                 pass
 
+        try:
+            cursor.execute("SELECT inbound_api_key_id FROM request_usage LIMIT 1")
+        except:
+            try:
+                cursor.execute(
+                    "ALTER TABLE request_usage ADD COLUMN inbound_api_key_id INTEGER"
+                )
+            except:
+                pass
+            try:
+                cursor.execute(
+                    "ALTER TABLE request_usage ADD COLUMN inbound_api_key_label TEXT"
+                )
+            except:
+                pass
+
+        try:
+            cursor.execute("SELECT inbound_api_key_id FROM embedding_usage LIMIT 1")
+        except:
+            try:
+                cursor.execute(
+                    "ALTER TABLE embedding_usage ADD COLUMN inbound_api_key_id INTEGER"
+                )
+            except:
+                pass
+            try:
+                cursor.execute(
+                    "ALTER TABLE embedding_usage ADD COLUMN inbound_api_key_label TEXT"
+                )
+            except:
+                pass
+
+        try:
+            cursor.execute("SELECT inbound_api_key_id FROM recent_activity LIMIT 1")
+        except:
+            try:
+                cursor.execute(
+                    "ALTER TABLE recent_activity ADD COLUMN inbound_api_key_id INTEGER"
+                )
+            except:
+                pass
+            try:
+                cursor.execute(
+                    "ALTER TABLE recent_activity ADD COLUMN inbound_api_key_label TEXT"
+                )
+            except:
+                pass
+
         # Migration: Add OAuth columns to endpoints table (encryption-ready schema)
         oauth_columns = [
             "oauth_enabled INTEGER DEFAULT 0",
@@ -1875,10 +1941,16 @@ def init_database():
             "CREATE INDEX IF NOT EXISTS idx_request_usage_created_at ON request_usage(created_at)"
         )
         cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_request_usage_inbound_api_key_id ON request_usage(inbound_api_key_id)"
+        )
+        cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_embedding_usage_virtual_model ON embedding_usage(virtual_model)"
         )
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_embedding_usage_created_at ON embedding_usage(created_at)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_embedding_usage_inbound_api_key_id ON embedding_usage(inbound_api_key_id)"
         )
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_recent_activity_created_at ON recent_activity(created_at)"
@@ -1891,6 +1963,9 @@ def init_database():
         )
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_recent_activity_client_ip ON recent_activity(client_ip)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_recent_activity_inbound_api_key_id ON recent_activity(inbound_api_key_id)"
         )
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_endpoint_health_endpoint_id ON endpoint_health(endpoint_id)"
@@ -2103,6 +2178,8 @@ def log_chat_usage(
     response_time_ms,
     cache_attempted: int = 0,
     cache_hit: int = 0,
+    inbound_api_key_id: Any = None,
+    inbound_api_key_label: str = "",
 ):
     """Log chat completion usage to request_usage table."""
     try:
@@ -2151,17 +2228,19 @@ def log_chat_usage(
             cursor.execute(
                 """
                 INSERT INTO request_usage 
-                (virtual_model, endpoint_name, endpoint_id, request_type, 
+                (virtual_model, endpoint_name, endpoint_id, inbound_api_key_id, inbound_api_key_label, request_type, 
                  prompt_tokens, completion_tokens, total_tokens, 
                  cached_input_tokens, cache_creation_tokens,
                  cost_estimate, cost_in, cost_out, cached_cost_estimate, response_time_ms,
-                 cache_attempted, cache_hit)
-                VALUES (?, ?, ?, 'chat', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  cache_attempted, cache_hit)
+                VALUES (?, ?, ?, ?, ?, 'chat', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
                 (
                     virtual_model,
                     endpoint_name,
                     endpoint_id,
+                    inbound_api_key_id,
+                    (inbound_api_key_label or "")[:128],
                     prompt_tokens,
                     completion_tokens,
                     total_tokens,
@@ -2396,7 +2475,13 @@ def store_cached_response(cache_key: str, response: dict[str, Any], ttl: int, vi
 
 
 def log_completion_usage(
-    virtual_model, endpoint_name, endpoint_id, usage, response_time_ms
+    virtual_model,
+    endpoint_name,
+    endpoint_id,
+    usage,
+    response_time_ms,
+    inbound_api_key_id: Any = None,
+    inbound_api_key_label: str = "",
 ):
     """Log text completion usage to request_usage table."""
     try:
@@ -2443,16 +2528,18 @@ def log_completion_usage(
                 cursor.execute(
                     """
                     INSERT INTO request_usage 
-                    (virtual_model, endpoint_name, endpoint_id, request_type, 
+                    (virtual_model, endpoint_name, endpoint_id, inbound_api_key_id, inbound_api_key_label, request_type, 
                      prompt_tokens, completion_tokens, total_tokens, 
                      cached_input_tokens, cache_creation_tokens,
                      cost_estimate, cost_in, cost_out, cached_cost_estimate, response_time_ms)
-                    VALUES (?, ?, ?, 'completion', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, 'completion', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                     (
                         virtual_model,
                         endpoint_name,
                         endpoint_id,
+                        inbound_api_key_id,
+                        (inbound_api_key_label or "")[:128],
                         prompt_tokens,
                         completion_tokens,
                         total_tokens,
@@ -2479,6 +2566,8 @@ def log_embedding_usage(
     input_tokens,
     output_tokens,
     response_time_ms,
+    inbound_api_key_id: Any = None,
+    inbound_api_key_label: str = "",
 ):
     """Log embedding usage to embedding_usage table."""
     try:
@@ -2494,15 +2583,17 @@ def log_embedding_usage(
             cursor.execute(
                 """
                 INSERT INTO embedding_usage 
-                (virtual_model, endpoint_name, endpoint_id, 
+                (virtual_model, endpoint_name, endpoint_id, inbound_api_key_id, inbound_api_key_label,
                  input_tokens, output_tokens, total_tokens, 
                  cost_estimate, cost_in, cost_out, response_time_ms)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
                 (
                     virtual_model,
                     endpoint_name,
                     endpoint_id,
+                    inbound_api_key_id,
+                    (inbound_api_key_label or "")[:128],
                     input_tokens,
                     output_tokens,
                     total_tokens,
@@ -2592,6 +2683,8 @@ def log_recent_activity(
     endpoint_name: str,
     endpoint_id: Any,
     endpoint_type: str,
+    inbound_api_key_id: Any = None,
+    inbound_api_key_label: str = "",
     client_ip: str,
     forwarded_for: str,
     x_source: str,
@@ -2652,9 +2745,10 @@ def log_recent_activity(
                 INSERT INTO recent_activity (
                     created_at, request_id, method, path, request_type,
                     virtual_model, actual_model, endpoint_name, endpoint_id, endpoint_type,
+                    inbound_api_key_id, inbound_api_key_label,
                     client_ip, forwarded_for, x_source, user_agent, stream,
                     status_code, outcome, response_time_ms, error_summary
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     int(time.time()),
@@ -2667,6 +2761,8 @@ def log_recent_activity(
                     endpoint_name_value[:128],
                     eid,
                     (endpoint_type or "")[:64],
+                    inbound_api_key_id,
+                    (inbound_api_key_label or "")[:128],
                     (client_ip or "-")[:128],
                     (forwarded_for or "")[:255],
                     (x_source or "")[:128],
@@ -2704,12 +2800,14 @@ def _build_activity_query(
     model_filter: str,
     path_filter: str,
     ip_filter: str,
+    inbound_api_key_id: Optional[int],
     since: int,
     include_health: bool,
 ) -> tuple[str, list[Any]]:
     sql = """
         SELECT id, created_at, request_id, method, path, request_type,
                virtual_model, actual_model, endpoint_name, endpoint_id, endpoint_type,
+               inbound_api_key_id, inbound_api_key_label,
                client_ip, forwarded_for, x_source, user_agent, stream,
                status_code, outcome, response_time_ms, error_summary
         FROM recent_activity
@@ -2733,6 +2831,9 @@ def _build_activity_query(
     if ip_filter:
         sql += " AND client_ip LIKE ?"
         params.append(f"%{ip_filter}%")
+    if inbound_api_key_id is not None:
+        sql += " AND inbound_api_key_id = ?"
+        params.append(inbound_api_key_id)
     sql += " ORDER BY created_at DESC LIMIT ?"
     params.append(max(1, min(500, limit)))
     return sql, params
@@ -6298,6 +6399,7 @@ async def chat_completions(request: Request):
 
     # Generate unique request ID for correlation
     request_id = str(uuid.uuid4())[:8]
+    inbound_api_key_id, inbound_api_key_label = _get_request_inbound_key_meta(request)
 
     data = await request.json()
 
@@ -6360,6 +6462,8 @@ async def chat_completions(request: Request):
             endpoint_name="",
             endpoint_id=None,
             endpoint_type="",
+            inbound_api_key_id=inbound_api_key_id,
+            inbound_api_key_label=inbound_api_key_label,
             client_ip=v_client_ip,
             forwarded_for=v_forwarded_for,
             x_source=(request.headers.get("x-source") or "serverless-proxy"),
@@ -6422,6 +6526,8 @@ async def chat_completions(request: Request):
             endpoint_name="",
             endpoint_id=None,
             endpoint_type="",
+            inbound_api_key_id=inbound_api_key_id,
+            inbound_api_key_label=inbound_api_key_label,
             client_ip=client_ip,
             forwarded_for=forwarded_for,
             x_source=incoming_source,
@@ -6480,6 +6586,8 @@ async def chat_completions(request: Request):
             endpoint_name="",
             endpoint_id=current_endpoint_id,
             endpoint_type=current_endpoint_type or "",
+            inbound_api_key_id=inbound_api_key_id,
+            inbound_api_key_label=inbound_api_key_label,
             client_ip=client_ip,
             forwarded_for=forwarded_for,
             x_source=incoming_source,
@@ -6571,6 +6679,8 @@ async def chat_completions(request: Request):
                     response_time_ms,
                     cache_attempted=1,
                     cache_hit=1,
+                    inbound_api_key_id=inbound_api_key_id,
+                    inbound_api_key_label=inbound_api_key_label,
                 )
                 response = JSONResponse(content=cached_resp)
                 response.headers["X-Cache"] = "HIT"
@@ -6927,6 +7037,8 @@ async def chat_completions(request: Request):
             response_time_ms,
             cache_attempted=0,
             cache_hit=0,
+            inbound_api_key_id=inbound_api_key_id,
+            inbound_api_key_label=inbound_api_key_label,
         )
 
         async def stream_generator():
@@ -7151,6 +7263,8 @@ async def chat_completions(request: Request):
         response_time_ms,
         cache_attempted=cache_attempted,
         cache_hit=cache_hit,
+        inbound_api_key_id=inbound_api_key_id,
+        inbound_api_key_label=inbound_api_key_label,
     )
 
     # Store non-stream cache after successful response when safe
@@ -7401,6 +7515,11 @@ async def get_activity_feed(request: Request):
     model_filter = str(qp.get("model", "") or "").strip()
     path_filter = str(qp.get("path", "") or "").strip()
     ip_filter = str(qp.get("ip", "") or "").strip()
+    inbound_api_key_id_raw = str(qp.get("inbound_api_key_id", "") or "").strip()
+    try:
+        inbound_api_key_id = int(inbound_api_key_id_raw) if inbound_api_key_id_raw else None
+    except Exception:
+        inbound_api_key_id = None
     try:
         since = int(qp.get("since", "0") or 0)
     except Exception:
@@ -7419,6 +7538,7 @@ async def get_activity_feed(request: Request):
             model_filter=model_filter,
             path_filter=path_filter,
             ip_filter=ip_filter,
+            inbound_api_key_id=inbound_api_key_id,
             since=since,
             include_health=include_health,
         )
@@ -7469,6 +7589,11 @@ async def get_usage_summary(request: Request):
     start_date = query_params.get("start_date")
     end_date = query_params.get("end_date")
     virtual_model = query_params.get("virtual_model")
+    inbound_api_key_id_raw = str(query_params.get("inbound_api_key_id") or "").strip()
+    try:
+        inbound_api_key_id = int(inbound_api_key_id_raw) if inbound_api_key_id_raw else None
+    except Exception:
+        inbound_api_key_id = None
 
     # Default to last 24 hours if no dates specified
     if not start_date:
@@ -7504,6 +7629,9 @@ async def get_usage_summary(request: Request):
             if virtual_model:
                 base_query += " AND virtual_model = ?"
                 params.append(virtual_model)
+            if inbound_api_key_id is not None:
+                base_query += " AND inbound_api_key_id = ?"
+                params.append(inbound_api_key_id)
 
             cursor.execute(base_query, params)
             summary = cursor.fetchone()
@@ -7530,6 +7658,9 @@ async def get_usage_summary(request: Request):
             if virtual_model:
                 daily_query += " AND virtual_model = ?"
                 daily_params.append(virtual_model)
+            if inbound_api_key_id is not None:
+                daily_query += " AND inbound_api_key_id = ?"
+                daily_params.append(inbound_api_key_id)
 
             daily_query += " GROUP BY date ORDER BY date DESC"
             cursor.execute(daily_query, daily_params)
@@ -7556,6 +7687,9 @@ async def get_usage_summary(request: Request):
             if virtual_model:
                 daily_model_query += " AND virtual_model = ?"
                 daily_model_params.append(virtual_model)
+            if inbound_api_key_id is not None:
+                daily_model_query += " AND inbound_api_key_id = ?"
+                daily_model_params.append(inbound_api_key_id)
 
             daily_model_query += (
                 " GROUP BY date, virtual_model "
@@ -7613,6 +7747,9 @@ async def get_usage_summary(request: Request):
             if virtual_model:
                 estimated_models_query += " AND ru.virtual_model = ?"
                 estimated_params.append(virtual_model)
+            if inbound_api_key_id is not None:
+                estimated_models_query += " AND ru.inbound_api_key_id = ?"
+                estimated_params.append(inbound_api_key_id)
             estimated_models_query += " ORDER BY ru.virtual_model"
             cursor.execute(estimated_models_query, estimated_params)
             estimated_models = [
@@ -7659,6 +7796,11 @@ async def get_usage_by_model(request: Request):
     query_params = request.query_params
     start_date = query_params.get("start_date")
     end_date = query_params.get("end_date")
+    inbound_api_key_id_raw = str(query_params.get("inbound_api_key_id") or "").strip()
+    try:
+        inbound_api_key_id = int(inbound_api_key_id_raw) if inbound_api_key_id_raw else None
+    except Exception:
+        inbound_api_key_id = None
 
     if not start_date:
         start_date = str(int(time.time()) - 86400)
@@ -7668,8 +7810,7 @@ async def get_usage_by_model(request: Request):
     try:
         with get_db() as conn:
             cursor = conn.cursor()
-            cursor.execute(
-                """
+            query = """
                 SELECT 
                     virtual_model,
                     SUM(prompt_tokens) as prompt_tokens,
@@ -7682,11 +7823,13 @@ async def get_usage_by_model(request: Request):
                     COUNT(*) as request_count
                 FROM request_usage
                 WHERE created_at >= ? AND created_at <= ?
-                GROUP BY virtual_model
-                ORDER BY total_tokens DESC
-            """,
-                [start_date, end_date],
-            )
+            """
+            params = [start_date, end_date]
+            if inbound_api_key_id is not None:
+                query += " AND inbound_api_key_id = ?"
+                params.append(inbound_api_key_id)
+            query += " GROUP BY virtual_model ORDER BY total_tokens DESC"
+            cursor.execute(query, params)
 
             results = [dict(row) for row in cursor.fetchall()]
             return JSONResponse(content=results)
@@ -7704,6 +7847,11 @@ async def get_usage_by_endpoint(request: Request):
     query_params = request.query_params
     start_date = query_params.get("start_date")
     end_date = query_params.get("end_date")
+    inbound_api_key_id_raw = str(query_params.get("inbound_api_key_id") or "").strip()
+    try:
+        inbound_api_key_id = int(inbound_api_key_id_raw) if inbound_api_key_id_raw else None
+    except Exception:
+        inbound_api_key_id = None
 
     if not start_date:
         start_date = str(int(time.time()) - 86400)
@@ -7713,8 +7861,7 @@ async def get_usage_by_endpoint(request: Request):
     try:
         with get_db() as conn:
             cursor = conn.cursor()
-            cursor.execute(
-                """
+            query = """
                 SELECT 
                     endpoint_name,
                     SUM(prompt_tokens) as prompt_tokens,
@@ -7723,11 +7870,13 @@ async def get_usage_by_endpoint(request: Request):
                     COUNT(*) as request_count
                 FROM request_usage
                 WHERE created_at >= ? AND created_at <= ? AND endpoint_name IS NOT NULL
-                GROUP BY endpoint_name
-                ORDER BY total_tokens DESC
-            """,
-                [start_date, end_date],
-            )
+            """
+            params = [start_date, end_date]
+            if inbound_api_key_id is not None:
+                query += " AND inbound_api_key_id = ?"
+                params.append(inbound_api_key_id)
+            query += " GROUP BY endpoint_name ORDER BY total_tokens DESC"
+            cursor.execute(query, params)
 
             results = [dict(row) for row in cursor.fetchall()]
             return JSONResponse(content=results)
@@ -7746,6 +7895,11 @@ async def export_usage_csv(request: Request):
     start_date = data.get("start_date")
     end_date = data.get("end_date")
     virtual_model = data.get("virtual_model")
+    inbound_api_key_id_raw = str(data.get("inbound_api_key_id") or "").strip()
+    try:
+        inbound_api_key_id = int(inbound_api_key_id_raw) if inbound_api_key_id_raw else None
+    except Exception:
+        inbound_api_key_id = None
 
     if not start_date:
         start_date = str(int(time.time()) - 86400)
@@ -7775,6 +7929,9 @@ async def export_usage_csv(request: Request):
             if virtual_model:
                 base_query += " AND virtual_model = ?"
                 params.append(virtual_model)
+            if inbound_api_key_id is not None:
+                base_query += " AND inbound_api_key_id = ?"
+                params.append(inbound_api_key_id)
 
             base_query += " ORDER BY created_at DESC"
 
@@ -7849,6 +8006,11 @@ async def get_embedding_usage(request: Request):
     query_params = request.query_params
     start_date = query_params.get("start_date")
     end_date = query_params.get("end_date")
+    inbound_api_key_id_raw = str(query_params.get("inbound_api_key_id") or "").strip()
+    try:
+        inbound_api_key_id = int(inbound_api_key_id_raw) if inbound_api_key_id_raw else None
+    except Exception:
+        inbound_api_key_id = None
 
     if not start_date:
         start_date = str(int(time.time()) - 86400)
@@ -7858,8 +8020,7 @@ async def get_embedding_usage(request: Request):
     try:
         with get_db() as conn:
             cursor = conn.cursor()
-            cursor.execute(
-                """
+            query = """
                 SELECT 
                     SUM(input_tokens) as total_input_tokens,
                     SUM(output_tokens) as total_output_tokens,
@@ -7868,9 +8029,12 @@ async def get_embedding_usage(request: Request):
                     COUNT(*) as request_count
                 FROM embedding_usage
                 WHERE created_at >= ? AND created_at <= ?
-            """,
-                [start_date, end_date],
-            )
+            """
+            params = [start_date, end_date]
+            if inbound_api_key_id is not None:
+                query += " AND inbound_api_key_id = ?"
+                params.append(inbound_api_key_id)
+            cursor.execute(query, params)
 
             summary = cursor.fetchone()
             return JSONResponse(
@@ -8675,6 +8839,7 @@ async def completions(request: Request):
     auth_response = enforce_runtime_access(request)
     if auth_response is not None:
         return auth_response
+    inbound_api_key_id, inbound_api_key_label = _get_request_inbound_key_meta(request)
     start_time = time_module.time()
     client_ip, forwarded_for = _resolve_activity_client_ip(request)
     x_source = (request.headers.get("x-source") or "").strip()
@@ -8706,6 +8871,8 @@ async def completions(request: Request):
             endpoint_name="",
             endpoint_id=None,
             endpoint_type="",
+            inbound_api_key_id=inbound_api_key_id,
+            inbound_api_key_label=inbound_api_key_label,
             client_ip=client_ip,
             forwarded_for=forwarded_for,
             x_source=x_source,
@@ -8753,6 +8920,8 @@ async def completions(request: Request):
                     endpoint_name="",
                     endpoint_id=endpoint_id,
                     endpoint_type=endpoint_type or "",
+                    inbound_api_key_id=inbound_api_key_id,
+                    inbound_api_key_label=inbound_api_key_label,
                     client_ip=client_ip,
                     forwarded_for=forwarded_for,
                     x_source=x_source,
@@ -8789,6 +8958,8 @@ async def completions(request: Request):
             endpoint_name="",
             endpoint_id=endpoint_id,
             endpoint_type=endpoint_type or "",
+            inbound_api_key_id=inbound_api_key_id,
+            inbound_api_key_label=inbound_api_key_label,
             client_ip=client_ip,
             forwarded_for=forwarded_for,
             x_source=x_source,
@@ -8837,6 +9008,8 @@ async def completions(request: Request):
             endpoint_name="",
             endpoint_id=endpoint_id,
             endpoint_type=endpoint_type or "",
+            inbound_api_key_id=inbound_api_key_id,
+            inbound_api_key_label=inbound_api_key_label,
             client_ip=client_ip,
             forwarded_for=forwarded_for,
             x_source=x_source,
@@ -8850,7 +9023,15 @@ async def completions(request: Request):
 
     # Log usage
     response_time_ms = int((time_module.time() - start_time) * 1000)
-    log_completion_usage(model, None, None, usage, response_time_ms)
+    log_completion_usage(
+        model,
+        None,
+        None,
+        usage,
+        response_time_ms,
+        inbound_api_key_id=inbound_api_key_id,
+        inbound_api_key_label=inbound_api_key_label,
+    )
 
     response_content = {
         "id": job_id,
@@ -8883,6 +9064,8 @@ async def completions(request: Request):
         endpoint_name="",
         endpoint_id=endpoint_id,
         endpoint_type=endpoint_type or "",
+        inbound_api_key_id=inbound_api_key_id,
+        inbound_api_key_label=inbound_api_key_label,
         client_ip=client_ip,
         forwarded_for=forwarded_for,
         x_source=x_source,
@@ -8904,6 +9087,7 @@ async def embeddings(request: Request):
     auth_response = enforce_runtime_access(request)
     if auth_response is not None:
         return auth_response
+    inbound_api_key_id, inbound_api_key_label = _get_request_inbound_key_meta(request)
     start_time = time_module.time()
     client_ip, forwarded_for = _resolve_activity_client_ip(request)
     x_source = (request.headers.get("x-source") or "").strip()
@@ -8927,6 +9111,8 @@ async def embeddings(request: Request):
             endpoint_name="",
             endpoint_id=None,
             endpoint_type="",
+            inbound_api_key_id=inbound_api_key_id,
+            inbound_api_key_label=inbound_api_key_label,
             client_ip=client_ip,
             forwarded_for=forwarded_for,
             x_source=x_source,
@@ -8972,6 +9158,8 @@ async def embeddings(request: Request):
                     endpoint_name="",
                     endpoint_id=endpoint_id,
                     endpoint_type=endpoint_type or "",
+                    inbound_api_key_id=inbound_api_key_id,
+                    inbound_api_key_label=inbound_api_key_label,
                     client_ip=client_ip,
                     forwarded_for=forwarded_for,
                     x_source=x_source,
@@ -9002,6 +9190,8 @@ async def embeddings(request: Request):
                 endpoint_name="",
                 endpoint_id=endpoint_id,
                 endpoint_type=endpoint_type or "",
+                inbound_api_key_id=inbound_api_key_id,
+                inbound_api_key_label=inbound_api_key_label,
                 client_ip=client_ip,
                 forwarded_for=forwarded_for,
                 x_source=x_source,
@@ -9026,7 +9216,14 @@ async def embeddings(request: Request):
 
             if input_tokens > 0 or output_tokens > 0:
                 log_embedding_usage(
-                    model, None, None, input_tokens, output_tokens, response_time_ms
+                    model,
+                    None,
+                    None,
+                    input_tokens,
+                    output_tokens,
+                    response_time_ms,
+                    inbound_api_key_id=inbound_api_key_id,
+                    inbound_api_key_label=inbound_api_key_label,
                 )
         except:
             pass  # Embeddings might not return token usage
@@ -9048,6 +9245,8 @@ async def embeddings(request: Request):
             endpoint_name="",
             endpoint_id=endpoint_id,
             endpoint_type=endpoint_type or "",
+            inbound_api_key_id=inbound_api_key_id,
+            inbound_api_key_label=inbound_api_key_label,
             client_ip=client_ip,
             forwarded_for=forwarded_for,
             x_source=x_source,
@@ -9080,6 +9279,8 @@ async def embeddings(request: Request):
         endpoint_name="",
         endpoint_id=endpoint_id,
         endpoint_type=endpoint_type or "",
+        inbound_api_key_id=inbound_api_key_id,
+        inbound_api_key_label=inbound_api_key_label,
         client_ip=client_ip,
         forwarded_for=forwarded_for,
         x_source=x_source,
@@ -9740,6 +9941,11 @@ def api_admin_activity():
     model_filter = (flask_request.args.get("model") or "").strip()
     path_filter = (flask_request.args.get("path") or "").strip()
     ip_filter = (flask_request.args.get("ip") or "").strip()
+    inbound_api_key_id_raw = (flask_request.args.get("inbound_api_key_id") or "").strip()
+    try:
+        inbound_api_key_id = int(inbound_api_key_id_raw) if inbound_api_key_id_raw else None
+    except Exception:
+        inbound_api_key_id = None
     try:
         since = int((flask_request.args.get("since") or "0").strip() or 0)
     except Exception:
@@ -9758,6 +9964,7 @@ def api_admin_activity():
             model_filter=model_filter,
             path_filter=path_filter,
             ip_filter=ip_filter,
+            inbound_api_key_id=inbound_api_key_id,
             since=since,
             include_health=include_health,
         )

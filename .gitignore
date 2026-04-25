@@ -52,6 +52,7 @@ docs/session_export_toolcall_playbook.md
 docs/diagnostics.md
 docs/token_tracking_implementation.md
 docs/response_format_rules_clone_plan.md
+docs/inbound_api_key_usage_activity_plan.md
 install-serverless-proxy-backup.sh
 backup-serverless-proxy.sh
 serverless-proxy-backup.cron

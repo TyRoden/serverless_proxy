@@ -13,6 +13,7 @@ Client (OpenAI format) → Serverless Proxy (port 8002) → Configured Backends
 - **Admin UI**: Configure endpoints and virtual models via web interface
 - **Deployment Modes**: Keep installs simple with default `internal_only`, or switch to `internet_facing` when you want secure external access
 - **Inbound API Keys**: Generate labeled API keys for external tools and systems
+- **Per-Key Usage Analysis**: Filter Usage and Activity by inbound API key label to measure traffic and cost per client/team key
 - **Tool-Call Compatibility**: Normalize misformatted model tool calls with DB-driven regex patterns
 - **OpenAI-compatible**: Works with any OpenAI client library
 
@@ -454,6 +455,7 @@ Access the admin dashboard at `/proxy-dashboard`. Authentication is handled by t
 - **Deployment Mode Setting**: Switch between `internal_only` and `internet_facing`
 - **Configurable Dashboard Timezone**: Choose `Server Local Time` or a common IANA timezone for dashboard/report exports
 - **Activity Tab**: Recent request feed (route/model/IP/source/status/latency) with filters and auto-refresh
+- **Per-Key Filtering**: Usage and Activity can be filtered by inbound API key so teams can isolate traffic by client key label
 - **Patterns Tab**: Manage tool-call translation patterns in the UI
 - **Model Discovery**: Fetch available models from endpoints
 - **Enable/Disable**: Toggle endpoints and virtual models
@@ -582,6 +584,7 @@ The proxy provides comprehensive cost tracking per model:
 - **Per-model pricing**: Configure input/output/cached token rates for each virtual model
 - **Usage dashboard**: View token counts, costs, and response times in the admin UI
 - **Daily breakdown**: Track usage patterns over time
+- **Per-key visibility**: Filter Usage and Activity by inbound API key label to measure requests, tokens, and cost per client/team key
 - **Cost estimation**: Automatic calculation based on configured rates
 
 Configure pricing per virtual model:
@@ -602,9 +605,11 @@ The admin dashboard includes an `Activity` tab for quick operational visibility.
 
 - Recent traffic table (newest first)
 - Default view: latest 100 rows, `/health` excluded
-- Filter by status, model, IP, and path
+- Filter by status, model, IP, path, and inbound API key
 - Auto-refresh every 10 seconds (toggleable)
 - Metadata-only storage (no prompts/tool args/response bodies)
+
+When inbound API keys are in use, Activity rows show the key label beneath the caller IP, and both `Activity` and `Usage & Cost` support filtering by key. This lets development teams measure traffic, tokens, and spend per client key while preserving the default all-traffic view for installs that do not use keys.
 
 ## API Endpoints
 

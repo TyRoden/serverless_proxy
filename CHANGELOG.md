@@ -2,6 +2,21 @@
 
 All notable changes to the Serverless Proxy will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **Per-Key Usage Filtering** - Added dashboard filtering for `Usage & Cost` and `Activity` by inbound API key so teams can measure requests, tokens, and cost per client key label.
+- **Activity Key Attribution** - Activity rows now display the inbound API key label beneath the caller IP when a request was authenticated with a key.
+
+### Fixed
+
+- **Chat Key Attribution Logging** - Chat traffic now persists inbound API key metadata into `recent_activity` and `request_usage`, so key-based filters work consistently across the primary request path.
+
+### Documentation
+
+- **README Key Analytics Notes** - Documented that Usage and Activity can be filtered by inbound API key, enabling per-team/per-client usage measurement from the dashboard.
+
 ## [2.4.6] - 2026-04-23
 
 ### Added

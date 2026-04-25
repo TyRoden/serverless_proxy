@@ -287,6 +287,12 @@
                         <option value="">All models</option>
                     </select>
                 </div>
+                <div class="form-group">
+                    <label>Key</label>
+                    <select id="usage-inbound-api-key-filter" onchange="loadUsage()">
+                        <option value="">All keys</option>
+                    </select>
+                </div>
                 <button class="btn btn-secondary btn-sm" onclick="toggleCustomDateRange()">Custom Dates</button>
                 <button class="btn btn-primary btn-sm" onclick="exportUsageCSV()">Export CSV</button>
             </div>
@@ -341,6 +347,12 @@
                 <div class="form-group" style="min-width:180px;">
                     <label>Path</label>
                     <input type="text" id="activity-path" placeholder="/v1/chat/completions" oninput="loadActivityDebounced()">
+                </div>
+                <div class="form-group" style="min-width:180px;">
+                    <label>Key</label>
+                    <select id="activity-inbound-api-key-filter" onchange="loadActivity()">
+                        <option value="">All keys</option>
+                    </select>
                 </div>
                 <div class="checkbox-row" style="margin-bottom:8px;">
                     <input type="checkbox" id="activity-include-health" onchange="loadActivity()">
@@ -874,6 +886,50 @@
     let currentTab = 'dashboard';
     let activityAutoRefreshTimer = null;
     let activityDebounceTimer = null;
+
+    function escHtml(v) {
+        return String(v || '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
+
+    function getSelectedInboundApiKeyId(selectId) {
+        return (document.getElementById(selectId)?.value || '').trim();
+    }
+
+    function populateInboundApiKeyFilters(items) {
+        const options = ['<option value="">All keys</option>'].concat(
+            (items || []).map(item => `<option value="${Number(item.id)}">${escHtml(item.label || ('Key ' + item.id))}</option>`)
+        ).join('');
+
+        ['usage-inbound-api-key-filter', 'activity-inbound-api-key-filter'].forEach((id) => {
+            const select = document.getElementById(id);
+            if (!select) return;
+            const currentValue = select.value || '';
+            select.innerHTML = options;
+            select.value = currentValue && Array.from(select.options).some(opt => opt.value === currentValue)
+                ? currentValue
+                : '';
+        });
+    }
+
+    function loadInboundApiKeyFilters() {
+        fetch(new URL('/api/admin/inbound-api-keys', window.location.origin).toString(), {
+            credentials: 'include',
+            headers: { 'Accept': 'application/json' }
+        })
+            .then(r => r.json())
+            .then(data => {
+                populateInboundApiKeyFilters(Array.isArray(data.items) ? data.items : []);
+            })
+            .catch(err => {
+                console.error('Error loading inbound API key filters:', err);
+                populateInboundApiKeyFilters([]);
+            });
+    }
     
     function showTab(tabName) {
         currentTab = tabName;
@@ -971,7 +1027,8 @@
             model: (document.getElementById('activity-model')?.value || '').trim(),
             ip: (document.getElementById('activity-ip')?.value || '').trim(),
             path: (document.getElementById('activity-path')?.value || '').trim(),
-            include_health: document.getElementById('activity-include-health')?.checked ? 'true' : 'false'
+            include_health: document.getElementById('activity-include-health')?.checked ? 'true' : 'false',
+            inbound_api_key_id: getSelectedInboundApiKeyId('activity-inbound-api-key-filter')
         });
 
         fetch('/api/admin/endpoints/activity?' + params.toString(), { credentials: 'same-origin' })
@@ -1000,12 +1057,6 @@
             return;
         }
 
-        const esc = (v) => String(v || '')
-            .replace(/&/g, '&amp;')
-            .replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;')
-            .replace(/"/g, '&quot;')
-            .replace(/'/g, '&#39;');
         const shortUa = (ua) => {
             const t = String(ua || '').trim();
             if (!t) return '-';
@@ -1014,21 +1065,25 @@
 
         const rows = items.map(it => {
             const status = it.status_code || 0;
-            const outcome = esc(it.outcome || 'other');
+            const outcome = escHtml(it.outcome || 'other');
             const statusColor = status >= 200 && status < 400 ? 'var(--accent-green)' : (status >= 500 ? 'var(--accent-red)' : 'var(--accent-yellow)');
-            const route = esc((it.method || 'GET') + ' ' + (it.path || ''));
+            const route = escHtml((it.method || 'GET') + ' ' + (it.path || ''));
             const vm = String(it.virtual_model || '').trim();
             const am = String(it.actual_model || '').trim();
-            const endpoint = esc(it.endpoint_name || (it.endpoint_id ? ('#' + it.endpoint_id) : '-'));
+            const endpoint = escHtml(it.endpoint_name || (it.endpoint_id ? ('#' + it.endpoint_id) : '-'));
             const model = vm && am && vm !== am
-                ? `${esc(vm)} <span style="color:var(--text-secondary);">→</span> <code>${esc(am)}</code>`
-                : esc(vm || am || '-');
-            const src = esc(it.x_source || '-');
-            const ip = esc(it.client_ip || '-');
-            const ua = esc(shortUa(it.user_agent));
+                ? `${escHtml(vm)} <span style="color:var(--text-secondary);">→</span> <code>${escHtml(am)}</code>`
+                : escHtml(vm || am || '-');
+            const src = escHtml(it.x_source || '-');
+            const ip = escHtml(it.client_ip || '-');
+            const keyLabel = String(it.inbound_api_key_label || '').trim();
+            const ipDisplay = keyLabel
+                ? `${ip}<div style="font-size:11px;color:var(--text-secondary);margin-top:2px;">${escHtml(keyLabel)}</div>`
+                : ip;
+            const ua = escHtml(shortUa(it.user_agent));
             const latency = Number(it.response_time_ms || 0);
             const latencyTxt = latency >= 1000 ? (latency / 1000).toFixed(1) + ' s' : latency + ' ms';
-            const err = esc(it.error_summary || '');
+            const err = escHtml(it.error_summary || '');
             const streamBadge = it.stream ? '<span style="font-size:11px;color:var(--text-secondary);">stream</span>' : '';
             return `
                 <tr>
@@ -1036,9 +1091,9 @@
                     <td>${route}</td>
                     <td>${model}</td>
                     <td>${endpoint}</td>
-                    <td>${ip}</td>
+                    <td>${ipDisplay}</td>
                     <td>${src}</td>
-                    <td title="${esc(it.user_agent || '')}">${ua}</td>
+                    <td title="${escHtml(it.user_agent || '')}">${ua}</td>
                     <td><span style="color:${statusColor};font-weight:600;">${status}</span> <span style="font-size:11px;color:var(--text-secondary);">${outcome}</span> ${streamBadge}</td>
                     <td>${latencyTxt}</td>
                 </tr>
@@ -1084,10 +1139,12 @@
         }
         
         const virtualModel = document.getElementById('virtual-model-filter').value;
+        const inboundApiKeyId = getSelectedInboundApiKeyId('usage-inbound-api-key-filter');
         const params = new URLSearchParams({
             start_date: startDate.toString(),
             end_date: endDate.toString(),
-            ...(virtualModel ? {virtual_model: virtualModel} : {})
+            ...(virtualModel ? {virtual_model: virtualModel} : {}),
+            ...(inboundApiKeyId ? {inbound_api_key_id: inboundApiKeyId} : {})
         });
         
         fetch('/api/admin/usage?' + params.toString(), { credentials: 'same-origin' })
@@ -1175,7 +1232,7 @@
 
             const modelRows = (day.models || []).map(model => `
                 <tr class="model-breakdown-row">
-                    <td class="model-name-cell">↳ ${esc(model.virtual_model)}${estimatedModels.has(model.virtual_model) ? '*' : ''}</td>
+                    <td class="model-name-cell">↳ ${escHtml(model.virtual_model)}${estimatedModels.has(model.virtual_model) ? '*' : ''}</td>
                     <td>${formatNumber(model.prompt_tokens)}</td>
                     <td>${formatNumber(model.cached_input_tokens || 0)}</td>
                     <td>${formatNumber(model.completion_tokens)}</td>
@@ -1237,12 +1294,13 @@
         }
         
         const virtualModel = document.getElementById('virtual-model-filter').value || undefined;
+        const inboundApiKeyId = getSelectedInboundApiKeyId('usage-inbound-api-key-filter') || undefined;
         
         fetch('/api/admin/usage/export', {
             method: 'POST',
             credentials: 'same-origin',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({start_date: startDate, end_date: endDate, virtual_model: virtualModel})
+            body: JSON.stringify({start_date: startDate, end_date: endDate, virtual_model: virtualModel, inbound_api_key_id: inboundApiKeyId})
         })
         .then(r => {
             if (!r.ok) throw new Error('Export failed');
@@ -1995,6 +2053,8 @@
             })
             .catch(err => console.error('Error loading model filter:', err));
     }
+
+    loadInboundApiKeyFilters();
     
     function loadVirtualModels() {
         fetch('/api/admin/virtual-models', { credentials: 'same-origin' })
