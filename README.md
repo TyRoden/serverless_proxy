@@ -653,9 +653,9 @@ The proxy now supports both Ollama-native routes and OpenAI-compatible routes wh
 - `GET /models`, `GET /api/models`, `GET /api/v1/models` -> model listing aliases
 - `POST /embeddings`, `POST /api/v1/embeddings` -> embeddings aliases
 
-#### Full native surface passthrough (Phase 2)
+#### Full native surface compatibility (Phase 2)
 
-Forwarded to configured Ollama endpoint (resolved by model backend first, or default enabled Ollama endpoint):
+For Ollama-backed virtual models, these routes are forwarded to the configured Ollama endpoint. For non-Ollama backends, the proxy translates where practical and otherwise returns an explicit compatibility response:
 
 - `POST /api/show`
 - `GET|POST /api/ps`
@@ -672,6 +672,11 @@ Forwarded to configured Ollama endpoint (resolved by model backend first, or def
 - **Upstream selection for ollama virtual models**:
   - tries Ollama OpenAI-compatible upstream `POST /v1/chat/completions` first
   - falls back to native `POST /api/chat` if upstream returns `404/405`
+- **Translated native compatibility for non-Ollama backends**:
+  - `/api/chat` and `/api/generate` preserve Ollama-style request/response shapes while translating upstream to the selected backend as faithfully as possible
+  - `/api/show` returns a synthetic metadata response for non-Ollama virtual models so Ollama-oriented clients can still inspect model details
+  - `/api/show` accepts either `model` or `name` in the request body for improved client compatibility
+  - some model-management routes such as pull/push/create/copy/delete/blob operations remain true Ollama-surface operations and are only meaningful for real Ollama upstreams
 - **Message normalization**:
   - converts OpenAI block-style `messages[].content` arrays to Ollama-safe string content for native `/api/chat`
 - **Streaming**:
@@ -680,6 +685,21 @@ Forwarded to configured Ollama endpoint (resolved by model backend first, or def
 - **Embeddings**:
   - for Ollama endpoints, proxy tries `/api/embed` then falls back to `/api/embeddings`
   - capability errors from upstream are returned as non-200 responses (for example `501` if model lacks embedding support)
+
+#### Verified translated behavior for stream-required upstreams
+
+- For `openai_oauth`-backed virtual models such as `gpt-5.4-oauth`, the proxy now buffers upstream streaming internally and synthesizes non-stream responses for:
+  - Ollama `POST /api/chat`
+  - Ollama `POST /api/generate`
+  - Anthropic `POST /v1/messages`
+  - OpenAI `POST /v1/completions`
+- Known remaining limitation:
+  - `POST /v1/chat/completions` with `stream:false` on `openai_oauth` models still needs one final normalization pass so it returns a standard JSON `chat.completion` body instead of SSE-style chunk text.
+
+#### Activity and key attribution behavior
+
+- In `internet_facing` mode, trusted internal callers can still access the proxy without an inbound API key.
+- If a trusted-internal caller does send a valid inbound API key, the proxy now records that key label/id in Activity and Usage so the dashboard can attribute the request correctly.
 
 #### Diagnostics for compatibility debugging
 

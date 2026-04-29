@@ -8,14 +8,20 @@ All notable changes to the Serverless Proxy will be documented in this file.
 
 - **Per-Key Usage Filtering** - Added dashboard filtering for `Usage & Cost` and `Activity` by inbound API key so teams can measure requests, tokens, and cost per client key label.
 - **Activity Key Attribution** - Activity rows now display the inbound API key label beneath the caller IP when a request was authenticated with a key.
+- **Translated Ollama Show Metadata** - Added synthetic `/api/show` compatibility responses for non-Ollama virtual models and accepted both `model` and `name` request fields for broader Ollama client compatibility.
 
 ### Fixed
 
 - **Chat Key Attribution Logging** - Chat traffic now persists inbound API key metadata into `recent_activity` and `request_usage`, so key-based filters work consistently across the primary request path.
+- **Trusted Internal Key Attribution** - Requests from trusted internal CIDRs now still persist inbound API key metadata when a valid key is explicitly supplied, restoring Activity/Usage attribution for LAN callers using keys.
+- **Ollama Non-Stream Translation** - `openai_oauth`-backed virtual models now synthesize non-stream Ollama responses for `/api/chat` and `/api/generate` instead of leaking upstream stream-only constraints.
+- **Anthropic Non-Stream Translation** - `openai_oauth`-backed virtual models now synthesize non-stream Anthropic `/v1/messages` responses by buffering streamed upstream output.
+- **OpenAI Completions Normalization** - `openai_oauth`-backed virtual models now synthesize non-stream `/v1/completions` responses and improved streamed completions output instead of returning only `[DONE]`.
 
 ### Documentation
 
 - **README Key Analytics Notes** - Documented that Usage and Activity can be filtered by inbound API key, enabling per-team/per-client usage measurement from the dashboard.
+- **README Multi-Protocol Notes** - Documented translated Ollama compatibility behavior, trusted-internal key attribution behavior, and the one remaining `chat.completions` non-stream normalization limitation for `openai_oauth` models.
 
 ## [2.4.6] - 2026-04-23
 

@@ -330,24 +330,25 @@ def enforce_runtime_access(request: Request, internal_only: bool = False) -> Opt
         f"[INGRESS_AUTH] path={request.url.path} direct_ip={direct_client_ip} effective_ip={effective_client_ip} forwarded_for={forwarded_for or '-'} mode={get_deployment_mode()} internal_only={internal_only}",
     )
 
+    api_key = extract_inbound_api_key(request)
+    key_record = verify_inbound_api_key(api_key) if api_key else None
+    if key_record:
+        mark_inbound_api_key_used(
+            int(key_record.get("id") or 0),
+            effective_client_ip,
+            (request.headers.get("user-agent") or ""),
+        )
+        request.state.inbound_api_key_id = int(key_record.get("id") or 0) or None
+        request.state.inbound_api_key_label = str(key_record.get("label") or "").strip()
+
     if is_trusted_internal_request(request):
         return None
 
     if internal_only:
         return JSONResponse(status_code=404, content={"error": "Not found"})
 
-    api_key = extract_inbound_api_key(request)
-    key_record = verify_inbound_api_key(api_key)
     if not key_record:
         return JSONResponse(status_code=401, content={"error": "Unauthorized"})
-
-    mark_inbound_api_key_used(
-        int(key_record.get("id") or 0),
-        effective_client_ip,
-        (request.headers.get("user-agent") or ""),
-    )
-    request.state.inbound_api_key_id = int(key_record.get("id") or 0) or None
-    request.state.inbound_api_key_label = str(key_record.get("label") or "").strip()
     return None
 
 
@@ -4687,6 +4688,130 @@ def _resolve_ollama_target_for_request(
     return None, None
 
 
+def _ollama_streaming_not_supported_response() -> JSONResponse:
+    return JSONResponse(
+        status_code=501,
+        content={
+            "error": "Streaming Ollama translation is not supported for the current backend"
+        },
+    )
+
+
+def _backend_effective_url(backend: Any) -> str:
+    url = getattr(backend, "url", None)
+    if not url and hasattr(backend, "primary"):
+        url = getattr(backend.primary, "url", None)
+    if not url:
+        raise AttributeError("backend has no url")
+    return str(url)
+
+
+def _openai_backend_endpoint_for_chat(backend: Any) -> tuple[str, str]:
+    endpoint = _backend_effective_url(backend)
+    endpoint_type = getattr(backend, "endpoint_type", "")
+    if endpoint_type == "deepinfra":
+        endpoint = f"{endpoint}/v1/openai/chat/completions"
+    elif endpoint_type == "openai_oauth":
+        endpoint = _resolve_openai_oauth_response_endpoint(endpoint)
+    elif endpoint_type == "openwebui":
+        endpoint = f"{endpoint}/api/chat/completions"
+    elif endpoint_type == "queue":
+        endpoint = f"{endpoint}/v1/chat/completions"
+    else:
+        endpoint = f"{endpoint}/v1/chat/completions"
+    return endpoint, endpoint_type
+
+
+async def _call_backend_chat_via_stream_collect(
+    *,
+    backend: Any,
+    model: str,
+    messages: list[dict[str, Any]],
+    temperature: Any,
+    max_tokens: Any,
+    top_p: Any,
+    tools: list[Any],
+    incoming_source: str,
+) -> tuple[dict[str, Any], Optional[dict[str, Any]], int]:
+    actual_model = getattr(backend, "model", model)
+    endpoint, endpoint_type = _openai_backend_endpoint_for_chat(backend)
+    payload = {
+        "model": actual_model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "top_p": top_p,
+        "stream": True,
+    }
+    if tools:
+        payload["tools"] = tools
+    if endpoint_type == "openai_oauth":
+        payload = _openai_chat_to_openai_oauth_payload(
+            messages=messages,
+            model=actual_model,
+            stream=True,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            tools=tools,
+            tool_choice=None,
+            parallel_tool_calls=None,
+        )
+
+    headers = {"Content-Type": "application/json"}
+    auth_header = await resolve_endpoint_auth_header_async(
+        {
+            "id": getattr(backend, "endpoint_id", None),
+            "api_key": getattr(backend, "api_key", ""),
+            "oauth_enabled": getattr(backend, "oauth_enabled", 0),
+            "oauth_grant_type": getattr(backend, "oauth_grant_type", ""),
+            "oauth_token_url": getattr(backend, "oauth_token_url", ""),
+            "oauth_client_id": getattr(backend, "oauth_client_id", ""),
+            "oauth_client_secret": getattr(backend, "oauth_client_secret", ""),
+            "oauth_scope": getattr(backend, "oauth_scope", ""),
+            "oauth_refresh_token": getattr(backend, "oauth_refresh_token", ""),
+            "oauth_token_expires_at": getattr(backend, "oauth_token_expires_at", 0),
+            "oauth_token_request_format": getattr(
+                backend, "oauth_token_request_format", "json"
+            ),
+            "oauth_client_auth_method": getattr(
+                backend, "oauth_client_auth_method", "client_secret_post"
+            ),
+        }
+    )
+    if auth_header:
+        headers["Authorization"] = auth_header
+    headers["X-Source"] = incoming_source
+    headers["X-Model"] = actual_model
+    headers["X-Priority"] = "NORMAL"
+
+    stream_data = ""
+    async with httpx.AsyncClient(timeout=1200.0) as client:
+        async with client.stream("POST", endpoint, headers=headers, json=payload) as resp:
+            if resp.status_code >= 400:
+                error_text = await resp.aread()
+                return (
+                    None,
+                    {
+                        "error": {
+                            "message": error_text.decode("utf-8", errors="replace"),
+                            "type": "upstream_error",
+                        }
+                    },
+                    int(resp.status_code or 500),
+                )
+            async for chunk in resp.aiter_text():
+                stream_data += chunk
+
+    converted = (
+        _openai_oauth_sse_to_openai_chat_sse(stream_data, actual_model)
+        if endpoint_type == "openai_oauth"
+        else stream_data
+    )
+    result = {"_stream_data": converted, "id": f"chat-{int(time.time())}"}
+    return result, None, 200
+
+
 async def _ollama_passthrough(
     request: Request, upstream_path: str, method: str = "POST"
 ):
@@ -5422,6 +5547,9 @@ class FailoverBackend(LLMBackend):
         self.failover_used = False
         self.failover_strategy = self.strategy
         self.routed_virtual_model_name = self.virtual_model_name
+
+    def __getattr__(self, name: str):
+        return getattr(self.primary, name)
 
     def _set_runtime_route_meta(self, backend: LLMBackend, vm: dict, used_failover: bool) -> None:
         self.model = getattr(backend, "model", vm.get("actual_model"))
@@ -6692,16 +6820,28 @@ async def chat_completions(request: Request):
             debug_log("warn", f"[CACHE] lookup failed model={model}: {e}")
 
     # Call backend (handles both AI Queue and RunPod)
-    backend_result, error, status_code = await backend.chat_completion(
-        messages=messages,
-        model=model,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        top_p=top_p,
-        stream=stream,
-        tools=tools,
-        **extra_params,
-    )
+    if not stream and getattr(backend, "endpoint_type", "") == "openai_oauth":
+        backend_result, error, status_code = await _call_backend_chat_via_stream_collect(
+            backend=backend,
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            tools=tools,
+            incoming_source=incoming_source,
+        )
+    else:
+        backend_result, error, status_code = await backend.chat_completion(
+            messages=messages,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            stream=stream,
+            tools=tools,
+            **extra_params,
+        )
 
     if error:
         response = JSONResponse(status_code=status_code, content=error)
@@ -6718,7 +6858,7 @@ async def chat_completions(request: Request):
         result = backend_result["result"]
 
     # Check if this is a streaming response from a virtual model backend
-    if "_stream_data" in result:
+    if "_stream_data" in result and stream:
         # Parse existing SSE data instead of making another request
         stream_data = result["_stream_data"]
         full_content = ""
@@ -7163,73 +7303,6 @@ async def chat_completions(request: Request):
         _log_chat_activity(200, "", stream_flag=True)
         return response
 
-    # Non-streaming response
-    response_content = {
-        "id": job_id,
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": model,
-        "choices": [],
-        "usage": usage,
-    }
-
-    # Add system_fingerprint if available (OA-4)
-    if system_fingerprint:
-        response_content["system_fingerprint"] = system_fingerprint
-
-    normalized_tool_calls = []
-    for idx, tc in enumerate(tool_calls_data or []):
-        if not isinstance(tc, dict):
-            continue
-        fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
-        tc_name = str(fn.get("name") or "").strip()
-        if not tc_name:
-            continue
-        tc_id = str(tc.get("id") or f"call_{int(time.time() * 1000)}_{idx}").strip()
-        tc_args = fn.get("arguments")
-        if isinstance(tc_args, (dict, list)):
-            tc_args = json.dumps(tc_args)
-        elif tc_args is None:
-            tc_args = "{}"
-        else:
-            tc_args = str(tc_args)
-            if not tc_args.strip():
-                tc_args = "{}"
-        normalized_tool_calls.append(
-            {
-                "id": tc_id,
-                "type": "function",
-                "function": {"name": tc_name, "arguments": tc_args},
-            }
-        )
-
-    # Determine finish_reason: "tool_calls" only if tool calls present AND no text content
-    finish_reason = "tool_calls" if (normalized_tool_calls and not text_content) else "stop"
-
-    if tool_calls_data:
-        response_content["choices"].append(
-            {
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": text_content,
-                },
-                "tool_calls": tool_calls_data,
-                "finish_reason": finish_reason,
-            }
-        )
-    else:
-        response_content["choices"].append(
-            {
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": text_content,
-                },
-                "finish_reason": finish_reason,
-            }
-        )
-
     # Log usage for both streaming and non-streaming
     response_time_ms = int((time_module.time() - start_time) * 1000)
     endpoint_name = None
@@ -7267,6 +7340,59 @@ async def chat_completions(request: Request):
         inbound_api_key_label=inbound_api_key_label,
     )
 
+    # Build non-streaming response
+    response_content = {
+        "id": job_id,
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [],
+        "usage": usage,
+    }
+
+    if system_fingerprint:
+        response_content["system_fingerprint"] = system_fingerprint
+
+    normalized_tool_calls = []
+    for idx, tc in enumerate(tool_calls_data or []):
+        if not isinstance(tc, dict):
+            continue
+        fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+        tc_name = str(fn.get("name") or "").strip()
+        if not tc_name:
+            continue
+        tc_id = str(tc.get("id") or f"call_{int(time.time() * 1000)}_{idx}").strip()
+        tc_args = fn.get("arguments")
+        if isinstance(tc_args, (dict, list)):
+            tc_args = json.dumps(tc_args)
+        elif tc_args is None:
+            tc_args = "{}"
+        else:
+            tc_args = str(tc_args)
+            if not tc_args.strip():
+                tc_args = "{}"
+        normalized_tool_calls.append(
+            {
+                "id": tc_id,
+                "type": "function",
+                "function": {"name": tc_name, "arguments": tc_args},
+            }
+        )
+
+    finish_reason = "tool_calls" if (normalized_tool_calls and not text_content) else "stop"
+
+    choice = {
+        "index": 0,
+        "message": {
+            "role": "assistant",
+            "content": text_content,
+        },
+        "finish_reason": finish_reason,
+    }
+    if normalized_tool_calls:
+        choice["message"]["tool_calls"] = normalized_tool_calls
+    response_content["choices"].append(choice)
+
     # Store non-stream cache after successful response when safe
     if (
         not stream
@@ -7286,47 +7412,6 @@ async def chat_completions(request: Request):
                 )
             except Exception as e:
                 debug_log("warn", f"[CACHE] store failed model={model}: {e}")
-
-    # Build and return response
-    response_content = {
-        "id": job_id,
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": model,
-        "choices": [],
-        "usage": usage,
-    }
-
-    # Add system_fingerprint if available (OA-4)
-    if system_fingerprint:
-        response_content["system_fingerprint"] = system_fingerprint
-
-    # Determine finish_reason: "tool_calls" only if tool calls present AND no text content
-    finish_reason = "tool_calls" if (tool_calls_data and not text_content) else "stop"
-
-    if normalized_tool_calls:
-        response_content["choices"].append(
-            {
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": text_content,
-                    "tool_calls": normalized_tool_calls,
-                },
-                "finish_reason": finish_reason,
-            }
-        )
-    elif text_content is not None:
-        response_content["choices"].append(
-            {
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": text_content,
-                },
-                "finish_reason": finish_reason,
-            }
-        )
 
     response = JSONResponse(content=response_content)
     _log_chat_activity(200, "", stream_flag=False)
@@ -8214,13 +8299,17 @@ async def anthropic_messages(request: Request):
 
     # Build request for chat/completions - use actual model from backend
     actual_model = backend.model if hasattr(backend, "model") else model
+    effective_stream = bool(stream)
+    if not effective_stream and getattr(backend, "endpoint_type", "") == "openai_oauth":
+        effective_stream = True
+
     chat_data = {
         "model": actual_model,
         "messages": converted_messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
         "top_p": top_p,
-        "stream": stream,
+        "stream": effective_stream,
     }
     if tools:
         chat_data["tools"] = tools
@@ -8229,7 +8318,7 @@ async def anthropic_messages(request: Request):
         chat_data = _openai_chat_to_openai_oauth_payload(
             messages=converted_messages,
             model=actual_model,
-            stream=stream,
+            stream=effective_stream,
             temperature=temperature,
             max_tokens=max_tokens,
             top_p=top_p,
@@ -8239,7 +8328,7 @@ async def anthropic_messages(request: Request):
         )
 
     # Check for streaming
-    if stream:
+    if effective_stream and stream:
         # Handle streaming - similar to chat_completions but return SSE
         headers = {"Content-Type": "application/json"}
         auth_header = await resolve_endpoint_auth_header_async(
@@ -8271,7 +8360,7 @@ async def anthropic_messages(request: Request):
         headers["X-Priority"] = "NORMAL"
 
         # Get endpoint URL
-        endpoint = backend.url
+        endpoint = _backend_effective_url(backend)
         if hasattr(backend, "endpoint_type"):
             if backend.endpoint_type == "deepinfra":
                 endpoint = f"{endpoint}/v1/openai/chat/completions"
@@ -8341,15 +8430,27 @@ async def anthropic_messages(request: Request):
         )
 
     # Non-streaming
-    backend_result, error, status_code = await backend.chat_completion(
-        messages=converted_messages,
-        model=model,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        top_p=top_p,
-        stream=False,
-        tools=tools,
-    )
+    if not stream and getattr(backend, "endpoint_type", "") == "openai_oauth":
+        backend_result, error, status_code = await _call_backend_chat_via_stream_collect(
+            backend=backend,
+            model=model,
+            messages=converted_messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            tools=tools,
+            incoming_source=incoming_source,
+        )
+    else:
+        backend_result, error, status_code = await backend.chat_completion(
+            messages=converted_messages,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            stream=False,
+            tools=tools,
+        )
 
     if error:
         return JSONResponse(status_code=status_code, content=error)
@@ -8362,7 +8463,36 @@ async def anthropic_messages(request: Request):
     content_blocks = []
     tool_calls_data = []
 
-    if "choices" in result and result["choices"]:
+    if "_stream_data" in result:
+        stream_data = result["_stream_data"]
+        finish_reason = "end_turn"
+        for line in stream_data.split("\n"):
+            stripped = line.strip()
+            if not stripped.startswith("data:"):
+                continue
+            payload = stripped[5:].lstrip()
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                chunk = json_module.loads(payload)
+            except Exception:
+                continue
+            if "choices" in chunk and chunk["choices"]:
+                delta = chunk["choices"][0].get("delta", {})
+                if delta.get("content"):
+                    content += delta["content"]
+                finish_reason = chunk["choices"][0].get("finish_reason") or finish_reason
+            if chunk.get("usage"):
+                usage = chunk["usage"]
+        if getattr(backend, "endpoint_type", "") == "openai_oauth" and not usage:
+            usage = _estimate_openai_oauth_usage(
+                messages=converted_messages,
+                tools=tools,
+                full_content=content,
+                full_reasoning="",
+                tool_calls=[],
+            )
+    elif "choices" in result and result["choices"]:
         message = result["choices"][0].get("message", {})
         content = message.get("content", "") or ""
         tool_calls_data = message.get("tool_calls", []) or []
@@ -8522,7 +8652,7 @@ async def ollama_chat(request: Request):
     if auth_response is not None:
         return auth_response
     data = await request.json()
-    model = data.get("model")
+    model = data.get("model") or data.get("name")
     if not model:
         return JSONResponse(status_code=400, content={"error": "model is required"})
 
@@ -8568,20 +8698,201 @@ async def ollama_chat(request: Request):
                 )
             return JSONResponse(content=resp.json())
 
+    if stream:
+        if getattr(backend, "endpoint_type", "") == "anthropic":
+            return _ollama_streaming_not_supported_response()
+
+        messages = data.get("messages") or []
+        options = data.get("options") or {}
+        incoming_source = request.headers.get("x-source", "serverless-proxy")
+        actual_model = getattr(backend, "model", model)
+        chat_data = {
+            "model": actual_model,
+            "messages": messages,
+            "temperature": options.get("temperature", 0.7),
+            "max_tokens": options.get("num_predict", 256),
+            "top_p": options.get("top_p", 1.0),
+            "stream": True,
+        }
+        if data.get("tools"):
+            chat_data["tools"] = data.get("tools")
+
+        if getattr(backend, "endpoint_type", "") == "openai_oauth":
+            chat_data = _openai_chat_to_openai_oauth_payload(
+                messages=messages,
+                model=actual_model,
+                stream=True,
+                temperature=options.get("temperature", 0.7),
+                max_tokens=options.get("num_predict", 256),
+                top_p=options.get("top_p", 1.0),
+                tools=data.get("tools") or [],
+                tool_choice=None,
+                parallel_tool_calls=None,
+            )
+
+        headers = {"Content-Type": "application/json"}
+        auth_header = await resolve_endpoint_auth_header_async(
+            {
+                "id": getattr(backend, "endpoint_id", None),
+                "api_key": getattr(backend, "api_key", ""),
+                "oauth_enabled": getattr(backend, "oauth_enabled", 0),
+                "oauth_grant_type": getattr(backend, "oauth_grant_type", ""),
+                "oauth_token_url": getattr(backend, "oauth_token_url", ""),
+                "oauth_client_id": getattr(backend, "oauth_client_id", ""),
+                "oauth_client_secret": getattr(backend, "oauth_client_secret", ""),
+                "oauth_scope": getattr(backend, "oauth_scope", ""),
+                "oauth_refresh_token": getattr(backend, "oauth_refresh_token", ""),
+                "oauth_token_expires_at": getattr(backend, "oauth_token_expires_at", 0),
+                "oauth_token_request_format": getattr(
+                    backend, "oauth_token_request_format", "json"
+                ),
+                "oauth_client_auth_method": getattr(
+                    backend, "oauth_client_auth_method", "client_secret_post"
+                ),
+            }
+        )
+        if auth_header:
+            headers["Authorization"] = auth_header
+        headers["X-Source"] = incoming_source
+        headers["X-Model"] = actual_model
+        headers["X-Priority"] = "NORMAL"
+
+        endpoint = _backend_effective_url(backend)
+        endpoint_type = getattr(backend, "endpoint_type", "")
+        if endpoint_type == "deepinfra":
+            endpoint = f"{endpoint}/v1/openai/chat/completions"
+        elif endpoint_type == "openai_oauth":
+            endpoint = _resolve_openai_oauth_response_endpoint(endpoint)
+        elif endpoint_type == "openwebui":
+            endpoint = f"{endpoint}/api/chat/completions"
+        elif endpoint_type == "queue":
+            endpoint = f"{endpoint}/v1/chat/completions"
+        else:
+            endpoint = f"{endpoint}/v1/chat/completions"
+
+        async def ndjson_generator():
+            import json as json_module
+
+            async with httpx.AsyncClient(timeout=1200.0) as client:
+                async with client.stream(
+                    "POST", endpoint, headers=headers, json=chat_data
+                ) as resp:
+                    if resp.status_code >= 400:
+                        error_text = await resp.aread()
+                        yield json_module.dumps(
+                            {"error": error_text.decode("utf-8", errors="replace")}
+                        ) + "\n"
+                        return
+
+                    done_sent = False
+                    async for line in resp.aiter_lines():
+                        if not line.strip() or not line.startswith("data: "):
+                            continue
+                        data_str = line[6:]
+                        if data_str == "[DONE]":
+                            if not done_sent:
+                                yield json_module.dumps(
+                                    {
+                                        "model": model,
+                                        "created_at": time.strftime(
+                                            "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+                                        ),
+                                        "message": {"role": "assistant", "content": ""},
+                                        "done": True,
+                                        "done_reason": "stop",
+                                    }
+                                ) + "\n"
+                                done_sent = True
+                            continue
+                        try:
+                            chunk = json_module.loads(data_str)
+                        except Exception:
+                            continue
+
+                        content = ""
+                        if endpoint_type == "openai_oauth":
+                            evt_type = str(chunk.get("type") or "").lower()
+                            if evt_type in (
+                                "response.output_text.delta",
+                                "response.output.delta",
+                                "output_text.delta",
+                            ):
+                                content = str(chunk.get("delta") or chunk.get("text") or "")
+                        else:
+                            delta = chunk.get("choices", [{}])[0].get("delta", {})
+                            content = delta.get("content") or ""
+
+                        if content:
+                            yield json_module.dumps(
+                                {
+                                    "model": model,
+                                    "created_at": time.strftime(
+                                        "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+                                    ),
+                                    "message": {"role": "assistant", "content": content},
+                                    "done": False,
+                                }
+                            ) + "\n"
+
+                    if not done_sent:
+                        yield json_module.dumps(
+                            {
+                                "model": model,
+                                "created_at": time.strftime(
+                                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+                                ),
+                                "message": {"role": "assistant", "content": ""},
+                                "done": True,
+                                "done_reason": "stop",
+                            }
+                        ) + "\n"
+
+        return StreamingResponse(ndjson_generator(), media_type="application/x-ndjson")
+
     messages = data.get("messages") or []
     options = data.get("options") or {}
-    backend_result, error, status_code = await backend.chat_completion(
-        messages=messages,
-        model=model,
-        temperature=options.get("temperature", 0.7),
-        max_tokens=options.get("num_predict", 256),
-        top_p=options.get("top_p", 1.0),
-        stream=False,
-        tools=data.get("tools") or [],
-    )
+    if getattr(backend, "endpoint_type", "") == "openai_oauth":
+        backend_result, error, status_code = await _call_backend_chat_via_stream_collect(
+            backend=backend,
+            model=model,
+            messages=messages,
+            temperature=options.get("temperature", 0.7),
+            max_tokens=options.get("num_predict", 256),
+            top_p=options.get("top_p", 1.0),
+            tools=data.get("tools") or [],
+            incoming_source=request.headers.get("x-source", "serverless-proxy"),
+        )
+    else:
+        backend_result, error, status_code = await backend.chat_completion(
+            messages=messages,
+            model=model,
+            temperature=options.get("temperature", 0.7),
+            max_tokens=options.get("num_predict", 256),
+            top_p=options.get("top_p", 1.0),
+            stream=False,
+            tools=data.get("tools") or [],
+        )
     if error:
         return JSONResponse(status_code=status_code, content=error)
     result = backend_result.get("result", backend_result)
+    if "_stream_data" in result:
+        assembled = {"choices": [{"message": {"content": ""}}]}
+        for line in result["_stream_data"].split("\n"):
+            stripped = line.strip()
+            if not stripped.startswith("data:"):
+                continue
+            payload = stripped[5:].lstrip()
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                chunk = json.loads(payload)
+            except Exception:
+                continue
+            if "choices" in chunk and chunk["choices"]:
+                delta = chunk["choices"][0].get("delta", {})
+                if delta.get("content"):
+                    assembled["choices"][0]["message"]["content"] += delta["content"]
+        result = assembled
     return JSONResponse(content=_openai_to_ollama_chat_response(result, model))
 
 
@@ -8591,7 +8902,7 @@ async def ollama_generate(request: Request):
     if auth_response is not None:
         return auth_response
     data = await request.json()
-    model = data.get("model")
+    model = data.get("model") or data.get("name")
     if not model:
         return JSONResponse(status_code=400, content={"error": "model is required"})
 
@@ -8661,6 +8972,160 @@ async def ollama_generate(request: Request):
                 )
             return JSONResponse(content=resp.json())
 
+    if stream:
+        if getattr(backend, "endpoint_type", "") == "anthropic":
+            return _ollama_streaming_not_supported_response()
+
+        prompt = data.get("prompt", "")
+        messages = []
+        if data.get("system"):
+            messages.append({"role": "system", "content": data.get("system")})
+        messages.append({"role": "user", "content": prompt})
+
+        options = data.get("options") or {}
+        incoming_source = request.headers.get("x-source", "serverless-proxy")
+        actual_model = getattr(backend, "model", model)
+        chat_data = {
+            "model": actual_model,
+            "messages": messages,
+            "temperature": options.get("temperature", 0.7),
+            "max_tokens": options.get("num_predict", 256),
+            "top_p": options.get("top_p", 1.0),
+            "stream": True,
+        }
+
+        if getattr(backend, "endpoint_type", "") == "openai_oauth":
+            chat_data = _openai_chat_to_openai_oauth_payload(
+                messages=messages,
+                model=actual_model,
+                stream=True,
+                temperature=options.get("temperature", 0.7),
+                max_tokens=options.get("num_predict", 256),
+                top_p=options.get("top_p", 1.0),
+                tools=[],
+                tool_choice=None,
+                parallel_tool_calls=None,
+            )
+
+        headers = {"Content-Type": "application/json"}
+        auth_header = await resolve_endpoint_auth_header_async(
+            {
+                "id": getattr(backend, "endpoint_id", None),
+                "api_key": getattr(backend, "api_key", ""),
+                "oauth_enabled": getattr(backend, "oauth_enabled", 0),
+                "oauth_grant_type": getattr(backend, "oauth_grant_type", ""),
+                "oauth_token_url": getattr(backend, "oauth_token_url", ""),
+                "oauth_client_id": getattr(backend, "oauth_client_id", ""),
+                "oauth_client_secret": getattr(backend, "oauth_client_secret", ""),
+                "oauth_scope": getattr(backend, "oauth_scope", ""),
+                "oauth_refresh_token": getattr(backend, "oauth_refresh_token", ""),
+                "oauth_token_expires_at": getattr(backend, "oauth_token_expires_at", 0),
+                "oauth_token_request_format": getattr(
+                    backend, "oauth_token_request_format", "json"
+                ),
+                "oauth_client_auth_method": getattr(
+                    backend, "oauth_client_auth_method", "client_secret_post"
+                ),
+            }
+        )
+        if auth_header:
+            headers["Authorization"] = auth_header
+        headers["X-Source"] = incoming_source
+        headers["X-Model"] = actual_model
+        headers["X-Priority"] = "NORMAL"
+
+        endpoint = backend.url
+        endpoint_type = getattr(backend, "endpoint_type", "")
+        if endpoint_type == "deepinfra":
+            endpoint = f"{endpoint}/v1/openai/chat/completions"
+        elif endpoint_type == "openai_oauth":
+            endpoint = _resolve_openai_oauth_response_endpoint(endpoint)
+        elif endpoint_type == "openwebui":
+            endpoint = f"{endpoint}/api/chat/completions"
+        elif endpoint_type == "queue":
+            endpoint = f"{endpoint}/v1/chat/completions"
+        else:
+            endpoint = f"{endpoint}/v1/chat/completions"
+
+        async def ndjson_generator():
+            import json as json_module
+
+            async with httpx.AsyncClient(timeout=1200.0) as client:
+                async with client.stream(
+                    "POST", endpoint, headers=headers, json=chat_data
+                ) as resp:
+                    if resp.status_code >= 400:
+                        error_text = await resp.aread()
+                        yield json_module.dumps(
+                            {"error": error_text.decode("utf-8", errors="replace")}
+                        ) + "\n"
+                        return
+
+                    done_sent = False
+                    async for line in resp.aiter_lines():
+                        if not line.strip() or not line.startswith("data: "):
+                            continue
+                        data_str = line[6:]
+                        if data_str == "[DONE]":
+                            if not done_sent:
+                                yield json_module.dumps(
+                                    {
+                                        "model": model,
+                                        "created_at": time.strftime(
+                                            "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+                                        ),
+                                        "response": "",
+                                        "done": True,
+                                        "done_reason": "stop",
+                                    }
+                                ) + "\n"
+                                done_sent = True
+                            continue
+                        try:
+                            chunk = json_module.loads(data_str)
+                        except Exception:
+                            continue
+
+                        content = ""
+                        if endpoint_type == "openai_oauth":
+                            evt_type = str(chunk.get("type") or "").lower()
+                            if evt_type in (
+                                "response.output_text.delta",
+                                "response.output.delta",
+                                "output_text.delta",
+                            ):
+                                content = str(chunk.get("delta") or chunk.get("text") or "")
+                        else:
+                            delta = chunk.get("choices", [{}])[0].get("delta", {})
+                            content = delta.get("content") or ""
+
+                        if content:
+                            yield json_module.dumps(
+                                {
+                                    "model": model,
+                                    "created_at": time.strftime(
+                                        "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+                                    ),
+                                    "response": content,
+                                    "done": False,
+                                }
+                            ) + "\n"
+
+                    if not done_sent:
+                        yield json_module.dumps(
+                            {
+                                "model": model,
+                                "created_at": time.strftime(
+                                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+                                ),
+                                "response": "",
+                                "done": True,
+                                "done_reason": "stop",
+                            }
+                        ) + "\n"
+
+        return StreamingResponse(ndjson_generator(), media_type="application/x-ndjson")
+
     prompt = data.get("prompt", "")
     messages = []
     if data.get("system"):
@@ -8668,19 +9133,48 @@ async def ollama_generate(request: Request):
     messages.append({"role": "user", "content": prompt})
 
     options = data.get("options") or {}
-    backend_result, error, status_code = await backend.chat_completion(
-        messages=messages,
-        model=model,
-        temperature=options.get("temperature", 0.7),
-        max_tokens=options.get("num_predict", 256),
-        top_p=options.get("top_p", 1.0),
-        stream=False,
-    )
+    if getattr(backend, "endpoint_type", "") == "openai_oauth":
+        backend_result, error, status_code = await _call_backend_chat_via_stream_collect(
+            backend=backend,
+            model=model,
+            messages=messages,
+            temperature=options.get("temperature", 0.7),
+            max_tokens=options.get("num_predict", 256),
+            top_p=options.get("top_p", 1.0),
+            tools=[],
+            incoming_source=request.headers.get("x-source", "serverless-proxy"),
+        )
+    else:
+        backend_result, error, status_code = await backend.chat_completion(
+            messages=messages,
+            model=model,
+            temperature=options.get("temperature", 0.7),
+            max_tokens=options.get("num_predict", 256),
+            top_p=options.get("top_p", 1.0),
+            stream=False,
+        )
     if error:
         return JSONResponse(status_code=status_code, content=error)
-    raw = _openai_to_ollama_chat_response(
-        backend_result.get("result", backend_result), model
-    )
+    result = backend_result.get("result", backend_result)
+    if "_stream_data" in result:
+        assembled = {"choices": [{"message": {"content": ""}}]}
+        for line in result["_stream_data"].split("\n"):
+            stripped = line.strip()
+            if not stripped.startswith("data:"):
+                continue
+            payload = stripped[5:].lstrip()
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                chunk = json.loads(payload)
+            except Exception:
+                continue
+            if "choices" in chunk and chunk["choices"]:
+                delta = chunk["choices"][0].get("delta", {})
+                if delta.get("content"):
+                    assembled["choices"][0]["message"]["content"] += delta["content"]
+        result = assembled
+    raw = _openai_to_ollama_chat_response(result, model)
     return {
         "model": raw.get("model", model),
         "created_at": raw.get(
@@ -8727,7 +9221,51 @@ async def ollama_show(request: Request):
     auth_response = enforce_runtime_access(request)
     if auth_response is not None:
         return auth_response
-    return await _ollama_passthrough(request, "/api/show", method="POST")
+    data = await request.json()
+    model = data.get("model") or data.get("name")
+    if not model:
+        return JSONResponse(status_code=400, content={"error": "model is required"})
+
+    backend = get_backend(model)
+    if backend is None:
+        return JSONResponse(status_code=404, content={"error": "model not found"})
+
+    if getattr(backend, "endpoint_type", "") == "ollama":
+        return await _ollama_passthrough(request, "/api/show", method="POST")
+
+    actual_model = getattr(backend, "model", model)
+    endpoint_type = getattr(backend, "endpoint_type", "") or "proxy"
+    family = endpoint_type.replace("_", "-")
+    capabilities = ["chat"]
+    if endpoint_type in ("openai", "openai_oauth", "openwebui", "deepinfra", "queue", "vllm"):
+        capabilities.append("completion")
+    if endpoint_type not in ("anthropic",):
+        capabilities.append("embedding")
+
+    details = {
+        "family": family,
+        "families": [family],
+        "parameter_size": "unknown",
+        "quantization_level": "unknown",
+        "parent_model": actual_model,
+        "format": endpoint_type,
+        "capabilities": capabilities,
+    }
+
+    return {
+        "license": "unknown",
+        "modelfile": "# synthetic metadata generated by serverless-proxy",
+        "parameters": "",
+        "template": "",
+        "details": details,
+        "model_info": {
+            "proxy_virtual_model": model,
+            "proxy_actual_model": actual_model,
+            "proxy_endpoint_type": endpoint_type,
+            "proxy_translated": True,
+        },
+        "messages": [],
+    }
 
 
 @app.get("/api/ps")
@@ -8936,15 +9474,27 @@ async def completions(request: Request):
             debug_log("warn", f"[CACHE] embeddings lookup failed model={model}: {e}")
 
     # Call backend
-    backend_result, error, status_code = await backend.chat_completion(
-        messages=messages,
-        model=model,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        top_p=top_p,
-        stream=stream,
-        stop=stop,
-    )
+    if not stream and getattr(backend, "endpoint_type", "") == "openai_oauth":
+        backend_result, error, status_code = await _call_backend_chat_via_stream_collect(
+            backend=backend,
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            tools=[],
+            incoming_source=x_source or "serverless-proxy",
+        )
+    else:
+        backend_result, error, status_code = await backend.chat_completion(
+            messages=messages,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            stream=stream,
+            stop=stop,
+        )
 
     if error:
         response = JSONResponse(status_code=status_code, content=error)
@@ -8977,27 +9527,85 @@ async def completions(request: Request):
         result = backend_result["result"]
 
     content = ""
-    if "choices" in result and result["choices"]:
-        content = result["choices"][0].get("message", {}).get("content", "") or ""
-
+    usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     job_id = result.get("id", f"cmpl-{int(time_module.time())}")
-    usage = result.get(
-        "usage", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-    )
+
+    if "_stream_data" in result:
+        stream_data = result["_stream_data"]
+        for line in stream_data.split("\n"):
+            stripped = line.strip()
+            if not stripped.startswith("data:"):
+                continue
+            payload = stripped[5:].lstrip()
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                chunk = json.loads(payload)
+            except Exception:
+                continue
+            if "choices" in chunk and chunk["choices"]:
+                delta = chunk["choices"][0].get("delta", {})
+                if delta.get("content"):
+                    content += delta["content"]
+            if chunk.get("usage"):
+                usage = chunk["usage"]
+        if getattr(backend, "endpoint_type", "") == "openai_oauth" and not any(usage.values()):
+            usage = _estimate_openai_oauth_usage(
+                messages=messages,
+                tools=[],
+                full_content=content,
+                full_reasoning="",
+                tool_calls=[],
+            )
+    elif "choices" in result and result["choices"]:
+        content = result["choices"][0].get("message", {}).get("content", "") or ""
+        usage = result.get(
+            "usage", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        )
 
     if stream:
+        if "_stream_data" in result:
 
-        async def generate_sse():
-            created = int(time_module.time())
-            if content:
-                yield f"data: {json.dumps({'id': job_id, 'choices': [{'text': content, 'index': 0}], 'model': model})}\n\n"
-            yield "data: [DONE]\n\n"
+            async def passthrough_sse():
+                yielded_text = False
+                for line in result["_stream_data"].split("\n"):
+                    stripped = line.strip()
+                    if not stripped.startswith("data:"):
+                        continue
+                    payload = stripped[5:].lstrip()
+                    if payload == "[DONE]":
+                        continue
+                    try:
+                        chunk = json.loads(payload)
+                    except Exception:
+                        continue
+                    if "choices" in chunk and chunk["choices"]:
+                        delta = chunk["choices"][0].get("delta", {})
+                        text = delta.get("content") or ""
+                        if text:
+                            yielded_text = True
+                            yield f"data: {json.dumps({'id': job_id, 'choices': [{'text': text, 'index': 0}], 'model': model})}\n\n"
+                if not yielded_text and content:
+                    yield f"data: {json.dumps({'id': job_id, 'choices': [{'text': content, 'index': 0}], 'model': model})}\n\n"
+                yield "data: [DONE]\n\n"
 
-        response = StreamingResponse(
-            generate_sse(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
-        )
+            response = StreamingResponse(
+                passthrough_sse(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+            )
+        else:
+
+            async def generate_sse():
+                if content:
+                    yield f"data: {json.dumps({'id': job_id, 'choices': [{'text': content, 'index': 0}], 'model': model})}\n\n"
+                yield "data: [DONE]\n\n"
+
+            response = StreamingResponse(
+                generate_sse(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+            )
         log_recent_activity(
             request_id=str(job_id),
             method=request.method,

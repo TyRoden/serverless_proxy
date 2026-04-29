@@ -34,10 +34,12 @@ Goal: make proxy usable as an Ollama endpoint for inference clients and OpenAI-c
 
 ## Phase 2 - Full Ollama Surface Compatibility
 
-Goal: support full native Ollama API surface for model lifecycle and admin operations.
+Goal: support full native Ollama API surface for model lifecycle and admin operations, while translating request/response shapes for non-Ollama backends where that is practical.
 
 - [ ] Add/verify model metadata and runtime routes:
   - [x] `POST /api/show`
+    - [x] passthrough for real Ollama upstreams
+    - [x] synthetic compatibility response for non-Ollama virtual models
   - [x] `POST /api/ps` (and `GET /api/ps`)
 - [ ] Add model lifecycle routes:
   - [x] `POST /api/pull`
@@ -49,6 +51,8 @@ Goal: support full native Ollama API surface for model lifecycle and admin opera
   - [x] `POST /api/blobs/:digest`
   - [x] `HEAD /api/blobs/:digest`
 - [ ] Add explicit capability contracts and errors for unsupported upstreams
+  - [x] translated `/api/show` compatibility contract for non-Ollama backends
+  - [x] explicit streaming-not-supported response for unsupported translated backends
 - [x] Add end-to-end conformance suite for full surface (`scripts/ollama_full_surface_conformance.sh`)
 - [x] Document known version-dependent behavior by Ollama release (`docs/ollama-version-notes.md`)
 
@@ -56,5 +60,6 @@ Goal: support full native Ollama API surface for model lifecycle and admin opera
 
 - [ ] OpenClaw/OpenAI JS against proxy base URL works for chat and tools on Ollama virtual models
 - [ ] Native Ollama clients work against proxy runtime routes
+- [ ] Native Ollama clients can inspect translated non-Ollama virtual models via `/api/show`
 - [ ] Existing non-Ollama endpoint behavior is unchanged
 - [ ] Diagnostics can identify method/path/upstream-shape issues in one run
