@@ -21,10 +21,14 @@ All notable changes to the Serverless Proxy will be documented in this file.
 - **OpenAI Chat Non-Stream OAuth Normalization** - `openai_oauth`-backed models now return standard non-stream JSON `chat.completion` bodies for `POST /v1/chat/completions` (`stream:false`) while keeping streaming behavior unchanged.
 - **OpenAI Tool Round-Trip Completion Fix** - Fixed `openai_oauth` tool-result follow-up turns that could return empty final assistant content by preserving text emitted in OAuth Responses `response.output_item.added` / `response.output_text.added` events during SSE-to-chat normalization.
 - **OpenAI Tool Round-Trip Completion Fix (Part 2)** - Fixed an additional OAuth edge case where post-tool turns could still return `finish_reason:"stop"` with empty content; chat path now synthesizes fallback assistant text from the latest `role:"tool"` payload for both non-stream and streaming responses.
+- **OpenAI Completions Streaming Fidelity** - `POST /v1/completions` with `stream:true` now returns proper SSE `text_completion` chunks followed by `[DONE]` instead of a single non-stream JSON object.
+- **OpenAI Completions Stop Handling** - `POST /v1/completions` now normalizes and applies `stop` sequences (`string` or `string[]`) so completion text is stop-truncated consistently.
+- **OpenAI Chat Strict Request Validation** - `POST /v1/chat/completions` now rejects missing required `model`/`messages` and invalid tool-message ordering (unknown `tool_call_id`) with proxy-side `invalid_request_error` responses.
 - **Anthropic Stop-Reason/Usage Mapping** - Normalized Anthropic non-stream synthesis to map finish reasons (`stop`, `tool_calls`, `length`) to Anthropic-compatible `stop_reason` and stable token usage fields.
 - **Anthropic Tool Schema Mapping Compatibility** - `/v1/messages` tool definitions now normalize both Anthropic `input_schema` and OpenAI-style `parameters`, preserving tool argument generation for `openai_oauth` backends.
 - **Anthropic Tool-Use Streaming Compatibility** - `openai_oauth` Anthropic streaming now emits Anthropic-style SSE events (`message_start`, `content_block_start`/`content_block_stop`, `message_delta`, `[DONE]`) instead of `[DONE]`-only output.
 - **Anthropic Tool-Result Round-Trip Completion Fix** - Fixed follow-up `tool_result` turns that could end with empty assistant content by preserving/normalizing final text and adding fallback synthesis from tool-result payloads when upstream returns empty content.
+- **Anthropic Messages Strict Request Validation** - `POST /v1/messages` now rejects missing required `model`, `max_tokens`, or `messages`, and enforces Anthropic tool schema requirements (`name` + `input_schema`) with clear `invalid_request_error` responses.
 - **Ollama Embeddings Cross-Host Compatibility** - `/api/embed` and `/api/embeddings` now resolve virtual models first (with alias fallback such as `name`/`name:latest`) so embedding models hosted on non-Ollama backends work through Ollama-compatible routes.
 - **Ollama Embedding Error Hygiene** - Non-embedding models on Ollama embedding routes now return structured `unsupported_operation` compatibility responses instead of leaking upstream auth/capability errors.
 - **Ollama Show Fallback for Backend-Loaded Models** - `/api/show` now supports passthrough for backend-loaded Ollama models not explicitly present in virtual model mappings.
@@ -49,12 +53,18 @@ All notable changes to the Serverless Proxy will be documented in this file.
   - Additional tool round-trip probe reproduced and fixed the empty-post-tool edge case:
     - non-stream now returns non-empty assistant text on `finish_reason:"stop"`
     - stream now emits content delta(s) before final stop (instead of stop-only)
+  - `POST /v1/completions` (`stream:true`) now emits real SSE completion chunks and `[DONE]`.
+  - `POST /v1/completions` with `stop:["STOP"]` now returns stop-truncated completion text.
+  - `POST /v1/chat/completions` with missing `messages` now returns `400 invalid_request_error`.
+  - `POST /v1/chat/completions` with malformed tool ordering (`role:"tool"` before assistant tool call) now returns proxy-side validation error instead of upstream wording.
 - Validated Anthropic compatibility:
   - `POST /v1/messages` non-stream for `gpt-5.4-oauth` returned valid Anthropic message payload.
   - `POST /v1/messages` stream for `gpt-5.4-oauth` emitted Anthropic event sequence with `tool_use` content blocks and parsed input.
   - `POST /v1/messages` non-stream for `gemma4-e4b` remained non-regressed.
   - `POST /v1/messages` tool-use non-stream returned `tool_use` content blocks with parsed arguments.
   - Full Anthropic tool round-trip probe (dynamic `tool_use_id` from turn 1 carried into turn 2 `tool_result`) returned non-empty final assistant text.
+  - `POST /v1/messages` missing `messages` now returns `400 invalid_request_error`.
+  - `POST /v1/messages` malformed tool definition (missing `input_schema`) now returns `400 invalid_request_error`.
 - Validated Ollama embeddings compatibility:
   - `POST /api/embed` and `POST /api/embeddings` succeeded for `nomic-embed-text` and `qwen3-embedding`.
   - `POST /api/embed` batch input succeeded for `qwen3-embedding`.

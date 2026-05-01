@@ -6835,6 +6835,86 @@ def _filter_tool_calls_by_advertised(
     return kept, dropped
 
 
+def _openai_invalid_request(message: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=400,
+        content={
+            "error": {
+                "message": message,
+                "type": "invalid_request_error",
+                "code": "invalid_request_error",
+            }
+        },
+    )
+
+
+def _anthropic_invalid_request(message: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=400,
+        content={
+            "type": "error",
+            "error": {"type": "invalid_request_error", "message": message},
+        },
+    )
+
+
+def _validate_openai_tool_message_ordering(messages: Any) -> Optional[str]:
+    if not isinstance(messages, list):
+        return "Missing required field: messages"
+
+    seen_tool_call_ids: set[str] = set()
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role") or "").lower()
+        if role == "assistant" and isinstance(msg.get("tool_calls"), list):
+            for tc in msg.get("tool_calls") or []:
+                if not isinstance(tc, dict):
+                    continue
+                tc_id = str(tc.get("id") or "").strip()
+                if tc_id:
+                    seen_tool_call_ids.add(tc_id)
+        elif role == "tool":
+            tool_call_id = str(msg.get("tool_call_id") or "").strip()
+            if not tool_call_id:
+                return "Tool message missing required field: tool_call_id"
+            if tool_call_id not in seen_tool_call_ids:
+                return f"Tool message references unknown tool_call_id '{tool_call_id}'"
+    return None
+
+
+def _normalize_stop_sequences(stop: Any) -> list[str]:
+    if stop is None:
+        return []
+    if isinstance(stop, str):
+        s = stop
+        return [s] if s else []
+    if isinstance(stop, list):
+        out: list[str] = []
+        for item in stop:
+            if isinstance(item, str) and item:
+                out.append(item)
+        return out
+    return []
+
+
+def _apply_stop_sequences_to_text(text: str, stop_sequences: list[str]) -> tuple[str, bool]:
+    if not isinstance(text, str) or not text or not stop_sequences:
+        return text if isinstance(text, str) else "", False
+
+    cut_index = len(text)
+    hit = False
+    for s in stop_sequences:
+        idx = text.find(s)
+        if idx != -1 and idx < cut_index:
+            cut_index = idx
+            hit = True
+
+    if not hit:
+        return text, False
+    return text[:cut_index], True
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     """OpenAI-compatible chat completions endpoint."""
@@ -6929,6 +7009,15 @@ async def chat_completions(request: Request):
     top_p = data.get("top_p", 1.0)
     stream = data.get("stream", False)
     tools = data.get("tools", [])
+
+    if not isinstance(model, str) or not model.strip():
+        return _openai_invalid_request("Missing required field: model")
+    if not isinstance(messages, list) or len(messages) == 0:
+        return _openai_invalid_request("Missing required field: messages")
+
+    tool_order_err = _validate_openai_tool_message_ordering(messages)
+    if tool_order_err:
+        return _openai_invalid_request(tool_order_err)
 
     # Inbound request logging (basic diagnostics)
     accept_header = request.headers.get("accept", "")
@@ -8348,6 +8437,31 @@ async def anthropic_messages(request: Request):
     top_p = data.get("top_p", 1.0)
     stream = data.get("stream", False)
     tools = data.get("tools", [])
+
+    if not isinstance(model, str) or not model.strip():
+        return _anthropic_invalid_request("Missing required field: model")
+    if data.get("max_tokens") is None:
+        return _anthropic_invalid_request("Missing required field: max_tokens")
+    if not isinstance(messages, list) or len(messages) == 0:
+        return _anthropic_invalid_request("Missing required field: messages")
+    if tools is not None and not isinstance(tools, list):
+        return _anthropic_invalid_request("Invalid field: tools must be an array")
+
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            return _anthropic_invalid_request(
+                "Invalid Anthropic tool definition: each tool must be an object"
+            )
+        tool_name = str(tool.get("name") or "").strip()
+        if not tool_name:
+            return _anthropic_invalid_request(
+                "Anthropic tool missing required field: name"
+            )
+        input_schema = tool.get("input_schema")
+        if not isinstance(input_schema, dict):
+            return _anthropic_invalid_request(
+                f"Anthropic tool '{tool_name}' missing required field: input_schema"
+            )
 
     def _fallback_text_from_tool_result(msgs: list[dict[str, Any]]) -> str:
         for m in reversed(msgs or []):
@@ -9851,6 +9965,10 @@ async def completions(request: Request):
     top_p = data.get("top_p", 1.0)
     stream = data.get("stream", False)
     stop = data.get("stop")
+    stop_sequences = _normalize_stop_sequences(stop)
+
+    if not isinstance(model, str) or not model.strip():
+        return _openai_invalid_request("Missing required field: model")
 
     # Convert to chat format
     messages = [{"role": "user", "content": prompt}]
@@ -9891,7 +10009,7 @@ async def completions(request: Request):
     cache_control_req = (request.headers.get("cache-control") or "").lower()
     cache_key = None
 
-    if cache_enabled and "no-store" not in cache_control_req:
+    if (not stream) and cache_enabled and "no-store" not in cache_control_req:
         try:
             cache_key = normalize_request_for_cache(
                 {
@@ -10023,49 +10141,49 @@ async def completions(request: Request):
             "usage", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         )
 
+    content, stop_applied = _apply_stop_sequences_to_text(content, stop_sequences)
+
     if stream:
-        if "_stream_data" in result:
 
-            async def passthrough_sse():
-                yielded_text = False
-                for line in result["_stream_data"].split("\n"):
-                    stripped = line.strip()
-                    if not stripped.startswith("data:"):
-                        continue
-                    payload = stripped[5:].lstrip()
-                    if payload == "[DONE]":
-                        continue
-                    try:
-                        chunk = json.loads(payload)
-                    except Exception:
-                        continue
-                    if "choices" in chunk and chunk["choices"]:
-                        delta = chunk["choices"][0].get("delta", {})
-                        text = delta.get("content") or ""
-                        if text:
-                            yielded_text = True
-                            yield f"data: {json.dumps({'id': job_id, 'choices': [{'text': text, 'index': 0}], 'model': model})}\n\n"
-                if not yielded_text and content:
-                    yield f"data: {json.dumps({'id': job_id, 'choices': [{'text': content, 'index': 0}], 'model': model})}\n\n"
-                yield "data: [DONE]\n\n"
+        async def completion_sse():
+            created = int(time_module.time())
+            if content:
+                first_chunk = {
+                    "id": job_id,
+                    "object": "text_completion",
+                    "created": created,
+                    "model": model,
+                    "choices": [
+                        {
+                            "text": content,
+                            "index": 0,
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+                yield f"data: {json.dumps(first_chunk)}\n\n"
 
-            response = StreamingResponse(
-                passthrough_sse(),
-                media_type="text/event-stream",
-                headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
-            )
-        else:
+            final_chunk = {
+                "id": job_id,
+                "object": "text_completion",
+                "created": created,
+                "model": model,
+                "choices": [
+                    {
+                        "text": "",
+                        "index": 0,
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
+            yield f"data: {json.dumps(final_chunk)}\n\n"
+            yield "data: [DONE]\n\n"
 
-            async def generate_sse():
-                if content:
-                    yield f"data: {json.dumps({'id': job_id, 'choices': [{'text': content, 'index': 0}], 'model': model})}\n\n"
-                yield "data: [DONE]\n\n"
-
-            response = StreamingResponse(
-                generate_sse(),
-                media_type="text/event-stream",
-                headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
-            )
+        response = StreamingResponse(
+            completion_sse(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
         log_recent_activity(
             request_id=str(job_id),
             method=request.method,
@@ -10116,7 +10234,7 @@ async def completions(request: Request):
         "usage": usage,
     }
     response = JSONResponse(content=response_content)
-    if cache_enabled and cache_key:
+    if (not stream) and cache_enabled and cache_key:
         try:
             ttl = int(get_setting("cache_ttl_chat", "300") or 300)
             store_cached_response(cache_key, response_content, ttl, virtual_model)

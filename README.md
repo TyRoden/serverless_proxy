@@ -723,6 +723,12 @@ Validated on live proxy with inbound API key and current `main` runtime:
     - if upstream returns `finish_reason:"stop"` with empty post-tool text, proxy now synthesizes a minimal assistant answer from the latest `role:"tool"` payload
     - non-stream now returns non-empty `message.content`
     - stream now emits one or more content delta chunks before final stop
+  - `POST /v1/completions` strictness and fidelity:
+    - `stream:true` now emits true SSE `text_completion` chunks and `[DONE]`
+    - `stop` sequences are honored via truncation-safe normalization (`string` or `string[]`)
+  - `POST /v1/chat/completions` strict validation:
+    - missing required `model` or `messages` now returns `400 invalid_request_error`
+    - invalid tool-message ordering now returns proxy-side validation (`unknown tool_call_id`) instead of leaking upstream provider phrasing
   - `POST /v1/embeddings` with `qwen3-embedding` returns valid embedding vector payload
 - **Anthropic-compatible**
   - `POST /v1/messages` with `gpt-5.4-oauth`:
@@ -735,6 +741,9 @@ Validated on live proxy with inbound API key and current `main` runtime:
     3. final assistant response returns non-empty `content` text and `stop_reason:"end_turn"`
   - Anthropic tool schema normalization supports both `input_schema` and OpenAI-style `parameters` in incoming tool definitions
   - `POST /v1/messages` with `gemma4-e4b` non-stream remains non-regressed (`200`)
+  - `POST /v1/messages` strict validation:
+    - missing required `model`, `max_tokens`, or `messages` returns `400` Anthropic-style `invalid_request_error`
+    - malformed tool definitions (for example missing `input_schema`) are rejected with clear validation errors
 - **Ollama-compatible**
   - `POST /api/embed` with `nomic-embed-text` and alias forms returns embeddings (`200`)
   - `POST /api/embeddings` with `prompt` field returns single-vector shape (`{"embedding":[...]}`)
@@ -766,6 +775,7 @@ Tool round-trip test note:
 Compatibility posture note:
 
 - The proxy now includes extensive compatibility checks and normalizations across both OpenAI and Anthropic protocol surfaces, with explicit coverage for stream-required OAuth backends, tool-call/tool-result round-trips, and non-stream response synthesis.
+- Protocol strictness is also now enforced for schema-required fields and malformed tool-message sequencing, so invalid requests fail predictably with proxy-normalized errors.
 
 #### Conformance and roadmap docs
 
