@@ -17,11 +17,38 @@ All notable changes to the Serverless Proxy will be documented in this file.
 - **Ollama Non-Stream Translation** - `openai_oauth`-backed virtual models now synthesize non-stream Ollama responses for `/api/chat` and `/api/generate` instead of leaking upstream stream-only constraints.
 - **Anthropic Non-Stream Translation** - `openai_oauth`-backed virtual models now synthesize non-stream Anthropic `/v1/messages` responses by buffering streamed upstream output.
 - **OpenAI Completions Normalization** - `openai_oauth`-backed virtual models now synthesize non-stream `/v1/completions` responses and improved streamed completions output instead of returning only `[DONE]`.
+- **OAuth Chat Streaming Refactor Runtime Fix** - Fixed runtime `NameError` regressions in `chat_completions` stream parsing path by rehydrating parser outputs (`full_content`, `full_reasoning`, `finish_reason`, `stats`, `stream_data`) after helper extraction.
+- **OpenAI Chat Non-Stream OAuth Normalization** - `openai_oauth`-backed models now return standard non-stream JSON `chat.completion` bodies for `POST /v1/chat/completions` (`stream:false`) while keeping streaming behavior unchanged.
+- **Anthropic Stop-Reason/Usage Mapping** - Normalized Anthropic non-stream synthesis to map finish reasons (`stop`, `tool_calls`, `length`) to Anthropic-compatible `stop_reason` and stable token usage fields.
+- **Ollama Embeddings Cross-Host Compatibility** - `/api/embed` and `/api/embeddings` now resolve virtual models first (with alias fallback such as `name`/`name:latest`) so embedding models hosted on non-Ollama backends work through Ollama-compatible routes.
+- **Ollama Embedding Error Hygiene** - Non-embedding models on Ollama embedding routes now return structured `unsupported_operation` compatibility responses instead of leaking upstream auth/capability errors.
+- **Ollama Show Fallback for Backend-Loaded Models** - `/api/show` now supports passthrough for backend-loaded Ollama models not explicitly present in virtual model mappings.
+- **Ollama /api/ps Discovery Merge** - `/api/ps` now merges embedding-capable virtual models into discovery output and can return synthetic discovery when an Ollama passthrough endpoint is unavailable.
 
 ### Documentation
 
 - **README Key Analytics Notes** - Documented that Usage and Activity can be filtered by inbound API key, enabling per-team/per-client usage measurement from the dashboard.
-- **README Multi-Protocol Notes** - Documented translated Ollama compatibility behavior, trusted-internal key attribution behavior, and the one remaining `chat.completions` non-stream normalization limitation for `openai_oauth` models.
+- **README Multi-Protocol Notes** - Documented translated Ollama compatibility behavior, trusted-internal key attribution behavior, and OpenAI/Anthropic/Ollama protocol-surface compatibility expectations for `openai_oauth` models.
+- **README Compatibility Validation Expansion** - Added expanded compatibility notes covering OAuth/OpenAI chat normalization, Anthropic non-stream synthesis, Ollama embeddings cross-host behavior, `/api/ps` discovery merge behavior, and end-to-end validation probes.
+
+### Validation
+
+- Verified Python syntax (`python3 -m py_compile simple_bridge.py`) after compatibility patches.
+- Rebuilt/restarted proxy container (`docker compose up -d --build serverless-proxy`) during staged validation.
+- Validated OpenAI OAuth chat path:
+  - `POST /v1/chat/completions` (`stream:true`) returned valid SSE chunks and `[DONE]`.
+  - `POST /v1/chat/completions` (`stream:false`) returned valid JSON `chat.completion` body.
+  - Required tool-call stream probe returned correct tool-call deltas and `finish_reason:"tool_calls"`.
+- Validated Anthropic compatibility:
+  - `POST /v1/messages` non-stream for `gpt-5.4-oauth` returned valid Anthropic message payload.
+  - `POST /v1/messages` stream for `gpt-5.4-oauth` remained healthy.
+  - `POST /v1/messages` non-stream for `gemma4-e4b` remained non-regressed.
+  - `POST /v1/messages` tool-use non-stream returned `tool_use` content blocks with parsed arguments.
+- Validated Ollama embeddings compatibility:
+  - `POST /api/embed` and `POST /api/embeddings` succeeded for `nomic-embed-text` and `qwen3-embedding`.
+  - `POST /api/embed` batch input succeeded for `qwen3-embedding`.
+  - `POST /api/embed` for non-embedding model (`gpt-5.4-oauth`) returned structured `unsupported_operation`.
+  - `GET /api/ps` showed merged discovery including embedding-capable virtual model entries.
 
 ## [2.4.6] - 2026-04-23
 

@@ -692,9 +692,41 @@ For Ollama-backed virtual models, these routes are forwarded to the configured O
   - Ollama `POST /api/chat`
   - Ollama `POST /api/generate`
   - Anthropic `POST /v1/messages`
+  - OpenAI `POST /v1/chat/completions`
   - OpenAI `POST /v1/completions`
-- Known remaining limitation:
-  - `POST /v1/chat/completions` with `stream:false` on `openai_oauth` models still needs one final normalization pass so it returns a standard JSON `chat.completion` body instead of SSE-style chunk text.
+
+#### Embeddings compatibility behavior
+
+- `POST /api/embed` and `POST /api/embeddings` now resolve virtual models first (including `name` and `name:latest` alias forms), so embedding backends can live on non-Ollama hosts.
+- `POST /api/embed` accepts both `input` and `prompt` fields for broader Ollama-client compatibility.
+- If a model is not mapped in virtual models, embedding routes fall back to Ollama passthrough when an Ollama endpoint exists.
+- If no mapping and no Ollama endpoint are available, embedding routes return a structured `model_not_found` compatibility error.
+- Non-embedding models now return structured `unsupported_operation` errors on Ollama embedding routes instead of leaking upstream auth/capability noise.
+- `POST /api/show` now supports passthrough for backend-loaded Ollama models not explicitly present in virtual model mappings.
+- `GET|POST /api/ps` now merges embedding-capable virtual models into model discovery, and returns synthetic model discovery when Ollama passthrough is unavailable.
+
+#### Compatibility validation (latest)
+
+Validated on live proxy with inbound API key and current `main` runtime:
+
+- **OpenAI-compatible**
+  - `POST /v1/chat/completions` with `gpt-5.4-oauth`:
+    - `stream:true` returns valid SSE chunks + `[DONE]`
+    - `stream:false` returns valid JSON `chat.completion` body
+  - `POST /v1/chat/completions` with required tool call (`tool_choice:"required"`) returns streamed tool-call deltas and `finish_reason:"tool_calls"`
+  - `POST /v1/embeddings` with `qwen3-embedding` returns valid embedding vector payload
+- **Anthropic-compatible**
+  - `POST /v1/messages` with `gpt-5.4-oauth`:
+    - `stream:false` returns valid Anthropic message shape (`type:"message"`, `content`, `stop_reason`, `usage`)
+    - `stream:true` continues to emit Anthropic event stream correctly
+  - `POST /v1/messages` with tools on `gpt-5.4-oauth` returns `tool_use` blocks with parsed tool input and `stop_reason:"tool_use"`
+  - `POST /v1/messages` with `gemma4-e4b` non-stream remains non-regressed (`200`)
+- **Ollama-compatible**
+  - `POST /api/embed` with `nomic-embed-text` and alias forms returns embeddings (`200`)
+  - `POST /api/embeddings` with `prompt` field returns single-vector shape (`{"embedding":[...]}`)
+  - `POST /api/embed` with non-embedding model (`gpt-5.4-oauth`) returns structured `unsupported_operation` error (`400`)
+  - `GET /api/ps` includes discovered Ollama models and merged embedding-capable virtual models (for example `qwen3-embedding`)
+  - `POST /api/embed` with `qwen3-embedding` works for single and batch inputs
 
 #### Activity and key attribution behavior
 

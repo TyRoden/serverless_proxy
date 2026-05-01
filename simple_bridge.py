@@ -4697,6 +4697,49 @@ def _ollama_streaming_not_supported_response() -> JSONResponse:
     )
 
 
+def _looks_like_embedding_model_name(name: str) -> bool:
+    nl = str(name or "").lower()
+    return any(tok in nl for tok in ("embed", "embedding", "nomic", "bge", "e5"))
+
+
+def _virtual_model_supports_embedding_discovery(vm: dict[str, Any]) -> bool:
+    endpoint_type = str(vm.get("endpoint_type") or "").strip().lower()
+    # Conservative allow-list for endpoint families that commonly expose embeddings.
+    if endpoint_type not in ("ollama", "openai", "openwebui", "deepinfra", "queue", "vllm"):
+        return False
+
+    name = str(vm.get("name") or "")
+    actual = str(vm.get("actual_model") or "")
+    return _looks_like_embedding_model_name(name) or _looks_like_embedding_model_name(actual)
+
+
+def _virtual_embedding_models_for_ollama_ps() -> list[dict[str, Any]]:
+    models: list[dict[str, Any]] = []
+    for vm in get_enabled_virtual_models():
+        if not _virtual_model_supports_embedding_discovery(vm):
+            continue
+        model_name = str(vm.get("name") or "").strip()
+        if not model_name:
+            continue
+        models.append(
+            {
+                "name": model_name,
+                "model": model_name,
+                "size": 0,
+                "digest": "",
+                "details": {
+                    "family": "proxy",
+                    "parameter_size": "unknown",
+                    "quantization_level": "unknown",
+                },
+                "modified_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "_proxy_virtual": True,
+                "_proxy_endpoint_type": str(vm.get("endpoint_type") or ""),
+            }
+        )
+    return models
+
+
 def _backend_effective_url(backend: Any) -> str:
     url = getattr(backend, "url", None)
     if not url and hasattr(backend, "primary"):
@@ -9199,21 +9242,111 @@ async def ollama_embed(request: Request):
     if not model:
         return JSONResponse(status_code=400, content={"error": "model is required"})
 
-    backend = get_backend(model)
+    path = request.url.path
+    model_str = str(model)
+    candidate_models = [model_str]
+    if ":" not in model_str:
+        candidate_models.append(f"{model_str}:latest")
+    elif model_str.endswith(":latest"):
+        candidate_models.append(model_str[: -len(":latest")])
+
+    def _embedding_name_hint(name: str) -> bool:
+        nl = str(name or "").lower()
+        return any(tok in nl for tok in ("embed", "embedding", "nomic", "bge", "e5"))
+
+    async def _proxy_to_ollama_embed() -> JSONResponse:
+        target_url, target_api_key = _resolve_ollama_target_for_request(model_str)
+        if not target_url:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": {
+                        "type": "model_not_found",
+                        "message": f"Model '{model_str}' is not configured and no enabled Ollama endpoint is available for fallback resolution.",
+                    }
+                },
+            )
+
+        headers = {
+            "Content-Type": "application/json",
+            "X-Source": request.headers.get("x-source", "serverless-proxy"),
+        }
+        if target_api_key:
+            headers["Authorization"] = f"Bearer {target_api_key}"
+
+        payload = dict(data)
+
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            response = None
+            for candidate in candidate_models:
+                payload["model"] = candidate
+                response = await client.post(f"{target_url}{path}", headers=headers, json=payload)
+                body_text = (response.text or "").lower()
+                if response.status_code == 404 and "model not found" in body_text:
+                    continue
+                break
+
+        if response is None:
+            return JSONResponse(status_code=500, content={"error": "embedding proxy failed"})
+
+        try:
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except Exception:
+            return JSONResponse(status_code=response.status_code, content={"error": response.text})
+
+    resolved_model = model_str
+    backend = None
+    for candidate in candidate_models:
+        backend = get_backend(candidate)
+        if backend is not None:
+            resolved_model = candidate
+            break
+
     if backend is None:
-        return JSONResponse(status_code=404, content={"error": "model not found"})
+        # Keep Ollama-compatible behavior for backend-loaded models surfaced via /api/ps.
+        return await _proxy_to_ollama_embed()
+
+    if getattr(backend, "endpoint_type", "") == "ollama":
+        return await _proxy_to_ollama_embed()
 
     result, error, status_code = await backend.embeddings(
-        input_text=data.get("input", ""),
-        model=model,
+        input_text=data.get("input", data.get("prompt", "")),
+        model=resolved_model,
     )
     if error:
+        err_message = ""
+        if isinstance(error, dict):
+            inner = error.get("error")
+            if isinstance(inner, dict):
+                err_message = str(inner.get("message") or "")
+            elif isinstance(inner, str):
+                err_message = inner
+        if (
+            int(status_code or 500) in (400, 401, 403, 404)
+            and not _embedding_name_hint(resolved_model)
+        ):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "type": "unsupported_operation",
+                        "message": f"Model '{model_str}' is not embedding-capable on the Ollama protocol surface.",
+                    }
+                },
+            )
+        if err_message:
+            debug_log(
+                "warn",
+                f"[OLLAMA_EMBED_ERR] model={resolved_model} status={status_code} message={err_message[:160]}",
+            )
         return JSONResponse(status_code=status_code, content=error)
 
     vectors = [
         row.get("embedding") for row in result.get("data", []) if isinstance(row, dict)
     ]
-    return {"model": model, "embeddings": vectors}
+    if path.endswith("/api/embeddings"):
+        return {"embedding": vectors[0] if vectors else []}
+    return {"model": model_str, "embeddings": vectors}
 
 
 @app.post("/api/show")
@@ -9228,7 +9361,8 @@ async def ollama_show(request: Request):
 
     backend = get_backend(model)
     if backend is None:
-        return JSONResponse(status_code=404, content={"error": "model not found"})
+        # Allow synthetic show passthrough for backend-loaded Ollama models.
+        return await _ollama_passthrough(request, "/api/show", method="POST")
 
     if getattr(backend, "endpoint_type", "") == "ollama":
         return await _ollama_passthrough(request, "/api/show", method="POST")
@@ -9275,7 +9409,38 @@ async def ollama_ps(request: Request):
     if auth_response is not None:
         return auth_response
     method = request.method.upper()
-    return await _ollama_passthrough(request, "/api/ps", method=method)
+    passthrough = await _ollama_passthrough(request, "/api/ps", method=method)
+
+    synthetic_models = _virtual_embedding_models_for_ollama_ps()
+    if not synthetic_models:
+        return passthrough
+
+    if isinstance(passthrough, JSONResponse):
+        try:
+            content = json.loads(passthrough.body.decode("utf-8"))
+        except Exception:
+            content = None
+
+        # If there is no Ollama endpoint, still provide discoverable virtual embedding models.
+        if passthrough.status_code == 404 and isinstance(content, dict):
+            return JSONResponse(status_code=200, content={"models": synthetic_models})
+
+        if passthrough.status_code == 200 and isinstance(content, dict):
+            existing = content.get("models")
+            if isinstance(existing, list):
+                seen = {
+                    str((m.get("name") if isinstance(m, dict) else "") or "").strip().lower()
+                    for m in existing
+                }
+                merged = list(existing)
+                for m in synthetic_models:
+                    name_key = str(m.get("name") or "").strip().lower()
+                    if name_key and name_key not in seen:
+                        merged.append(m)
+                content["models"] = merged
+                return JSONResponse(status_code=200, content=content)
+
+    return passthrough
 
 
 @app.post("/api/pull")
