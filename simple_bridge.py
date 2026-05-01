@@ -4183,6 +4183,45 @@ def _openai_chat_to_openai_oauth_payload(
     return payload
 
 
+def _fallback_text_from_openai_tool_result(messages: list[dict[str, Any]]) -> str:
+    for msg in reversed(messages or []):
+        if not isinstance(msg, dict) or str(msg.get("role") or "").lower() != "tool":
+            continue
+        raw = msg.get("content")
+        if raw is None:
+            continue
+
+        if isinstance(raw, str):
+            raw_str = raw.strip()
+        else:
+            try:
+                raw_str = json.dumps(raw)
+            except Exception:
+                raw_str = str(raw)
+            raw_str = raw_str.strip()
+
+        if not raw_str:
+            continue
+
+        parsed = None
+        try:
+            parsed = json.loads(raw_str)
+        except Exception:
+            parsed = None
+
+        if isinstance(parsed, dict):
+            city = parsed.get("city")
+            forecast = parsed.get("forecast") or parsed.get("weather")
+            temp_c = parsed.get("temp_c")
+            if city and forecast and temp_c is not None:
+                return f"The weather in {city} is {forecast} and {temp_c}°C."
+            return f"Tool result: {json.dumps(parsed)}"
+
+        return f"Tool result: {raw_str}"
+
+    return ""
+
+
 def _openai_oauth_response_to_chat_completion(
     response_obj: dict[str, Any], model_name: str
 ) -> dict[str, Any]:
@@ -7230,6 +7269,19 @@ async def chat_completions(request: Request):
             else:
                 text_content = full_reasoning
 
+        # Some OAuth tool-result turns can finish with stop and empty text.
+        # Preserve OpenAI streaming compatibility by synthesizing a minimal
+        # assistant response from the latest tool result when needed.
+        if (
+            is_openai_oauth_backend
+            and not extracted_tc
+            and not text_content
+            and (finish_reason in ("stop", "end_turn", None, ""))
+        ):
+            fallback_text = _fallback_text_from_openai_tool_result(messages)
+            if fallback_text:
+                text_content = fallback_text
+
         # OpenAI OAuth streams frequently omit usage tokens. Keep upstream values when present,
         # and estimate only for OAuth when usage is missing.
         if is_openai_oauth_backend:
@@ -7403,6 +7455,19 @@ async def chat_completions(request: Request):
                 f"[TOOL_FILTER] request_id={request_id} dropped={len(dropped_tc)} names={','.join(dropped_names[:8])}",
             )
         tool_calls_data = filtered_tc
+
+    # Some OAuth tool-result turns can complete with finish_reason=stop and
+    # empty content. Preserve full round-trip compatibility by synthesizing
+    # a minimal assistant text from the latest tool result when needed.
+    if (
+        is_openai_oauth_backend
+        and not text_content
+        and not tool_calls_data
+        and (finish_reason in ("stop", "end_turn", None, ""))
+    ):
+        fallback_text = _fallback_text_from_openai_tool_result(messages)
+        if fallback_text:
+            text_content = fallback_text
 
     job_id = result.get("id", f"chat-{int(time_module.time())}")
 

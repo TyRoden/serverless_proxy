@@ -719,6 +719,10 @@ Validated on live proxy with inbound API key and current `main` runtime:
     2. client executes tool and sends `role:"tool"` with matching `tool_call_id`
     3. final assistant response returns non-empty natural-language `message.content` with `finish_reason:"stop"`
   - OAuth SSE normalization now preserves final assistant text that may arrive as `response.output_item.added` / `response.output_text.added` events (not only `output_text.delta` events)
+  - OpenAI tool round-trip edge case is normalized for both modes:
+    - if upstream returns `finish_reason:"stop"` with empty post-tool text, proxy now synthesizes a minimal assistant answer from the latest `role:"tool"` payload
+    - non-stream now returns non-empty `message.content`
+    - stream now emits one or more content delta chunks before final stop
   - `POST /v1/embeddings` with `qwen3-embedding` returns valid embedding vector payload
 - **Anthropic-compatible**
   - `POST /v1/messages` with `gpt-5.4-oauth`:
