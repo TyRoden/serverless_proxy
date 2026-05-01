@@ -714,6 +714,11 @@ Validated on live proxy with inbound API key and current `main` runtime:
     - `stream:true` returns valid SSE chunks + `[DONE]`
     - `stream:false` returns valid JSON `chat.completion` body
   - `POST /v1/chat/completions` with required tool call (`tool_choice:"required"`) returns streamed tool-call deltas and `finish_reason:"tool_calls"`
+  - Full OpenAI tool round-trip now passes:
+    1. assistant emits `tool_calls`
+    2. client executes tool and sends `role:"tool"` with matching `tool_call_id`
+    3. final assistant response returns non-empty natural-language `message.content` with `finish_reason:"stop"`
+  - OAuth SSE normalization now preserves final assistant text that may arrive as `response.output_item.added` / `response.output_text.added` events (not only `output_text.delta` events)
   - `POST /v1/embeddings` with `qwen3-embedding` returns valid embedding vector payload
 - **Anthropic-compatible**
   - `POST /v1/messages` with `gpt-5.4-oauth`:
@@ -737,10 +742,17 @@ Validated on live proxy with inbound API key and current `main` runtime:
 
 - Request/response diagnostics under debug mode:
   - `[HTTP_IN]`, `[HTTP_OUT]`, `[HTTP_ERR]`
+- OAuth SSE conversion diagnostics:
+  - `[OAUTH_SSE]` event counters show whether text/tool events were observed during conversion
+  - `[STREAM_PARSE]` confirms parsed content length, tool-call count, and final finish reason
 - Ollama upstream payload diagnostics:
   - `[OLLAMA_400] ... body=... payload=...`
 - Response marker header:
   - `X-Proxy: serverless-proxy`
+
+Tool round-trip test note:
+
+- For deterministic testing, use the `tool_call.id` returned by step 1 in step 2. Reusing stale/hardcoded `tool_call_id` values across requests can produce misleading empty final responses.
 
 #### Conformance and roadmap docs
 

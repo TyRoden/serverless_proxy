@@ -19,6 +19,7 @@ All notable changes to the Serverless Proxy will be documented in this file.
 - **OpenAI Completions Normalization** - `openai_oauth`-backed virtual models now synthesize non-stream `/v1/completions` responses and improved streamed completions output instead of returning only `[DONE]`.
 - **OAuth Chat Streaming Refactor Runtime Fix** - Fixed runtime `NameError` regressions in `chat_completions` stream parsing path by rehydrating parser outputs (`full_content`, `full_reasoning`, `finish_reason`, `stats`, `stream_data`) after helper extraction.
 - **OpenAI Chat Non-Stream OAuth Normalization** - `openai_oauth`-backed models now return standard non-stream JSON `chat.completion` bodies for `POST /v1/chat/completions` (`stream:false`) while keeping streaming behavior unchanged.
+- **OpenAI Tool Round-Trip Completion Fix** - Fixed `openai_oauth` tool-result follow-up turns that could return empty final assistant content by preserving text emitted in OAuth Responses `response.output_item.added` / `response.output_text.added` events during SSE-to-chat normalization.
 - **Anthropic Stop-Reason/Usage Mapping** - Normalized Anthropic non-stream synthesis to map finish reasons (`stop`, `tool_calls`, `length`) to Anthropic-compatible `stop_reason` and stable token usage fields.
 - **Ollama Embeddings Cross-Host Compatibility** - `/api/embed` and `/api/embeddings` now resolve virtual models first (with alias fallback such as `name`/`name:latest`) so embedding models hosted on non-Ollama backends work through Ollama-compatible routes.
 - **Ollama Embedding Error Hygiene** - Non-embedding models on Ollama embedding routes now return structured `unsupported_operation` compatibility responses instead of leaking upstream auth/capability errors.
@@ -39,6 +40,7 @@ All notable changes to the Serverless Proxy will be documented in this file.
   - `POST /v1/chat/completions` (`stream:true`) returned valid SSE chunks and `[DONE]`.
   - `POST /v1/chat/completions` (`stream:false`) returned valid JSON `chat.completion` body.
   - Required tool-call stream probe returned correct tool-call deltas and `finish_reason:"tool_calls"`.
+  - Full tool round-trip probe (dynamic `tool_call_id` from turn 1 carried into turn 2 `role:"tool"` message) returned non-empty final assistant content with `finish_reason:"stop"`.
 - Validated Anthropic compatibility:
   - `POST /v1/messages` non-stream for `gpt-5.4-oauth` returned valid Anthropic message payload.
   - `POST /v1/messages` stream for `gpt-5.4-oauth` remained healthy.

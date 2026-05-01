@@ -4283,6 +4283,8 @@ def _openai_oauth_response_to_chat_completion(
 def _openai_oauth_sse_to_openai_chat_sse(sse_text: str, model_name: str) -> str:
     out_lines: list[str] = []
     saw_tool_call = False
+    saw_text_delta = False
+    pending_added_text_parts: list[str] = []
     oauth_usage: Optional[dict[str, Any]] = None
     oauth_tool_stats: dict[str, int] = {
         "events": 0,
@@ -4379,6 +4381,27 @@ def _openai_oauth_sse_to_openai_chat_sse(sse_text: str, model_name: str) -> str:
             normalized["prompt_tokens_details"] = prompt_details
         return normalized
 
+    def _extract_text_from_output_item(item: Any) -> str:
+        if not isinstance(item, dict):
+            return ""
+        direct_text = item.get("text")
+        if isinstance(direct_text, str) and direct_text:
+            return direct_text
+        content_blocks = item.get("content")
+        if isinstance(content_blocks, list):
+            collected: list[str] = []
+            for block in content_blocks:
+                if not isinstance(block, dict):
+                    continue
+                block_type = str(block.get("type") or "").lower()
+                if block_type in ("output_text", "text", "input_text"):
+                    block_text = block.get("text")
+                    if isinstance(block_text, str) and block_text:
+                        collected.append(block_text)
+            if collected:
+                return "".join(collected)
+        return ""
+
     for raw in (sse_text or "").splitlines():
         line = raw.strip()
         if not line.startswith("data:"):
@@ -4407,10 +4430,9 @@ def _openai_oauth_sse_to_openai_chat_sse(sse_text: str, model_name: str) -> str:
             "output_text.delta",
         ):
             delta_text = str(evt.get("delta") or evt.get("text") or "")
-        elif evt_type in (
-            "response.output_item.added",
-            "response.output_text.added",
-        ):
+            if delta_text:
+                saw_text_delta = True
+        elif evt_type == "response.output_item.added":
             item = evt.get("item") or {}
             if isinstance(item, dict):
                 item_type = str(item.get("type") or "").lower()
@@ -4452,8 +4474,17 @@ def _openai_oauth_sse_to_openai_chat_sse(sse_text: str, model_name: str) -> str:
                             rec["emitted_args_len"] = int(rec.get("emitted_args_len") or 0) + len(
                                 fn_args
                             )
-                # Intentionally ignore text from output_item.added/output_text.added
-                # to avoid duplicate text chunks; rely on output_text.delta events.
+                else:
+                    item_text = _extract_text_from_output_item(item)
+                    if item_text:
+                        pending_added_text_parts.append(item_text)
+        elif evt_type == "response.output_text.added":
+            item = evt.get("item") or {}
+            item_text = _extract_text_from_output_item(item)
+            if not item_text:
+                item_text = str(evt.get("text") or "")
+            if item_text:
+                pending_added_text_parts.append(item_text)
         elif evt_type == "response.function_call_arguments.delta":
             oauth_tool_stats["tool_arg_delta"] += 1
             arg_delta = _args_to_str(evt.get("delta"))
@@ -4548,6 +4579,23 @@ def _openai_oauth_sse_to_openai_chat_sse(sse_text: str, model_name: str) -> str:
             out_lines.append(f"data: {json.dumps(chunk)}\n")
 
         if evt_type in ("response.completed", "response.done", "completed"):
+            if pending_added_text_parts and not saw_text_delta:
+                added_text = "".join(pending_added_text_parts)
+                if added_text:
+                    chunk = {
+                        "id": evt.get("response_id") or f"chatcmpl_{int(time.time() * 1000)}",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": model_name,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": added_text},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    out_lines.append(f"data: {json.dumps(chunk)}\n")
             finish_reason = "tool_calls" if saw_tool_call else "stop"
             final_chunk = {
                 "id": evt.get("response_id") or f"chatcmpl_{int(time.time() * 1000)}",
