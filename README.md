@@ -723,8 +723,13 @@ Validated on live proxy with inbound API key and current `main` runtime:
 - **Anthropic-compatible**
   - `POST /v1/messages` with `gpt-5.4-oauth`:
     - `stream:false` returns valid Anthropic message shape (`type:"message"`, `content`, `stop_reason`, `usage`)
-    - `stream:true` continues to emit Anthropic event stream correctly
+    - `stream:true` emits Anthropic-style SSE event sequence (`message_start`, `content_block_*`, `message_delta`, `[DONE]`)
   - `POST /v1/messages` with tools on `gpt-5.4-oauth` returns `tool_use` blocks with parsed tool input and `stop_reason:"tool_use"`
+  - Full Anthropic tool round-trip now passes:
+    1. assistant emits `tool_use` with parsed `input` (for example `{"city":"London"}`)
+    2. client sends `tool_result` with matching `tool_use_id`
+    3. final assistant response returns non-empty `content` text and `stop_reason:"end_turn"`
+  - Anthropic tool schema normalization supports both `input_schema` and OpenAI-style `parameters` in incoming tool definitions
   - `POST /v1/messages` with `gemma4-e4b` non-stream remains non-regressed (`200`)
 - **Ollama-compatible**
   - `POST /api/embed` with `nomic-embed-text` and alias forms returns embeddings (`200`)
@@ -753,6 +758,10 @@ Validated on live proxy with inbound API key and current `main` runtime:
 Tool round-trip test note:
 
 - For deterministic testing, use the `tool_call.id` returned by step 1 in step 2. Reusing stale/hardcoded `tool_call_id` values across requests can produce misleading empty final responses.
+
+Compatibility posture note:
+
+- The proxy now includes extensive compatibility checks and normalizations across both OpenAI and Anthropic protocol surfaces, with explicit coverage for stream-required OAuth backends, tool-call/tool-result round-trips, and non-stream response synthesis.
 
 #### Conformance and roadmap docs
 

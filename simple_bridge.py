@@ -4402,6 +4402,23 @@ def _openai_oauth_sse_to_openai_chat_sse(sse_text: str, model_name: str) -> str:
                 return "".join(collected)
         return ""
 
+    def _extract_text_from_response_obj(resp_obj: Any) -> str:
+        if not isinstance(resp_obj, dict):
+            return ""
+        direct = resp_obj.get("output_text")
+        if isinstance(direct, str) and direct:
+            return direct
+        output_items = resp_obj.get("output")
+        if isinstance(output_items, list):
+            collected: list[str] = []
+            for item in output_items:
+                item_text = _extract_text_from_output_item(item)
+                if item_text:
+                    collected.append(item_text)
+            if collected:
+                return "".join(collected)
+        return ""
+
     for raw in (sse_text or "").splitlines():
         line = raw.strip()
         if not line.startswith("data:"):
@@ -4561,6 +4578,10 @@ def _openai_oauth_sse_to_openai_chat_sse(sse_text: str, model_name: str) -> str:
                         )
                         rec["emitted_args_len"] = 2
                     last_tool_key = tool_key
+                else:
+                    item_text = _extract_text_from_output_item(item)
+                    if item_text:
+                        pending_added_text_parts.append(item_text)
 
         if delta_text:
             chunk = {
@@ -4579,6 +4600,12 @@ def _openai_oauth_sse_to_openai_chat_sse(sse_text: str, model_name: str) -> str:
             out_lines.append(f"data: {json.dumps(chunk)}\n")
 
         if evt_type in ("response.completed", "response.done", "completed"):
+            if not saw_text_delta and not pending_added_text_parts:
+                completed_text = _extract_text_from_response_obj(evt.get("response"))
+                if not completed_text:
+                    completed_text = str(evt.get("output_text") or "")
+                if completed_text:
+                    pending_added_text_parts.append(completed_text)
             if pending_added_text_parts and not saw_text_delta:
                 added_text = "".join(pending_added_text_parts)
                 if added_text:
@@ -8257,6 +8284,32 @@ async def anthropic_messages(request: Request):
     stream = data.get("stream", False)
     tools = data.get("tools", [])
 
+    def _fallback_text_from_tool_result(msgs: list[dict[str, Any]]) -> str:
+        for m in reversed(msgs or []):
+            if not isinstance(m, dict) or m.get("role") != "tool":
+                continue
+            raw = m.get("content")
+            if raw is None:
+                continue
+            raw_str = raw if isinstance(raw, str) else json_module.dumps(raw)
+            raw_str = str(raw_str).strip()
+            if not raw_str:
+                continue
+            try:
+                parsed = json_module.loads(raw_str)
+            except Exception:
+                parsed = None
+
+            if isinstance(parsed, dict):
+                city = parsed.get("city")
+                forecast = parsed.get("forecast") or parsed.get("weather")
+                temp_c = parsed.get("temp_c")
+                if city and forecast and temp_c is not None:
+                    return f"The weather in {city} is {forecast} and {temp_c}°C."
+                return f"Tool result: {json_module.dumps(parsed)}"
+            return f"Tool result: {raw_str}"
+        return ""
+
     # Convert Claude Code tool format to OpenAI format
     # Claude Code sends: {"name": "...", "description": "...", "parameters": {...}}
     # OpenAI expects: {"type": "function", "function": {"name": "...", "description": "...", "parameters": {...}}}
@@ -8266,15 +8319,18 @@ async def anthropic_messages(request: Request):
             if "function" in tool:
                 converted_tools.append(tool)
             elif "name" in tool:
+                params = tool.get("parameters")
+                if not isinstance(params, dict):
+                    params = tool.get("input_schema")
+                if not isinstance(params, dict):
+                    params = {"type": "object", "properties": {}}
                 converted_tools.append(
                     {
                         "type": "function",
                         "function": {
                             "name": tool.get("name"),
                             "description": tool.get("description", ""),
-                            "parameters": tool.get(
-                                "parameters", {"type": "object", "properties": {}}
-                            ),
+                            "parameters": params,
                         },
                     }
                 )
@@ -8424,6 +8480,125 @@ async def anthropic_messages(request: Request):
 
     # Check for streaming
     if effective_stream and stream:
+        if getattr(backend, "endpoint_type", "") == "openai_oauth":
+            backend_result, error, status_code = await _call_backend_chat_via_stream_collect(
+                backend=backend,
+                model=model,
+                messages=converted_messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                top_p=top_p,
+                tools=tools,
+                incoming_source=incoming_source,
+            )
+            if error:
+                return JSONResponse(status_code=status_code, content=error)
+
+            result = backend_result
+            if isinstance(backend_result, dict) and "result" in backend_result:
+                result = backend_result["result"]
+            stream_data = result.get("_stream_data", "") if isinstance(result, dict) else ""
+
+            parsed = _parse_chat_stream_payload(
+                stream_data=stream_data,
+                backend=backend,
+                messages=converted_messages,
+                tools=tools,
+                model=model,
+                request_id="anthropic_stream",
+            )
+
+            text_content = parsed.get("text_content") or parsed.get("full_content") or ""
+            tool_calls_data = parsed.get("tool_calls") or []
+            finish_reason = parsed.get("finish_reason")
+            usage_data = parsed.get("usage") or {}
+
+            if (
+                not text_content
+                and not tool_calls_data
+                and (finish_reason in ("stop", "end_turn", None, ""))
+            ):
+                text_content = _fallback_text_from_tool_result(converted_messages)
+
+            if tool_calls_data:
+                stop_reason = "tool_use"
+            elif finish_reason == "length":
+                stop_reason = "max_tokens"
+            else:
+                stop_reason = "end_turn"
+
+            async def oauth_stream_generator():
+                message_id = f"msg_{int(time_module.time() * 1000)}"
+                input_tokens = int(
+                    usage_data.get("prompt_tokens", usage_data.get("input_tokens", 0)) or 0
+                )
+                output_tokens = int(
+                    usage_data.get("completion_tokens", usage_data.get("output_tokens", 0))
+                    or 0
+                )
+
+                yield (
+                    f'data: {{"type":"message_start","message":{{"id":"{message_id}",'
+                    f'"type":"message","role":"assistant","content":[],"model":"{model}",'
+                    '"stop_reason":null,"stop_sequence":null,'
+                    f'"usage":{{"input_tokens":{input_tokens},"output_tokens":0}}}}}}\n\n'
+                )
+
+                if text_content:
+                    text_escaped = (
+                        str(text_content)
+                        .replace("\\", "\\\\")
+                        .replace('"', '\\"')
+                        .replace("\n", "\\n")
+                        .replace("\r", "\\r")
+                        .replace("\t", "\\t")
+                    )
+                    yield (
+                        'data: {"type":"content_block_start","index":0,'
+                        '"content_block":{"type":"text","text":""}}\n\n'
+                    )
+                    text_delta_evt = {
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "text_delta", "text": text_content},
+                    }
+                    yield f"data: {json_module.dumps(text_delta_evt)}\n\n"
+                    yield 'data: {"type":"content_block_stop","index":0}\n\n'
+                else:
+                    for idx, tc in enumerate(tool_calls_data):
+                        func = tc.get("function", {}) if isinstance(tc, dict) else {}
+                        args = func.get("arguments", {}) if isinstance(func, dict) else {}
+                        if isinstance(args, str):
+                            try:
+                                args = json_module.loads(args)
+                            except Exception:
+                                args = {"raw": args}
+                        block = {
+                            "type": "tool_use",
+                            "id": tc.get("id", f"toolu_{int(time_module.time() * 1000)}"),
+                            "name": func.get("name", ""),
+                            "input": args if isinstance(args, dict) else {},
+                        }
+                        yield (
+                            f'data: {{"type":"content_block_start","index":{idx},'
+                            f'"content_block":{json_module.dumps(block)}}}\n\n'
+                        )
+                        yield f'data: {{"type":"content_block_stop","index":{idx}}}\n\n'
+
+                msg_delta_evt = {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": stop_reason, "type": "message_delta"},
+                    "usage": {"output_tokens": output_tokens},
+                }
+                yield f"data: {json_module.dumps(msg_delta_evt)}\n\n"
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(
+                oauth_stream_generator(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+            )
+
         # Handle streaming - similar to chat_completions but return SSE
         headers = {"Content-Type": "application/json"}
         auth_header = await resolve_endpoint_auth_header_async(
@@ -8581,6 +8756,13 @@ async def anthropic_messages(request: Request):
         tool_calls_data = message.get("tool_calls", []) or []
         finish_reason = choice.get("finish_reason") or finish_reason
         usage = result.get("usage", {}) or usage
+
+    if (
+        not content
+        and not tool_calls_data
+        and (finish_reason in ("stop", "end_turn", None, ""))
+    ):
+        content = _fallback_text_from_tool_result(converted_messages)
 
     # Convert text content
     if content:

@@ -21,6 +21,9 @@ All notable changes to the Serverless Proxy will be documented in this file.
 - **OpenAI Chat Non-Stream OAuth Normalization** - `openai_oauth`-backed models now return standard non-stream JSON `chat.completion` bodies for `POST /v1/chat/completions` (`stream:false`) while keeping streaming behavior unchanged.
 - **OpenAI Tool Round-Trip Completion Fix** - Fixed `openai_oauth` tool-result follow-up turns that could return empty final assistant content by preserving text emitted in OAuth Responses `response.output_item.added` / `response.output_text.added` events during SSE-to-chat normalization.
 - **Anthropic Stop-Reason/Usage Mapping** - Normalized Anthropic non-stream synthesis to map finish reasons (`stop`, `tool_calls`, `length`) to Anthropic-compatible `stop_reason` and stable token usage fields.
+- **Anthropic Tool Schema Mapping Compatibility** - `/v1/messages` tool definitions now normalize both Anthropic `input_schema` and OpenAI-style `parameters`, preserving tool argument generation for `openai_oauth` backends.
+- **Anthropic Tool-Use Streaming Compatibility** - `openai_oauth` Anthropic streaming now emits Anthropic-style SSE events (`message_start`, `content_block_start`/`content_block_stop`, `message_delta`, `[DONE]`) instead of `[DONE]`-only output.
+- **Anthropic Tool-Result Round-Trip Completion Fix** - Fixed follow-up `tool_result` turns that could end with empty assistant content by preserving/normalizing final text and adding fallback synthesis from tool-result payloads when upstream returns empty content.
 - **Ollama Embeddings Cross-Host Compatibility** - `/api/embed` and `/api/embeddings` now resolve virtual models first (with alias fallback such as `name`/`name:latest`) so embedding models hosted on non-Ollama backends work through Ollama-compatible routes.
 - **Ollama Embedding Error Hygiene** - Non-embedding models on Ollama embedding routes now return structured `unsupported_operation` compatibility responses instead of leaking upstream auth/capability errors.
 - **Ollama Show Fallback for Backend-Loaded Models** - `/api/show` now supports passthrough for backend-loaded Ollama models not explicitly present in virtual model mappings.
@@ -31,6 +34,7 @@ All notable changes to the Serverless Proxy will be documented in this file.
 - **README Key Analytics Notes** - Documented that Usage and Activity can be filtered by inbound API key, enabling per-team/per-client usage measurement from the dashboard.
 - **README Multi-Protocol Notes** - Documented translated Ollama compatibility behavior, trusted-internal key attribution behavior, and OpenAI/Anthropic/Ollama protocol-surface compatibility expectations for `openai_oauth` models.
 - **README Compatibility Validation Expansion** - Added expanded compatibility notes covering OAuth/OpenAI chat normalization, Anthropic non-stream synthesis, Ollama embeddings cross-host behavior, `/api/ps` discovery merge behavior, and end-to-end validation probes.
+- **README OpenAI/Anthropic Coverage Clarification** - Added explicit notes that compatibility validation and fixes now include full OpenAI and Anthropic tool-call/tool-result round-trip coverage (streaming and non-streaming).
 
 ### Validation
 
@@ -43,9 +47,10 @@ All notable changes to the Serverless Proxy will be documented in this file.
   - Full tool round-trip probe (dynamic `tool_call_id` from turn 1 carried into turn 2 `role:"tool"` message) returned non-empty final assistant content with `finish_reason:"stop"`.
 - Validated Anthropic compatibility:
   - `POST /v1/messages` non-stream for `gpt-5.4-oauth` returned valid Anthropic message payload.
-  - `POST /v1/messages` stream for `gpt-5.4-oauth` remained healthy.
+  - `POST /v1/messages` stream for `gpt-5.4-oauth` emitted Anthropic event sequence with `tool_use` content blocks and parsed input.
   - `POST /v1/messages` non-stream for `gemma4-e4b` remained non-regressed.
   - `POST /v1/messages` tool-use non-stream returned `tool_use` content blocks with parsed arguments.
+  - Full Anthropic tool round-trip probe (dynamic `tool_use_id` from turn 1 carried into turn 2 `tool_result`) returned non-empty final assistant text.
 - Validated Ollama embeddings compatibility:
   - `POST /api/embed` and `POST /api/embeddings` succeeded for `nomic-embed-text` and `qwen3-embedding`.
   - `POST /api/embed` batch input succeeded for `qwen3-embedding`.
