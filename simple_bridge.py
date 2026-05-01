@@ -4812,6 +4812,170 @@ async def _call_backend_chat_via_stream_collect(
     return result, None, 200
 
 
+def _parse_chat_stream_payload(
+    *,
+    stream_data: str,
+    backend: Any,
+    messages: list[dict[str, Any]],
+    tools: list[Any],
+    model: str,
+    request_id: str,
+) -> dict[str, Any]:
+    full_content = ""
+    full_reasoning = ""
+    usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    stream_tool_calls = []
+    has_tool_calls = False
+    finish_reason = None
+    stats = {
+        "total_lines": 0,
+        "data_lines": 0,
+        "json_ok": 0,
+        "json_fail": 0,
+        "first_error": None,
+    }
+
+    for line in stream_data.split("\n"):
+        stats["total_lines"] += 1
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if not (stripped.startswith("data:") or stripped.startswith("data ")):
+            continue
+
+        payload = stripped
+        if stripped.startswith("data:"):
+            payload = stripped[5:]
+            if payload.startswith(" "):
+                payload = payload[1:]
+        if not payload or payload.strip() == "[DONE]":
+            continue
+
+        stats["data_lines"] += 1
+        try:
+            chunk = json.loads(payload)
+            stats["json_ok"] += 1
+            if "choices" in chunk and chunk["choices"]:
+                delta = chunk["choices"][0].get("delta", {})
+                tc = delta.get("tool_calls")
+                if tc:
+                    for tc_chunk in tc:
+                        tc_index = tc_chunk.get("index", 0)
+                        while len(stream_tool_calls) <= tc_index:
+                            stream_tool_calls.append({"index": tc_index})
+                        if tc_chunk.get("id") and not stream_tool_calls[tc_index].get("id"):
+                            stream_tool_calls[tc_index]["id"] = tc_chunk["id"]
+                        if tc_chunk.get("type") and not stream_tool_calls[tc_index].get("type"):
+                            stream_tool_calls[tc_index]["type"] = tc_chunk["type"]
+                        func = tc_chunk.get("function", {})
+                        if "function" not in stream_tool_calls[tc_index]:
+                            stream_tool_calls[tc_index]["function"] = {}
+                        func_target = stream_tool_calls[tc_index]["function"]
+                        if func.get("name") and not func_target.get("name"):
+                            func_target["name"] = func["name"]
+                        arg_fragment = func.get("arguments", "")
+                        if arg_fragment:
+                            current_args = func_target.get("arguments", "")
+                            func_target["arguments"] = current_args + arg_fragment
+                        if tc_chunk.get("arguments") and not func_target.get("arguments"):
+                            func_target["arguments"] = tc_chunk["arguments"]
+                    has_tool_calls = True
+                if not has_tool_calls and delta.get("content"):
+                    full_content += delta["content"]
+                if delta.get("reasoning_content"):
+                    full_reasoning += delta["reasoning_content"]
+                finish_reason = chunk["choices"][0].get("finish_reason")
+            if "usage" in chunk and chunk["usage"]:
+                usage = chunk["usage"]
+        except json.JSONDecodeError as e:
+            stats["json_fail"] += 1
+            if not stats["first_error"]:
+                stats["first_error"] = f"line={stats['total_lines']} err={str(e)[:40]}"
+        except Exception as e:
+            stats["json_fail"] += 1
+            if not stats["first_error"]:
+                stats["first_error"] = f"line={stats['total_lines']} err={str(e)[:40]}"
+
+    has_vision = any(
+        isinstance(c, dict) and c.get("type") == "image_url"
+        for msg in messages
+        if isinstance(msg, dict)
+        for c in (msg.get("content") or [])
+    )
+    is_openai_oauth_backend = (
+        hasattr(backend, "endpoint_type") and backend.endpoint_type == "openai_oauth"
+    )
+    advertised_tool_names = _advertised_tool_names(tools)
+
+    if has_vision:
+        text_content = full_content
+        extracted_tc = stream_tool_calls if stream_tool_calls else []
+    elif is_openai_oauth_backend:
+        text_content = full_content
+        extracted_tc = []
+    else:
+        extracted_tc, text_content = process_content(full_content)
+
+    if stream_tool_calls and not extracted_tc:
+        extracted_tc = stream_tool_calls
+
+    if extracted_tc:
+        filtered_tc, _ = _filter_tool_calls_by_advertised(extracted_tc, advertised_tool_names)
+        extracted_tc = filtered_tc
+
+    stream_error = None
+    for line in stream_data.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("data:") or stripped.startswith("data "):
+            payload = stripped
+            if stripped.startswith("data:"):
+                payload = stripped[5:]
+                if payload.startswith(" "):
+                    payload = payload[1:]
+            if payload and payload.strip() != "[DONE]":
+                try:
+                    data = json.loads(payload)
+                    if "error" in data:
+                        err = data["error"]
+                        stream_error = err.get("message") if isinstance(err, dict) else str(err)
+                        break
+                    if "error_type" in data or "error_message" in data:
+                        stream_error = data.get("error_message") or data.get("error_type") or str(data)
+                        break
+                except Exception:
+                    pass
+
+    if is_openai_oauth_backend:
+        prompt_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+        completion_tokens = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+        total_tokens = int(usage.get("total_tokens") or 0)
+        if total_tokens <= 0:
+            total_tokens = prompt_tokens + completion_tokens
+        if prompt_tokens <= 0 and completion_tokens <= 0 and total_tokens <= 0:
+            usage = _estimate_openai_oauth_usage(
+                messages=messages,
+                tools=tools,
+                full_content=full_content,
+                full_reasoning=full_reasoning,
+                tool_calls=extracted_tc or [],
+            )
+        else:
+            usage["prompt_tokens"] = prompt_tokens
+            usage["completion_tokens"] = completion_tokens
+            usage["total_tokens"] = total_tokens
+
+    return {
+        "full_content": full_content,
+        "full_reasoning": full_reasoning,
+        "text_content": text_content,
+        "tool_calls": extracted_tc or [],
+        "usage": usage,
+        "finish_reason": finish_reason,
+        "stream_error": stream_error,
+        "stats": stats,
+    }
+
+
 async def _ollama_passthrough(
     request: Request, upstream_path: str, method: str = "POST"
 ):
@@ -6859,224 +7023,36 @@ async def chat_completions(request: Request):
 
     # Check if this is a streaming response from a virtual model backend
     if "_stream_data" in result and stream:
-        # Parse existing SSE data instead of making another request
         stream_data = result["_stream_data"]
-        full_content = ""
-        full_reasoning = ""
-        usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-        stream_tool_calls = []
-        has_tool_calls = False
-        finish_reason = None
-
-        # Telemetry counters for diagnostics
-        stats = {
-            "total_lines": 0,
-            "data_lines": 0,
-            "json_ok": 0,
-            "json_fail": 0,
-            "first_error": None,
-        }
-
-        for line in stream_data.split("\n"):
-            stats["total_lines"] += 1
-            # Accept variations: "data:", "data: ", with possible leading whitespace
-            stripped = line.strip()
-            if not stripped:
-                continue
-            if not (stripped.startswith("data:") or stripped.startswith("data ")):
-                continue  # Skip non-data lines (event:, comments, etc.)
-
-            # Extract data payload - handle both "data:" and "data: " formats
-            payload = stripped
-            if stripped.startswith("data:"):
-                payload = stripped[5:]  # remove "data"
-                if payload.startswith(" "):
-                    payload = payload[1:]  # remove leading space if present
-            if not payload or payload.strip() == "[DONE]":
-                continue
-
-            stats["data_lines"] += 1
-            try:
-                chunk = json.loads(payload)
-                stats["json_ok"] += 1
-                if "choices" in chunk and chunk["choices"]:
-                    delta = chunk["choices"][0].get("delta", {})
-                    tc = delta.get("tool_calls")
-                    if tc:
-                        # Merge streaming tool calls by index - accumulate arguments across chunks
-                        # This handles fragmented arguments from Qwen and other streaming models
-                        for tc_chunk in tc:
-                            tc_index = tc_chunk.get("index", 0)
-                            # Ensure we have a dict for this index
-                            while len(stream_tool_calls) <= tc_index:
-                                stream_tool_calls.append({"index": tc_index})
-
-                            # Merge in name, id, type from first chunk (if present)
-                            if tc_chunk.get("id") and not stream_tool_calls[
-                                tc_index
-                            ].get("id"):
-                                stream_tool_calls[tc_index]["id"] = tc_chunk["id"]
-                            if tc_chunk.get("type") and not stream_tool_calls[
-                                tc_index
-                            ].get("type"):
-                                stream_tool_calls[tc_index]["type"] = tc_chunk["type"]
-
-                            # Merge function data
-                            func = tc_chunk.get("function", {})
-                            if "function" not in stream_tool_calls[tc_index]:
-                                stream_tool_calls[tc_index]["function"] = {}
-
-                            func_target = stream_tool_calls[tc_index]["function"]
-                            if func.get("name") and not func_target.get("name"):
-                                func_target["name"] = func["name"]
-
-                            # Accumulate arguments (they come in fragments across chunks)
-                            arg_fragment = func.get("arguments", "")
-                            if arg_fragment:
-                                current_args = func_target.get("arguments", "")
-                                func_target["arguments"] = current_args + arg_fragment
-
-                            # Also handle direct arguments at top level (some APIs use this)
-                            if tc_chunk.get("arguments") and not func_target.get(
-                                "arguments"
-                            ):
-                                func_target["arguments"] = tc_chunk["arguments"]
-
-                        has_tool_calls = True
-                    # Handle content and reasoning separately
-                    # When tool calls are present, content is skipped to avoid leaking thinking
-                    # But reasoning_content should still be captured
-                    if not has_tool_calls:
-                        if delta.get("content"):
-                            full_content += delta["content"]
-                    if delta.get("reasoning_content"):
-                        full_reasoning += delta["reasoning_content"]
-                    finish_reason = chunk["choices"][0].get("finish_reason")
-                if "usage" in chunk and chunk["usage"]:
-                    usage = chunk["usage"]
-            except json.JSONDecodeError as e:
-                stats["json_fail"] += 1
-                if not stats["first_error"]:
-                    stats["first_error"] = (
-                        f"line={stats['total_lines']} err={str(e)[:40]}"
-                    )
-                debug_log(
-                    "warn",
-                    f"Stream JSON parse error: line={stats['total_lines']}, error={str(e)[:60]}",
-                )
-            except Exception as e:
-                stats["json_fail"] += 1
-                if not stats["first_error"]:
-                    stats["first_error"] = (
-                        f"line={stats['total_lines']} err={str(e)[:40]}"
-                    )
-                debug_log(
-                    "warn",
-                    f"Stream parse error: line={stats['total_lines']}, error={str(e)[:60]}",
-                )
-
-        # Skip all content processing for vision requests - prevents corrupting image data
-        has_vision = any(
-            isinstance(c, dict) and c.get("type") == "image_url"
-            for msg in messages
-            if isinstance(msg, dict)
-            for c in (msg.get("content") or [])
+        parsed = _parse_chat_stream_payload(
+            stream_data=stream_data,
+            backend=backend,
+            messages=messages,
+            tools=tools,
+            model=model,
+            request_id=request_id,
         )
-        is_openai_oauth_backend = (
-            hasattr(backend, "endpoint_type") and backend.endpoint_type == "openai_oauth"
-        )
-        advertised_tool_names = _advertised_tool_names(tools)
-
-        if has_vision:
-            debug_log(
-                "info",
-                f"[BYPASS_PROCESS] request_id={request_id} skipping process_content for vision request",
-            )
-            text_content = full_content
-            extracted_tc = stream_tool_calls if stream_tool_calls else []
-        elif is_openai_oauth_backend:
-            # For OAuth-backed responses, trust only protocol-level tool events.
-            # Do not infer tool calls from plain text fallback parsing.
-            text_content = full_content
-            extracted_tc = []
-        else:
-            extracted_tc, text_content = process_content(full_content)
-
-        if stream_tool_calls and not extracted_tc:
-            extracted_tc = stream_tool_calls
-
-        if extracted_tc:
-            filtered_tc, dropped_tc = _filter_tool_calls_by_advertised(
-                extracted_tc, advertised_tool_names
-            )
-            if dropped_tc:
-                dropped_names = []
-                for tc in dropped_tc:
-                    fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
-                    dropped_names.append(str(fn.get("name") or "").strip() or "<empty>")
-                debug_log(
-                    "warn",
-                    f"[TOOL_FILTER] request_id={request_id} dropped={len(dropped_tc)} names={','.join(dropped_names[:8])}",
-                )
-            extracted_tc = filtered_tc
-
-        # Check for upstream error in stream data (e.g., validation errors from DeepInfra)
-        # Error payloads typically look like: {"error": {"message": "..."}} or {"error_type": "...", "error_message": "..."}
-        stream_error = None
-        for line in stream_data.split("\n"):
-            stripped = line.strip()
-            if stripped.startswith("data:") or stripped.startswith("data "):
-                # Extract payload
-                payload = stripped
-                if stripped.startswith("data:"):
-                    payload = stripped[5:]
-                    if payload.startswith(" "):
-                        payload = payload[1:]
-                if payload and payload.strip() != "[DONE]":
-                    try:
-                        data = json.loads(payload)
-                        if "error" in data:
-                            # Found error payload
-                            err = data["error"]
-                            if isinstance(err, dict):
-                                err_msg = err.get("message") or str(err)
-                            else:
-                                err_msg = str(err)
-                            stream_error = err_msg
-                            debug_log(
-                                "warn",
-                                f"UPSTREAM_STREAM_ERROR: request_id={request_id}, error={err_msg[:100]}",
-                            )
-                            break
-                        elif "error_type" in data or "error_message" in data:
-                            # Alternative error format
-                            err_msg = (
-                                data.get("error_message")
-                                or data.get("error_type")
-                                or str(data)
-                            )
-                            stream_error = err_msg
-                            debug_log(
-                                "warn",
-                                f"UPSTREAM_STREAM_ERROR: request_id={request_id}, error={err_msg[:100]}",
-                            )
-                            break
-                    except:
-                        pass
-
-        # If upstream returned an error in stream, return explicit error response
-        if stream_error:
+        if parsed["stream_error"]:
             response = JSONResponse(
                 status_code=400,
                 content={
                     "error": {
-                        "message": f"Upstream error: {stream_error}",
+                        "message": f"Upstream error: {parsed['stream_error']}",
                         "type": "upstream_error",
                     }
                 },
             )
-            _log_chat_activity(400, f"Upstream error: {stream_error}", stream_flag=True)
+            _log_chat_activity(400, f"Upstream error: {parsed['stream_error']}", stream_flag=True)
             return response
+
+        full_content = parsed["full_content"]
+        full_reasoning = parsed["full_reasoning"]
+        text_content = parsed["text_content"]
+        extracted_tc = parsed["tool_calls"]
+        usage = parsed["usage"]
+        finish_reason = parsed["finish_reason"]
+        stats = parsed["stats"]
+        is_openai_oauth_backend = endpoint_type == "openai_oauth"
 
         # Check for empty response anomaly
         content_chars = len(full_content)
@@ -7206,14 +7182,42 @@ async def chat_completions(request: Request):
     reasoning_content = ""
     tool_calls_data = []
     usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    finish_reason = "stop"
 
-    if "choices" in result and result["choices"]:
+    if "_stream_data" in result:
+        parsed = _parse_chat_stream_payload(
+            stream_data=result["_stream_data"],
+            backend=backend,
+            messages=messages,
+            tools=tools,
+            model=model,
+            request_id=request_id,
+        )
+        if parsed["stream_error"]:
+            response = JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": f"Upstream error: {parsed['stream_error']}",
+                        "type": "upstream_error",
+                    }
+                },
+            )
+            _log_chat_activity(400, f"Upstream error: {parsed['stream_error']}", stream_flag=False)
+            return response
+        content = parsed["full_content"]
+        reasoning_content = parsed["full_reasoning"]
+        tool_calls_data = parsed["tool_calls"]
+        usage = parsed["usage"]
+        finish_reason = parsed["finish_reason"] or finish_reason
+    elif "choices" in result and result["choices"]:
         choice = result["choices"][0]
         message = choice.get("message", {})
         content = message.get("content", "") or ""
         reasoning_content = message.get("reasoning_content", "") or ""
         tool_calls_data = message.get("tool_calls", []) or []
         usage = result.get("usage", usage)
+        finish_reason = choice.get("finish_reason") or finish_reason
 
     # Handle reasoning content based on show_reasoning setting
     show_reasoning = True
@@ -7379,7 +7383,7 @@ async def chat_completions(request: Request):
             }
         )
 
-    finish_reason = "tool_calls" if (normalized_tool_calls and not text_content) else "stop"
+    finish_reason = "tool_calls" if (normalized_tool_calls and not text_content) else (finish_reason or "stop")
 
     choice = {
         "index": 0,
@@ -8460,50 +8464,47 @@ async def anthropic_messages(request: Request):
         result = backend_result["result"]
 
     # Convert OpenAI format back to Anthropic format
+    content = ""
+    usage = {}
+    finish_reason = "stop"
     content_blocks = []
     tool_calls_data = []
 
     if "_stream_data" in result:
-        stream_data = result["_stream_data"]
-        finish_reason = "end_turn"
-        for line in stream_data.split("\n"):
-            stripped = line.strip()
-            if not stripped.startswith("data:"):
-                continue
-            payload = stripped[5:].lstrip()
-            if not payload or payload == "[DONE]":
-                continue
-            try:
-                chunk = json_module.loads(payload)
-            except Exception:
-                continue
-            if "choices" in chunk and chunk["choices"]:
-                delta = chunk["choices"][0].get("delta", {})
-                if delta.get("content"):
-                    content += delta["content"]
-                finish_reason = chunk["choices"][0].get("finish_reason") or finish_reason
-            if chunk.get("usage"):
-                usage = chunk["usage"]
-        if getattr(backend, "endpoint_type", "") == "openai_oauth" and not usage:
-            usage = _estimate_openai_oauth_usage(
-                messages=converted_messages,
-                tools=tools,
-                full_content=content,
-                full_reasoning="",
-                tool_calls=[],
-            )
+        parsed = _parse_chat_stream_payload(
+            stream_data=result["_stream_data"],
+            backend=backend,
+            messages=converted_messages,
+            tools=tools,
+            model=model,
+            request_id="anthropic_nonstream",
+        )
+        content = parsed["text_content"] or parsed["full_content"] or ""
+        usage = parsed["usage"] or {}
+        tool_calls_data = parsed["tool_calls"] or []
+        finish_reason = parsed["finish_reason"] or finish_reason
     elif "choices" in result and result["choices"]:
-        message = result["choices"][0].get("message", {})
+        choice = result["choices"][0]
+        message = choice.get("message", {})
         content = message.get("content", "") or ""
         tool_calls_data = message.get("tool_calls", []) or []
-        finish_reason = message.get("finish_reason", "end_turn")
+        finish_reason = choice.get("finish_reason") or finish_reason
+        usage = result.get("usage", {}) or usage
 
     # Convert text content
     if content:
         content_blocks.append({"type": "text", "text": content})
 
     # Convert tool calls to Anthropic format
-    stop_reason = finish_reason
+    if finish_reason in ("tool_calls",):
+        stop_reason = "tool_use"
+    elif finish_reason in ("length",):
+        stop_reason = "max_tokens"
+    elif finish_reason in ("stop", "end_turn", None, ""):
+        stop_reason = "end_turn"
+    else:
+        stop_reason = str(finish_reason)
+
     for tc in tool_calls_data:
         func = tc.get("function", {})
         args = func.get("arguments", {})
@@ -8522,10 +8523,7 @@ async def anthropic_messages(request: Request):
                 "input": args,
             }
         )
-        if stop_reason != "tool_calls":
-            stop_reason = "tool_use"
-
-    usage = result.get("usage", {})
+        stop_reason = "tool_use"
 
     # Build Anthropic response
     response = {
@@ -8537,8 +8535,10 @@ async def anthropic_messages(request: Request):
         "stop_reason": stop_reason,
         "stop_sequence": None,
         "usage": {
-            "input_tokens": usage.get("prompt_tokens", 0),
-            "output_tokens": usage.get("completion_tokens", 0),
+            "input_tokens": usage.get("prompt_tokens", usage.get("input_tokens", 0)),
+            "output_tokens": usage.get(
+                "completion_tokens", usage.get("output_tokens", 0)
+            ),
         },
     }
 
