@@ -29,6 +29,7 @@ All notable changes to the Serverless Proxy will be documented in this file.
 - **Anthropic Tool-Use Streaming Compatibility** - `openai_oauth` Anthropic streaming now emits Anthropic-style SSE events (`message_start`, `content_block_start`/`content_block_stop`, `message_delta`, `[DONE]`) instead of `[DONE]`-only output.
 - **Anthropic Tool-Result Round-Trip Completion Fix** - Fixed follow-up `tool_result` turns that could end with empty assistant content by preserving/normalizing final text and adding fallback synthesis from tool-result payloads when upstream returns empty content.
 - **Anthropic Messages Strict Request Validation** - `POST /v1/messages` now rejects missing required `model`, `max_tokens`, or `messages`, and enforces Anthropic tool schema requirements (`name` + `input_schema`) with clear `invalid_request_error` responses.
+- **Multi-Tool Result Aggregation Fallback** - OpenAI and Anthropic post-tool fallback synthesis now aggregates all returned tool results (in order) instead of only using the last tool result when upstream returns empty final text.
 - **Ollama Embeddings Cross-Host Compatibility** - `/api/embed` and `/api/embeddings` now resolve virtual models first (with alias fallback such as `name`/`name:latest`) so embedding models hosted on non-Ollama backends work through Ollama-compatible routes.
 - **Ollama Embedding Error Hygiene** - Non-embedding models on Ollama embedding routes now return structured `unsupported_operation` compatibility responses instead of leaking upstream auth/capability errors.
 - **Ollama Show Fallback for Backend-Loaded Models** - `/api/show` now supports passthrough for backend-loaded Ollama models not explicitly present in virtual model mappings.
@@ -40,6 +41,7 @@ All notable changes to the Serverless Proxy will be documented in this file.
 - **README Multi-Protocol Notes** - Documented translated Ollama compatibility behavior, trusted-internal key attribution behavior, and OpenAI/Anthropic/Ollama protocol-surface compatibility expectations for `openai_oauth` models.
 - **README Compatibility Validation Expansion** - Added expanded compatibility notes covering OAuth/OpenAI chat normalization, Anthropic non-stream synthesis, Ollama embeddings cross-host behavior, `/api/ps` discovery merge behavior, and end-to-end validation probes.
 - **README OpenAI/Anthropic Coverage Clarification** - Added explicit notes that compatibility validation and fixes now include full OpenAI and Anthropic tool-call/tool-result round-trip coverage (streaming and non-streaming).
+- **Protocol Compatibility Guide** - Added `docs/protocol-compatibility.md` as the canonical compatibility/strictness reference and linked it from README compatibility sections.
 
 ### Validation
 
@@ -65,6 +67,9 @@ All notable changes to the Serverless Proxy will be documented in this file.
   - Full Anthropic tool round-trip probe (dynamic `tool_use_id` from turn 1 carried into turn 2 `tool_result`) returned non-empty final assistant text.
   - `POST /v1/messages` missing `messages` now returns `400 invalid_request_error`.
   - `POST /v1/messages` malformed tool definition (missing `input_schema`) now returns `400 invalid_request_error`.
+  - Multi-tool tool-result round-trip now reflects all returned tool results in final assistant output (non-stream and stream).
+- Validated OpenAI multi-tool compatibility:
+  - `POST /v1/chat/completions` multi-tool round-trip now reflects all returned tool results in final assistant output (non-stream and stream).
 - Validated Ollama embeddings compatibility:
   - `POST /api/embed` and `POST /api/embeddings` succeeded for `nomic-embed-text` and `qwen3-embedding`.
   - `POST /api/embed` batch input succeeded for `qwen3-embedding`.

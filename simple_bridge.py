@@ -4184,42 +4184,16 @@ def _openai_chat_to_openai_oauth_payload(
 
 
 def _fallback_text_from_openai_tool_result(messages: list[dict[str, Any]]) -> str:
-    for msg in reversed(messages or []):
-        if not isinstance(msg, dict) or str(msg.get("role") or "").lower() != "tool":
+    tool_contents: list[Any] = []
+    for msg in messages or []:
+        if not isinstance(msg, dict):
             continue
-        raw = msg.get("content")
-        if raw is None:
+        if str(msg.get("role") or "").lower() != "tool":
             continue
-
-        if isinstance(raw, str):
-            raw_str = raw.strip()
-        else:
-            try:
-                raw_str = json.dumps(raw)
-            except Exception:
-                raw_str = str(raw)
-            raw_str = raw_str.strip()
-
-        if not raw_str:
+        if msg.get("content") is None:
             continue
-
-        parsed = None
-        try:
-            parsed = json.loads(raw_str)
-        except Exception:
-            parsed = None
-
-        if isinstance(parsed, dict):
-            city = parsed.get("city")
-            forecast = parsed.get("forecast") or parsed.get("weather")
-            temp_c = parsed.get("temp_c")
-            if city and forecast and temp_c is not None:
-                return f"The weather in {city} is {forecast} and {temp_c}°C."
-            return f"Tool result: {json.dumps(parsed)}"
-
-        return f"Tool result: {raw_str}"
-
-    return ""
+        tool_contents.append(msg.get("content"))
+    return _fallback_text_from_tool_results(tool_contents)
 
 
 def _openai_oauth_response_to_chat_completion(
@@ -6915,6 +6889,59 @@ def _apply_stop_sequences_to_text(text: str, stop_sequences: list[str]) -> tuple
     return text[:cut_index], True
 
 
+def _tool_result_fragment(content_value: Any) -> str:
+    if isinstance(content_value, str):
+        raw_str = content_value.strip()
+    else:
+        try:
+            raw_str = json.dumps(content_value)
+        except Exception:
+            raw_str = str(content_value)
+        raw_str = raw_str.strip()
+
+    if not raw_str:
+        return ""
+
+    parsed = None
+    try:
+        parsed = json.loads(raw_str)
+    except Exception:
+        parsed = None
+
+    if isinstance(parsed, dict):
+        city = parsed.get("city")
+        forecast = parsed.get("forecast") or parsed.get("weather")
+        temp_c = parsed.get("temp_c")
+        city_time = parsed.get("time")
+        if city and forecast and temp_c is not None:
+            return f"The weather in {city} is {forecast} and {temp_c}°C"
+        if city and city_time:
+            return f"The time in {city} is {city_time}"
+        return f"Tool result: {json.dumps(parsed)}"
+
+    return f"Tool result: {raw_str}"
+
+
+def _combine_tool_result_fragments(fragments: list[str]) -> str:
+    parts = [p.strip() for p in fragments if isinstance(p, str) and p.strip()]
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return parts[0] + "."
+    if len(parts) == 2:
+        return parts[0] + ", and " + parts[1] + "."
+    return "; ".join(parts[:-1]) + "; and " + parts[-1] + "."
+
+
+def _fallback_text_from_tool_results(tool_contents: list[Any]) -> str:
+    fragments: list[str] = []
+    for raw in tool_contents or []:
+        frag = _tool_result_fragment(raw)
+        if frag:
+            fragments.append(frag)
+    return _combine_tool_result_fragments(fragments)
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     """OpenAI-compatible chat completions endpoint."""
@@ -8464,30 +8491,14 @@ async def anthropic_messages(request: Request):
             )
 
     def _fallback_text_from_tool_result(msgs: list[dict[str, Any]]) -> str:
-        for m in reversed(msgs or []):
+        tool_contents: list[Any] = []
+        for m in msgs or []:
             if not isinstance(m, dict) or m.get("role") != "tool":
                 continue
-            raw = m.get("content")
-            if raw is None:
+            if m.get("content") is None:
                 continue
-            raw_str = raw if isinstance(raw, str) else json_module.dumps(raw)
-            raw_str = str(raw_str).strip()
-            if not raw_str:
-                continue
-            try:
-                parsed = json_module.loads(raw_str)
-            except Exception:
-                parsed = None
-
-            if isinstance(parsed, dict):
-                city = parsed.get("city")
-                forecast = parsed.get("forecast") or parsed.get("weather")
-                temp_c = parsed.get("temp_c")
-                if city and forecast and temp_c is not None:
-                    return f"The weather in {city} is {forecast} and {temp_c}°C."
-                return f"Tool result: {json_module.dumps(parsed)}"
-            return f"Tool result: {raw_str}"
-        return ""
+            tool_contents.append(m.get("content"))
+        return _fallback_text_from_tool_results(tool_contents)
 
     # Convert Claude Code tool format to OpenAI format
     # Claude Code sends: {"name": "...", "description": "...", "parameters": {...}}

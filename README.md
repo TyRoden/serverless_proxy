@@ -637,6 +637,8 @@ curl -X POST http://localhost:8002/v1/chat/completions \
 
 The proxy now supports both Ollama-native routes and OpenAI-compatible routes when a virtual model maps to an `ollama` endpoint.
 
+Canonical compatibility reference: `docs/protocol-compatibility.md`.
+
 #### Runtime inference routes (Phase 1)
 
 - `GET /api/tags`
@@ -709,6 +711,8 @@ For Ollama-backed virtual models, these routes are forwarded to the configured O
 
 Validated on live proxy with inbound API key and current `main` runtime:
 
+See `docs/protocol-compatibility.md` for the maintained compatibility guarantees/checklist, and `docs/Compatibility-Tests-Verified.md` for a larger verified matrix snapshot.
+
 - **OpenAI-compatible**
   - `POST /v1/chat/completions` with `gpt-5.4-oauth`:
     - `stream:true` returns valid SSE chunks + `[DONE]`
@@ -776,9 +780,14 @@ Compatibility posture note:
 
 - The proxy now includes extensive compatibility checks and normalizations across both OpenAI and Anthropic protocol surfaces, with explicit coverage for stream-required OAuth backends, tool-call/tool-result round-trips, and non-stream response synthesis.
 - Protocol strictness is also now enforced for schema-required fields and malformed tool-message sequencing, so invalid requests fail predictably with proxy-normalized errors.
+- Canonical compatibility docs are maintained in:
+  - `docs/protocol-compatibility.md`
+  - `docs/Compatibility-Tests-Verified.md`
 
 #### Conformance and roadmap docs
 
+- Protocol compatibility guide: `docs/protocol-compatibility.md`
+- Verified compatibility matrix snapshot: `docs/Compatibility-Tests-Verified.md`
 - Runtime conformance smoke script: `scripts/ollama_runtime_conformance.sh`
 - Full-surface conformance script: `scripts/ollama_full_surface_conformance.sh`
 - Compatibility roadmap and checklist: `docs/ollama-compatibility-roadmap.md`
