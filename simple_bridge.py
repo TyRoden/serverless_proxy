@@ -193,6 +193,27 @@ def is_payload_audit_enabled() -> bool:
     return str(value).lower() in ("1", "true", "yes", "on")
 
 
+def _is_scoped_text_payload_audit_target(
+    request_id: str,
+    stage: str,
+    model: str,
+    messages: Any,
+    audit_summary: Optional[dict] = None,
+) -> bool:
+    """Allow focused text snapshot capture for known failing forensic targets."""
+    model_text = str(model or "").strip()
+    if model_text not in {"Qwen3.5-35B-A3B", "Qwen3.5-35B-A3B-Q8_0.gguf"}:
+        return False
+    if not isinstance(messages, list) or not messages:
+        return False
+    summary = audit_summary or {}
+    if summary.get("image_blocks", 0) > 0 or summary.get("base64_text_blocks", 0) > 0:
+        return False
+    if stage not in {"inbound_raw", "inbound_normalized", "outbound"}:
+        return False
+    return True
+
+
 def get_deployment_mode() -> str:
     """Return deployment mode. Defaults to internal_only for compatibility."""
     value = str(get_setting("deployment_mode", "internal_only") or "internal_only")
@@ -1012,6 +1033,14 @@ def _persist_payload_snapshot(
         or (audit_summary and audit_summary.get("image_blocks", 0) > 0)
         or (audit_summary and audit_summary.get("base64_text_blocks", 0) > 0)
     )
+    if not has_relevant and _is_scoped_text_payload_audit_target(
+        request_id=request_id,
+        stage=stage,
+        model=model,
+        messages=messages,
+        audit_summary=audit_summary,
+    ):
+        has_relevant = True
     if not has_relevant:
         return
 
@@ -1284,6 +1313,56 @@ def _apply_virtual_model_system_prompt(messages: list[dict[str, Any]], vm: Optio
             if _normalize_system_prompt_text(_message_text_content(msg)) == system_prompt:
                 return messages
     return [{"role": "system", "content": system_prompt}] + messages
+
+
+def _normalize_strict_system_messages(
+    messages: list[dict[str, Any]],
+    vm: Optional[dict] = None,
+) -> list[dict[str, Any]]:
+    """Collapse system prompts into one leading message for strict backends.
+
+    llama.cpp's chat templates can reject any system role that is not the first
+    message. Preserve the virtual-model prompt mode while ensuring the final
+    outbound message list contains at most one leading system message.
+    """
+    if not isinstance(messages, list):
+        return messages
+
+    vm_prompt = _normalize_system_prompt_text(vm.get("system_prompt") if vm else "")
+    vm_mode = str(vm.get("system_prompt_mode") or "always").strip().lower() if vm else "off"
+    if vm_mode not in {"always", "anchor_if_missing", "off"}:
+        vm_mode = "always"
+
+    system_parts: list[str] = []
+    non_system_messages: list[dict[str, Any]] = []
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role") or "").strip().lower()
+        if role == "system":
+            text = _normalize_system_prompt_text(_message_text_content(msg))
+            if text:
+                system_parts.append(text)
+            continue
+        non_system_messages.append(msg)
+
+    if vm_prompt and vm_mode == "always":
+        system_parts = [part for part in system_parts if part != vm_prompt]
+        system_parts.insert(0, vm_prompt)
+    elif vm_prompt and vm_mode == "anchor_if_missing" and vm_prompt not in system_parts:
+        system_parts.insert(0, vm_prompt)
+
+    collapsed_parts: list[str] = []
+    for part in system_parts:
+        normalized = _normalize_system_prompt_text(part)
+        if normalized and normalized not in collapsed_parts:
+            collapsed_parts.append(normalized)
+
+    if not collapsed_parts:
+        return non_system_messages
+
+    return [{"role": "system", "content": "\n\n".join(collapsed_parts)}] + non_system_messages
 
 
 def _split_system_message(messages: list[dict[str, Any]]) -> tuple[Optional[str], list[dict[str, Any]]]:
@@ -4861,10 +4940,24 @@ def _looks_like_embedding_model_name(name: str) -> bool:
     return any(tok in nl for tok in ("embed", "embedding", "nomic", "bge", "e5"))
 
 
+def _coerce_openai_compatible_endpoint_type(endpoint_type: str, url: str) -> str:
+    """Route known llama.cpp OpenAI-compatible hosts through a dedicated type.
+
+    Keep true Ollama behavior unchanged. This avoids broad behavior changes for
+    normal Ollama backends while letting strict llama.cpp servers use the
+    OpenAI-compatible shaping and validation path.
+    """
+    normalized_type = str(endpoint_type or "").strip().lower()
+    normalized_url = str(url or "").strip().lower().rstrip("/")
+    if normalized_type == "ollama" and normalized_url.endswith(":11435"):
+        return "llamacpp_openai"
+    return normalized_type
+
+
 def _virtual_model_supports_embedding_discovery(vm: dict[str, Any]) -> bool:
     endpoint_type = str(vm.get("endpoint_type") or "").strip().lower()
     # Conservative allow-list for endpoint families that commonly expose embeddings.
-    if endpoint_type not in ("ollama", "openai", "openwebui", "deepinfra", "queue", "vllm"):
+    if endpoint_type not in ("ollama", "openai", "openwebui", "deepinfra", "queue", "vllm", "llamacpp_openai"):
         return False
 
     name = str(vm.get("name") or "")
@@ -5254,6 +5347,8 @@ async def _ollama_passthrough(
 def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
     """Create a backend from virtual model configuration."""
     endpoint_type = vm.get("endpoint_type", "openai")
+    url = vm.get("url", "")
+    endpoint_type = _coerce_openai_compatible_endpoint_type(endpoint_type, url)
 
     class VirtualModelBackend(LLMBackend):
         def __init__(self):
@@ -5339,6 +5434,9 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
                     pass
 
             # Use actual model from virtual model config
+            if self.endpoint_type == "llamacpp_openai":
+                messages = _normalize_strict_system_messages(messages)
+
             payload = {
                 "model": self.model,
                 "messages": messages,
@@ -5511,6 +5609,8 @@ def create_backend_from_virtual_model(vm: dict) -> LLMBackend:
             elif self.endpoint_type == "queue":
                 endpoint = f"{self.url}/v1/chat/completions"
             elif self.endpoint_type == "ollama":
+                endpoint = f"{self.url}/v1/chat/completions"
+            elif self.endpoint_type == "llamacpp_openai":
                 endpoint = f"{self.url}/v1/chat/completions"
             else:
                 endpoint = f"{self.url}/v1/chat/completions"
@@ -7158,10 +7258,6 @@ async def chat_completions(request: Request):
         # Use default top_p from virtual model if not specified
         if vm.get("top_p") and "top_p" not in data:
             top_p = vm.get("top_p")
-        # Prepend system prompt if set
-        if vm.get("system_prompt"):
-            system_msg = {"role": "system", "content": vm.get("system_prompt")}
-            messages = [system_msg] + messages
         # Check if we should force non-streaming for this model
         if vm.get("force_non_streaming", 0) == 1:
             stream = False
@@ -7199,6 +7295,10 @@ async def chat_completions(request: Request):
     endpoint_id = getattr(backend, "endpoint_id", None)
     endpoint_type = getattr(backend, "endpoint_type", "")
     actual_model = getattr(backend, "model", model)
+
+    messages = _apply_virtual_model_system_prompt(messages, vm)
+    if endpoint_type == "llamacpp_openai":
+        messages = _normalize_strict_system_messages(messages, vm)
 
     def _current_route_meta() -> tuple[Any, str, str, bool, str, str]:
         current_endpoint_id = getattr(backend, "endpoint_id", endpoint_id)
@@ -10939,6 +11039,8 @@ def fetch_endpoint_models(endpoint_id):
             ]
         elif endpoint_type == "ollama":
             model_paths = ["/api/tags", "/v1/models", "/models", "/api/models"]
+        elif endpoint_type == "llamacpp_openai":
+            model_paths = ["/v1/models", "/models", "/api/models", "/api/tags"]
         else:
             model_paths = ["/v1/models", "/models", "/api/models", "/api/v1/models"]
 

@@ -1,6 +1,6 @@
 # Serverless Proxy - Universal LLM Gateway
 
-A universal internal and external LLM gateway that bridges standard API requests to multiple backend providers (RunPod, Ollama, OpenAI-compatible APIs, Together AI, OAuth-backed providers, and more). Configure endpoints through the web admin UI, map virtual model names to actual backend models, and optionally expose the proxy safely to other tools with inbound API key generation. OAuth-backed endpoints can be shared across multiple tools, and the proxy handles token refresh centrally.
+A universal internal and external LLM gateway that bridges standard API requests to multiple backend providers (RunPod, Ollama, llama.cpp OpenAI-compatible servers, OpenAI-compatible APIs, Together AI, OAuth-backed providers, and more). Configure endpoints through the web admin UI, map virtual model names to actual backend models, and optionally expose the proxy safely to other tools with inbound API key generation. OAuth-backed endpoints can be shared across multiple tools, and the proxy handles token refresh centrally.
 
 ## Overview
 
@@ -8,7 +8,7 @@ A universal internal and external LLM gateway that bridges standard API requests
 Client (OpenAI format) → Serverless Proxy (port 8002) → Configured Backends
 ```
 
-- **Universal**: Connect to any LLM backend (RunPod, Ollama, OpenAI, OAuth-based OpenAI-compatible providers, Together AI, etc.)
+- **Universal**: Connect to any LLM backend (RunPod, Ollama, llama.cpp, OpenAI, OAuth-based OpenAI-compatible providers, Together AI, etc.)
 - **Virtual Models**: Map user-facing model names to actual backend models
 - **Admin UI**: Configure endpoints and virtual models via web interface
 - **Deployment Modes**: Keep installs simple with default `internal_only`, or switch to `internet_facing` when you want secure external access
@@ -88,7 +88,7 @@ docker compose exec serverless-proxy sh -c "ps aux | grep uvicorn" || echo "WARN
    - **Name**: Something like "My Ollama" or "RunPod Production"
    - **URL**: Your backend URL (e.g., `http://localhost:11434` for local Ollama, or your RunPod endpoint URL)
    - **API Key**: Your API key if required (leave blank for local Ollama)
-   - **Type**: Select the type (`openwebui`, `openai`, `openai_oauth`, `ollama`, `runpod`, `anthropic`, `deepinfra`, etc.)
+   - **Type**: Select the type (`openwebui`, `openai`, `openai_oauth`, `ollama`, `llamacpp_openai`, `runpod`, `anthropic`, `deepinfra`, etc.)
    - If you choose **OpenAI OAuth**, OAuth fields are shown and prefilled with OpenAI defaults
     - Click **Save**
 
@@ -661,6 +661,17 @@ The proxy now supports both Ollama-native routes and OpenAI-compatible routes wh
 
 Canonical compatibility reference: `docs/protocol-compatibility.md`.
 
+### llama.cpp OpenAI-Compatible Backends
+
+Use endpoint type `llamacpp_openai` when the upstream is a strict llama.cpp OpenAI-compatible server rather than a true Ollama host.
+
+- Routes through OpenAI-compatible upstream paths such as `/v1/chat/completions` and `/v1/models`.
+- Keeps llama.cpp compatibility behavior isolated from normal Ollama endpoint handling.
+- Normalizes outbound chat `messages` so any system instructions are emitted as a single leading `system` message, matching llama.cpp's stricter template expectations.
+- Preserves virtual-model `system_prompt_mode` behavior (`always`, `anchor_if_missing`, `off`) while still enforcing llama.cpp-safe message ordering.
+
+This matters because some llama.cpp Jinja templates reject later `system` messages with errors such as `System message must be at the beginning`, even when other OpenAI-compatible backends would accept the same payload.
+
 #### Runtime inference routes (Phase 1)
 
 - `GET /api/tags`
@@ -770,6 +781,10 @@ See `docs/protocol-compatibility.md` for the maintained compatibility guarantees
   - `POST /v1/messages` strict validation:
     - missing required `model`, `max_tokens`, or `messages` returns `400` Anthropic-style `invalid_request_error`
     - malformed tool definitions (for example missing `input_schema`) are rejected with clear validation errors
+- **llama.cpp OpenAI-compatible**
+  - Dedicated `llamacpp_openai` endpoints keep strict llama.cpp compatibility fixes separate from normal Ollama routing.
+  - `POST /v1/chat/completions` succeeds for plain chat, OpenAI-style tools payloads, and inbound late-`system` message cases after proxy normalization.
+  - Virtual-model system prompt anchor modes remain active while outbound message ordering stays llama.cpp-compatible.
 - **Ollama-compatible**
   - `POST /api/embed` with `nomic-embed-text` and alias forms returns embeddings (`200`)
   - `POST /api/embeddings` with `prompt` field returns single-vector shape (`{"embedding":[...]}`)
@@ -801,6 +816,7 @@ Tool round-trip test note:
 Compatibility posture note:
 
 - The proxy now includes extensive compatibility checks and normalizations across both OpenAI and Anthropic protocol surfaces, with explicit coverage for stream-required OAuth backends, tool-call/tool-result round-trips, and non-stream response synthesis.
+- Dedicated llama.cpp OpenAI-compatible backends also receive strict system-message ordering normalization so OpenAI-style clients can interoperate with llama.cpp chat-template rules without being forced onto the Ollama code path.
 - Protocol strictness is also now enforced for schema-required fields and malformed tool-message sequencing, so invalid requests fail predictably with proxy-normalized errors.
 - Canonical compatibility docs are maintained in:
   - `docs/protocol-compatibility.md`
@@ -917,6 +933,7 @@ For a full public-runtime Caddy example with route-by-route explanations, see:
 | `openai` | OpenAI-compatible API (`/v1/chat/completions`, `/v1/models`, `/v1/embeddings`) |
 | `openai_oauth` | OpenAI OAuth/Codex style backend (`/backend-api/codex/responses`) with OpenAI chat-completions request/response translation |
 | `ollama` | Ollama API (native `/api/*` + OpenAI-compatible `/v1/*` bridging) |
+| `llamacpp_openai` | llama.cpp OpenAI-compatible server (`/v1/chat/completions`, `/v1/models`) with strict system-message normalization |
 | `vllm` | vLLM API |
 | `together` | Together AI |
 | `runpod` | RunPod Serverless |

@@ -10,6 +10,7 @@ All notable changes to the Serverless Proxy will be documented in this file.
 - **Activity Key Attribution** - Activity rows now display the inbound API key label beneath the caller IP when a request was authenticated with a key.
 - **Translated Ollama Show Metadata** - Added synthetic `/api/show` compatibility responses for non-Ollama virtual models and accepted both `model` and `name` request fields for broader Ollama client compatibility.
 - **Virtual Model Prompt Anchoring** - Added `system_prompt_mode` for virtual models so prompts can be always prepended, disabled, or reinserted only when missing from inbound system-message context.
+- **Dedicated llama.cpp Backend Type** - Added `llamacpp_openai` endpoint support for strict llama.cpp OpenAI-compatible servers so operators can route those backends separately from true Ollama endpoints.
 
 ### Fixed
 
@@ -37,6 +38,7 @@ All notable changes to the Serverless Proxy will be documented in this file.
 - **Ollama Embedding Error Hygiene** - Non-embedding models on Ollama embedding routes now return structured `unsupported_operation` compatibility responses instead of leaking upstream auth/capability errors.
 - **Ollama Show Fallback for Backend-Loaded Models** - `/api/show` now supports passthrough for backend-loaded Ollama models not explicitly present in virtual model mappings.
 - **Ollama /api/ps Discovery Merge** - `/api/ps` now merges embedding-capable virtual models into discovery output and can return synthetic discovery when an Ollama passthrough endpoint is unavailable.
+- **llama.cpp Strict System-Message Compatibility** - `llamacpp_openai` chat routing now normalizes outbound message ordering so all system instructions collapse into a single leading system message, preventing `System message must be at the beginning` Jinja failures while preserving virtual-model prompt anchor modes.
 
 ### Documentation
 
@@ -47,6 +49,7 @@ All notable changes to the Serverless Proxy will be documented in this file.
 - **README Compatibility Validation Expansion** - Added expanded compatibility notes covering OAuth/OpenAI chat normalization, Anthropic non-stream synthesis, Ollama embeddings cross-host behavior, `/api/ps` discovery merge behavior, and end-to-end validation probes.
 - **README OpenAI/Anthropic Coverage Clarification** - Added explicit notes that compatibility validation and fixes now include full OpenAI and Anthropic tool-call/tool-result round-trip coverage (streaming and non-streaming).
 - **Protocol Compatibility Guide** - Added `docs/protocol-compatibility.md` as the canonical compatibility/strictness reference and linked it from README compatibility sections.
+- **README llama.cpp Compatibility Notes** - Documented the dedicated `llamacpp_openai` backend type and the strict system-message normalization applied for llama.cpp OpenAI-compatible endpoints.
 
 ### Validation
 
@@ -80,6 +83,10 @@ All notable changes to the Serverless Proxy will be documented in this file.
   - `POST /api/embed` batch input succeeded for `qwen3-embedding`.
   - `POST /api/embed` for non-embedding model (`gpt-5.4-oauth`) returned structured `unsupported_operation`.
   - `GET /api/ps` showed merged discovery including embedding-capable virtual model entries.
+- Validated llama.cpp OpenAI-compatible routing:
+  - `POST /v1/chat/completions` plain chat succeeded through `llamacpp_openai`.
+  - `POST /v1/chat/completions` with a late inbound `system` message now succeeds after normalization instead of returning `Jinja Exception: System message must be at the beginning`.
+  - `POST /v1/chat/completions` with OpenAI-style `tools` payload remained compatible on the dedicated llama.cpp path.
 
 ## [2.4.6] - 2026-04-23
 
