@@ -556,11 +556,33 @@ Map virtual model names to actual backend models:
 - **Virtual Name**: What clients will request (e.g., `gpt-4`, `prod-llama`)
 - **Endpoint**: Which backend to route to
 - **Actual Model**: The model name on the backend (e.g., `gpt-4o`, `llama3:70b`)
+- **System Prompt Mode**: `Always prepend`, `Anchor if missing`, or `Disabled` for the virtual model prompt
 - **Show Reasoning**: Toggle chain-of-thought display (for models like MiniMax that output thinking separately)
 - **Cost per 1M Input Tokens ($)**: Price per 1M input tokens you send
 - **Cost per 1M Output Tokens ($)**: Price per 1M output tokens you receive
 - **Cost per 1M Cached Input Tokens ($)**: Discounted price per 1M cached input tokens (see provider pricing)
 - **Cost per 1M Cached Output Tokens ($)**: Discounted price per 1M cached output tokens
+
+### Virtual Model Prompt Anchoring
+
+Virtual models can optionally anchor their configured `system_prompt` into the inbound conversation context.
+
+- **Always prepend**: insert the virtual model prompt as the oldest system message on every request
+- **Anchor if missing**: inspect inbound system messages and only reinsert the configured prompt when it is no longer present in the thread
+- **Disabled**: do not inject the virtual model prompt
+
+Anchoring uses deterministic normalized string matching against inbound `role:"system"` messages. When the prompt is missing, the proxy reinserts the original configured prompt verbatim as the oldest system message.
+
+Anchoring is intended to prevent instruction drift on key model behaviors across long-running or partially trimmed conversations. If an application stops sending the original virtual-model system prompt in the rolling thread, `Anchor if missing` restores that instruction so the model keeps the intended role, tone, and operational constraints.
+
+Verified anchored prompt behavior now covers these request surfaces:
+
+- OpenAI `POST /v1/chat/completions`
+- Anthropic `POST /v1/messages`
+- Ollama `POST /api/chat`
+- Ollama `POST /api/generate`
+
+For Ollama `generate`, the proxy uses the anchored virtual-model prompt through the route's native `system` semantics rather than relying only on prompt-prefix hacks. This keeps compatibility closer to Ollama's documented prompt model and reduces drift on important system instructions.
 
 ### Cached Token Pricing
 

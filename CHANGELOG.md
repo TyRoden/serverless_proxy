@@ -9,11 +9,14 @@ All notable changes to the Serverless Proxy will be documented in this file.
 - **Per-Key Usage Filtering** - Added dashboard filtering for `Usage & Cost` and `Activity` by inbound API key so teams can measure requests, tokens, and cost per client key label.
 - **Activity Key Attribution** - Activity rows now display the inbound API key label beneath the caller IP when a request was authenticated with a key.
 - **Translated Ollama Show Metadata** - Added synthetic `/api/show` compatibility responses for non-Ollama virtual models and accepted both `model` and `name` request fields for broader Ollama client compatibility.
+- **Virtual Model Prompt Anchoring** - Added `system_prompt_mode` for virtual models so prompts can be always prepended, disabled, or reinserted only when missing from inbound system-message context.
 
 ### Fixed
 
 - **Chat Key Attribution Logging** - Chat traffic now persists inbound API key metadata into `recent_activity` and `request_usage`, so key-based filters work consistently across the primary request path.
 - **Trusted Internal Key Attribution** - Requests from trusted internal CIDRs now still persist inbound API key metadata when a valid key is explicitly supplied, restoring Activity/Usage attribution for LAN callers using keys.
+- **Anchored Prompt Cross-Protocol Parity** - Virtual model `system_prompt_mode=anchor_if_missing` now preserves anchored instructions across OpenAI chat, Anthropic messages, Ollama chat, and Ollama generate, reducing drift when upstream clients stop sending the original system prompt in later turns.
+- **Ollama Generate System Prompt Compatibility** - `/api/generate` now applies anchored virtual-model prompts through Ollama-style `system` semantics for better compatibility with prompt-oriented generation routes.
 - **Ollama Non-Stream Translation** - `openai_oauth`-backed virtual models now synthesize non-stream Ollama responses for `/api/chat` and `/api/generate` instead of leaking upstream stream-only constraints.
 - **Anthropic Non-Stream Translation** - `openai_oauth`-backed virtual models now synthesize non-stream Anthropic `/v1/messages` responses by buffering streamed upstream output.
 - **OpenAI Completions Normalization** - `openai_oauth`-backed virtual models now synthesize non-stream `/v1/completions` responses and improved streamed completions output instead of returning only `[DONE]`.
@@ -38,6 +41,8 @@ All notable changes to the Serverless Proxy will be documented in this file.
 ### Documentation
 
 - **README Key Analytics Notes** - Documented that Usage and Activity can be filtered by inbound API key, enabling per-team/per-client usage measurement from the dashboard.
+- **README Prompt Anchoring Notes** - Documented virtual model system prompt anchoring behavior and the new prompt mode options.
+- **README Prompt Drift Notes** - Clarified that prompt anchoring is designed to prevent drift on important virtual-model instructions and documented the verified cross-protocol anchor coverage.
 - **README Multi-Protocol Notes** - Documented translated Ollama compatibility behavior, trusted-internal key attribution behavior, and OpenAI/Anthropic/Ollama protocol-surface compatibility expectations for `openai_oauth` models.
 - **README Compatibility Validation Expansion** - Added expanded compatibility notes covering OAuth/OpenAI chat normalization, Anthropic non-stream synthesis, Ollama embeddings cross-host behavior, `/api/ps` discovery merge behavior, and end-to-end validation probes.
 - **README OpenAI/Anthropic Coverage Clarification** - Added explicit notes that compatibility validation and fixes now include full OpenAI and Anthropic tool-call/tool-result round-trip coverage (streaming and non-streaming).

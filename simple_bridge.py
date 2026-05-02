@@ -1241,6 +1241,67 @@ def _looks_like_data_block(text: str) -> bool:
     return False
 
 
+def _normalize_system_prompt_text(text: Any) -> str:
+    if not isinstance(text, str):
+        return ""
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    normalized = re.sub(r"\n{3,}", "\n\n", normalized)
+    return normalized
+
+
+def _message_text_content(message: dict[str, Any]) -> str:
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text":
+                parts.append(str(block.get("text") or ""))
+        return "\n".join([p for p in parts if p])
+    return ""
+
+
+def _apply_virtual_model_system_prompt(messages: list[dict[str, Any]], vm: Optional[dict]) -> list[dict[str, Any]]:
+    if not isinstance(messages, list) or not vm:
+        return messages
+    system_prompt = _normalize_system_prompt_text(vm.get("system_prompt"))
+    if not system_prompt:
+        return messages
+    mode = str(vm.get("system_prompt_mode") or "always").strip().lower()
+    if mode not in {"always", "anchor_if_missing", "off"}:
+        mode = "always"
+    if mode == "off":
+        return messages
+    if mode == "anchor_if_missing":
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            if str(msg.get("role") or "").strip().lower() != "system":
+                continue
+            if _normalize_system_prompt_text(_message_text_content(msg)) == system_prompt:
+                return messages
+    return [{"role": "system", "content": system_prompt}] + messages
+
+
+def _split_system_message(messages: list[dict[str, Any]]) -> tuple[Optional[str], list[dict[str, Any]]]:
+    system_message = None
+    non_system_messages: list[dict[str, Any]] = []
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role") or "").strip().lower()
+        if role == "system" and system_message is None:
+            text = _message_text_content(msg)
+            if text:
+                system_message = text
+            continue
+        non_system_messages.append(msg)
+    return system_message, non_system_messages
+
+
 def init_database():
     """Initialize database tables."""
     with get_db() as conn:
@@ -1784,6 +1845,16 @@ def init_database():
             try:
                 cursor.execute(
                     "ALTER TABLE virtual_models ADD COLUMN cache_enabled INTEGER DEFAULT 1"
+                )
+            except:
+                pass
+
+        try:
+            cursor.execute("SELECT system_prompt_mode FROM virtual_models LIMIT 1")
+        except:
+            try:
+                cursor.execute(
+                    "ALTER TABLE virtual_models ADD COLUMN system_prompt_mode TEXT DEFAULT 'always'"
                 )
             except:
                 pass
@@ -4987,7 +5058,8 @@ def _parse_chat_stream_payload(
             chunk = json.loads(payload)
             stats["json_ok"] += 1
             if "choices" in chunk and chunk["choices"]:
-                delta = chunk["choices"][0].get("delta", {})
+                choice0 = chunk["choices"][0] or {}
+                delta = choice0.get("delta", {})
                 tc = delta.get("tool_calls")
                 if tc:
                     for tc_chunk in tc:
@@ -5011,11 +5083,29 @@ def _parse_chat_stream_payload(
                         if tc_chunk.get("arguments") and not func_target.get("arguments"):
                             func_target["arguments"] = tc_chunk["arguments"]
                     has_tool_calls = True
-                if not has_tool_calls and delta.get("content"):
-                    full_content += delta["content"]
+                if not has_tool_calls:
+                    # Some OpenAI-compatible backends emit assistant text in
+                    # non-standard choice/message fields instead of delta.content.
+                    content_piece = delta.get("content")
+                    if content_piece is None:
+                        msg = choice0.get("message") or {}
+                        content_piece = (
+                            msg.get("content")
+                            or choice0.get("content")
+                            or delta.get("text")
+                            or choice0.get("text")
+                        )
+                    if isinstance(content_piece, list):
+                        content_piece = "".join(
+                            str(part.get("text") or "")
+                            for part in content_piece
+                            if isinstance(part, dict)
+                        )
+                    if content_piece:
+                        full_content += str(content_piece)
                 if delta.get("reasoning_content"):
                     full_reasoning += delta["reasoning_content"]
-                finish_reason = chunk["choices"][0].get("finish_reason")
+                finish_reason = choice0.get("finish_reason")
             if "usage" in chunk and chunk["usage"]:
                 usage = chunk["usage"]
         except json.JSONDecodeError as e:
@@ -8637,6 +8727,8 @@ async def anthropic_messages(request: Request):
     virtual_model = model
     if hasattr(backend, "virtual_model_name"):
         virtual_model = backend.virtual_model_name
+    vm_config = get_virtual_model(virtual_model) or get_virtual_model(model)
+    converted_messages = _apply_virtual_model_system_prompt(converted_messages, vm_config)
 
     # Build request for chat/completions - use actual model from backend
     actual_model = backend.model if hasattr(backend, "model") else model
@@ -9122,13 +9214,16 @@ async def ollama_chat(request: Request):
     backend = get_backend(model)
     if backend is None:
         return JSONResponse(status_code=404, content={"error": "model not found"})
+    vm_config = get_virtual_model(getattr(backend, "virtual_model_name", model)) or get_virtual_model(model)
 
     stream = bool(data.get("stream", False))
 
     if getattr(backend, "endpoint_type", "") == "ollama":
         payload = dict(data)
         payload["model"] = getattr(backend, "model", model)
-        payload["messages"] = _normalize_ollama_messages(payload.get("messages") or [])
+        payload["messages"] = _apply_virtual_model_system_prompt(
+            _normalize_ollama_messages(payload.get("messages") or []), vm_config
+        )
         headers = {
             "Content-Type": "application/json",
             "X-Source": request.headers.get("x-source", "serverless-proxy"),
@@ -9165,7 +9260,7 @@ async def ollama_chat(request: Request):
         if getattr(backend, "endpoint_type", "") == "anthropic":
             return _ollama_streaming_not_supported_response()
 
-        messages = data.get("messages") or []
+        messages = _apply_virtual_model_system_prompt(data.get("messages") or [], vm_config)
         options = data.get("options") or {}
         incoming_source = request.headers.get("x-source", "serverless-proxy")
         actual_model = getattr(backend, "model", model)
@@ -9312,7 +9407,7 @@ async def ollama_chat(request: Request):
 
         return StreamingResponse(ndjson_generator(), media_type="application/x-ndjson")
 
-    messages = data.get("messages") or []
+    messages = _apply_virtual_model_system_prompt(data.get("messages") or [], vm_config)
     options = data.get("options") or {}
     if getattr(backend, "endpoint_type", "") == "openai_oauth":
         backend_result, error, status_code = await _call_backend_chat_via_stream_collect(
@@ -9372,16 +9467,21 @@ async def ollama_generate(request: Request):
     backend = get_backend(model)
     if backend is None:
         return JSONResponse(status_code=404, content={"error": "model not found"})
+    vm_config = get_virtual_model(getattr(backend, "virtual_model_name", model)) or get_virtual_model(model)
 
     stream = bool(data.get("stream", False))
 
     # Native passthrough for Ollama endpoints
     if getattr(backend, "endpoint_type", "") == "ollama":
+        normalized_prompt = _normalize_system_prompt_text(vm_config.get("system_prompt") if vm_config else "")
+        prompt_value = data.get("prompt", "")
         payload = {
             "model": getattr(backend, "model", model),
-            "prompt": data.get("prompt", ""),
+            "prompt": prompt_value,
             "stream": stream,
         }
+        if normalized_prompt and not data.get("system"):
+            payload["system"] = normalized_prompt
         for k in (
             "suffix",
             "images",
@@ -9440,10 +9540,13 @@ async def ollama_generate(request: Request):
             return _ollama_streaming_not_supported_response()
 
         prompt = data.get("prompt", "")
+        anchored_system_prompt = _normalize_system_prompt_text(vm_config.get("system_prompt") if vm_config else "")
         messages = []
         if data.get("system"):
             messages.append({"role": "system", "content": data.get("system")})
         messages.append({"role": "user", "content": prompt})
+        combined_messages = _apply_virtual_model_system_prompt(messages, vm_config)
+        ollama_system_message, messages = _split_system_message(combined_messages)
 
         options = data.get("options") or {}
         incoming_source = request.headers.get("x-source", "serverless-proxy")
@@ -9456,6 +9559,10 @@ async def ollama_generate(request: Request):
             "top_p": options.get("top_p", 1.0),
             "stream": True,
         }
+        if ollama_system_message:
+            chat_data["system"] = ollama_system_message
+        elif anchored_system_prompt:
+            chat_data["system"] = anchored_system_prompt
 
         if getattr(backend, "endpoint_type", "") == "openai_oauth":
             chat_data = _openai_chat_to_openai_oauth_payload(
@@ -9590,10 +9697,13 @@ async def ollama_generate(request: Request):
         return StreamingResponse(ndjson_generator(), media_type="application/x-ndjson")
 
     prompt = data.get("prompt", "")
+    anchored_system_prompt = _normalize_system_prompt_text(vm_config.get("system_prompt") if vm_config else "")
     messages = []
     if data.get("system"):
         messages.append({"role": "system", "content": data.get("system")})
     messages.append({"role": "user", "content": prompt})
+    combined_messages = _apply_virtual_model_system_prompt(messages, vm_config)
+    ollama_system_message, messages = _split_system_message(combined_messages)
 
     options = data.get("options") or {}
     if getattr(backend, "endpoint_type", "") == "openai_oauth":
@@ -10936,7 +11046,7 @@ def update_virtual_model(vm_id):
                 cost_per_1m_tokens_in_cached = ?, cost_per_1m_tokens_out_cached = ?,
                 disable_streaming = ?, force_non_streaming = ?, custom_headers = ?,
                 enabled = ?, cache_enabled = ?, max_tokens = ?, temperature = ?, top_p = ?, system_prompt = ?,
-                show_reasoning = ?,
+                system_prompt_mode = ?, show_reasoning = ?,
                 updated_at = strftime('%s', 'now')
             WHERE id = ?
         """,
@@ -10958,6 +11068,7 @@ def update_virtual_model(vm_id):
                 data.get("temperature") or 0,
                 data.get("top_p") or 1.0,
                 data.get("system_prompt") or "",
+                str(data.get("system_prompt_mode") or "always"),
                 1 if data.get("show_reasoning", True) else 0,
                 vm_id,
             ),
@@ -10987,8 +11098,8 @@ def create_virtual_model():
                 cost_per_1m_tokens_in, cost_per_1m_tokens_out,
                 cost_per_1m_tokens_in_cached, cost_per_1m_tokens_out_cached,
                 disable_streaming, force_non_streaming, custom_headers,
-                enabled, cache_enabled, max_tokens, temperature, top_p, system_prompt, show_reasoning
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                enabled, cache_enabled, max_tokens, temperature, top_p, system_prompt, system_prompt_mode, show_reasoning
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
             (
                 data.get("name"),
@@ -11008,6 +11119,7 @@ def create_virtual_model():
                 data.get("temperature") or 0,
                 data.get("top_p") or 1.0,
                 data.get("system_prompt") or "",
+                str(data.get("system_prompt_mode") or "always"),
                 1 if data.get("show_reasoning", True) else 0,
             ),
         )

@@ -725,6 +725,15 @@
                             <label for="vm-system-prompt">System Prompt</label>
                             <textarea id="vm-system-prompt" name="system_prompt" placeholder="Optional system prompt to prepend to all requests" style="width:100%;min-height:60px;padding:8px;border:1px solid #ddd;border-radius:4px;"></textarea>
                         </div>
+                        <div class="form-group">
+                            <label for="vm-system-prompt-mode">System Prompt Mode</label>
+                            <select id="vm-system-prompt-mode" name="system_prompt_mode">
+                                <option value="always">Always prepend</option>
+                                <option value="anchor_if_missing">Anchor if missing</option>
+                                <option value="off">Disabled</option>
+                            </select>
+                            <small>Anchor mode only reinserts the virtual model prompt when it is missing from inbound system messages.</small>
+                        </div>
                         <div class="form-row">
                             <div class="form-group" style="width:100%;">
                                 <label>Custom Headers</label>
@@ -1786,6 +1795,7 @@
         document.getElementById('vm-temperature').value = data ? (data.temperature || 0.7) : '0.7';
         document.getElementById('vm-top-p').value = data ? (data.top_p || 1.0) : '1.0';
         document.getElementById('vm-system-prompt').value = data ? (data.system_prompt || '') : '';
+        document.getElementById('vm-system-prompt-mode').value = data ? (data.system_prompt_mode || 'always') : 'always';
         document.getElementById('vm-disable-streaming').checked = data ? (data.disable_streaming === 1) : false;
         document.getElementById('vm-force-non-streaming').checked = data ? (data.force_non_streaming === 1) : false;
         document.getElementById('vm-show-reasoning').checked = data ? (data.show_reasoning !== 0) : true;
@@ -2003,6 +2013,7 @@
             temperature: parseFloat(form.temperature.value) || 0,
             top_p: parseFloat(form.top_p.value) || 1.0,
             system_prompt: form.system_prompt.value || '',
+            system_prompt_mode: form.system_prompt_mode.value || 'always',
             custom_headers: getCustomHeadersFromForm(),
             disable_streaming: form.disable_streaming.checked ? 1 : 0,
             force_non_streaming: form.force_non_streaming.checked ? 1 : 0,
